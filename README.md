@@ -1,21 +1,24 @@
 # Apeiron
 
-A GPU-accelerated binary entropy and complexity visualizer using Hilbert curves and advanced analysis techniques.
+A high-performance, GPU-accelerated binary entropy and complexity visualizer using Hilbert curves and advanced signal analysis techniques.
 
-Apeiron provides visual analysis of binary files through eight visualization modes, helping identify patterns, encrypted regions, compressed data, and structural anomalies in executables, firmware, and other binary formats. It includes wavelet-based malware detection inspired by academic research.
+Apeiron provides interactive visual analysis of binary files through eight visualization modes, helping identify patterns, encrypted regions, compressed data, and structural anomalies in executables, firmware, and other binary formats. It includes wavelet-based malware detection inspired by academic research.
 
 https://github.com/user-attachments/assets/c2ec6dc2-0296-4fa2-9494-8e86ccd562c2
 
 ## Features
 
 - **Eight Visualization Modes**: Comprehensive binary analysis from entropy to wavelet decomposition
-- **GPU Acceleration**: Hardware-accelerated rendering via wgpu compute shaders
+- **GPU Acceleration**: Hardware-accelerated rendering via wgpu compute shaders (WGSL)
+- **Portable SIMD**: High-performance algorithms using the `wide` crate (AVX2 on x86_64, NEON on ARM64)
+- **Progressive Rendering**: Large files (100MB+) render instantly with background refinement
+- **Memory-Mapped I/O**: Efficient handling of multi-gigabyte files without loading into RAM
 - **SSECS Malware Detection**: Wavelet-based suspiciousness scoring from academic research
 - **Interactive Hex Inspector**: Synchronized hex view with Hilbert curve region highlighting
 - **Real-time Analysis**: Hover over any region to see detailed byte-level analysis
 - **Hilbert Curve Mapping**: Space-filling curve preserves locality - nearby bytes appear as nearby pixels
 - **Pan & Zoom**: Explore large files with smooth navigation
-- **Cross-Platform**: Runs on macOS, Linux, and Windows
+- **Cross-Platform**: macOS (Apple Silicon & Intel), Linux, and Windows
 
 ## Visualization Modes
 
@@ -34,7 +37,7 @@ A recurrence plot from nonlinear dynamics theory. Each pixel (x,y) shows the sim
 - **Vertical/horizontal lines**: Laminar states (unchanged regions)
 - **Checkerboard patterns**: Periodic structures
 
-Useful for identifying repeated code blocks, copy-paste patterns, and structural repetition.
+Uses SIMD-accelerated chi-squared distance with branchless division for real-time computation.
 
 ### Byte Digraph (DIG)
 A 256x256 heatmap showing byte transition frequencies. X-axis is the source byte value, Y-axis is the following byte value:
@@ -42,7 +45,7 @@ A 256x256 heatmap showing byte transition frequencies. X-axis is the source byte
 - **Dark regions**: Rare or absent transitions
 - **Clusters**: Reveal character set usage (ASCII, Unicode, binary patterns)
 
-Effective for distinguishing file types and identifying encoding schemes.
+Computed with parallel thread-local histograms and SIMD merge operations.
 
 ### Byte Phase Space (PHS)
 Plots byte[i] vs byte[i+1] for all sequential bytes, colored by file position:
@@ -57,7 +60,7 @@ Approximates algorithmic complexity using DEFLATE compression ratio:
 - **Yellow/Orange**: High complexity - compressed or complex data
 - **Red/Pink**: Maximum complexity - encrypted or truly random data
 
-Unlike Shannon entropy, Kolmogorov complexity captures algorithmic patterns and is sensitive to compressibility rather than just byte distribution.
+Features fast-path detection for likely-incompressible data, skipping compression for random/encrypted regions.
 
 ### Jensen-Shannon Divergence (JSD)
 Measures how much each region's byte distribution diverges from the file's overall distribution:
@@ -65,7 +68,7 @@ Measures how much each region's byte distribution diverges from the file's overa
 - **Yellow/Orange**: Anomalous regions with unusual byte patterns
 - **Red**: Highly anomalous - encrypted, compressed, or foreign data
 
-JSD is symmetric and bounded [0,1], making it ideal for detecting embedded or injected content that differs from the surrounding data.
+JSD is symmetric and bounded [0,1], making it ideal for detecting embedded or injected content.
 
 ### Multi-Scale Entropy (MSE)
 Refined Composite Multi-Scale Entropy (RCMSE) analysis revealing complexity across multiple time scales:
@@ -73,7 +76,7 @@ Refined Composite Multi-Scale Entropy (RCMSE) analysis revealing complexity acro
 - **Green/Yellow**: Medium complexity (structured data)
 - **Orange/Red**: High complexity across scales (complex or random data)
 
-MSE distinguishes between different types of complexity - truly random data vs. complex but structured data - which single-scale entropy cannot differentiate.
+MSE distinguishes between different types of complexity - truly random data vs. complex but structured data.
 
 ### Wavelet Entropy (WAV)
 Haar wavelet decomposition analyzing entropic energy distribution across spatial scales:
@@ -81,7 +84,7 @@ Haar wavelet decomposition analyzing entropic energy distribution across spatial
 - **Yellow/Orange**: Mixed energy distribution (suspicious patterns)
 - **Red**: Coarse-scale energy dominance (large entropy shifts, potentially malicious)
 
-Based on the SSECS methodology from Wojnowicz et al. (2016), this mode highlights regions where entropy changes occur at suspicious spatial scales - a characteristic of malware with encrypted/compressed payloads.
+Based on the SSECS methodology from Wojnowicz et al. (2016).
 
 ## SSECS Malware Analysis
 
@@ -111,7 +114,7 @@ The right panel provides a synchronized hex view that:
 
 ### Pre-built Binaries
 Download the latest release for your platform from the [Releases](../../releases) page:
-- `apeiron-macos-arm64` - macOS Apple Silicon
+- `apeiron-macos-arm64` - macOS Apple Silicon (M1/M2/M3)
 - `apeiron-macos-x86_64` - macOS Intel
 - `apeiron-linux-x86_64` - Linux x86_64
 - `apeiron-windows-x86_64.exe` - Windows x86_64
@@ -127,7 +130,7 @@ Requirements:
 git clone https://github.com/anomalyco/apeiron.git
 cd apeiron
 
-# Build release version
+# Build release version (with LTO optimization)
 cargo build --release
 
 # Run
@@ -203,18 +206,29 @@ The right panel shows detailed information about the currently hovered byte posi
 ## Technical Details
 
 ### Entropy Calculation
-Shannon entropy is calculated over a sliding window:
+Shannon entropy is calculated over a sliding window using SIMD-accelerated histogram counting:
 ```
 H = -Σ p(x) * log₂(p(x))
 ```
 where p(x) is the probability of byte value x in the window. Result ranges from 0 (uniform) to 8 bits (maximum entropy).
 
+**Optimizations:**
+- 4-way parallel histogram counting to avoid cache contention
+- Cache-aligned (64-byte) histogram buffers
+- True SIMD log2 approximation using IEEE 754 bit manipulation
+- Dual accumulators for instruction-level parallelism
+
 ### Kolmogorov Complexity Approximation
-Complexity is approximated using DEFLATE compression:
+Complexity is approximated using DEFLATE compression (level 6):
 ```
 K(x) ≈ len(compress(x)) / len(x)
 ```
 Pre-computed at file load time using parallel processing (sampled every 64 bytes with 128-byte windows).
+
+**Optimizations:**
+- Thread-local encoder buffer reuse
+- Fast-path detection for likely-incompressible data (skips compression)
+- Background streaming computation with progress updates
 
 ### Jensen-Shannon Divergence
 JSD between window distribution P and file distribution Q:
@@ -223,12 +237,22 @@ JSD(P||Q) = ½ D_KL(P||M) + ½ D_KL(Q||M)
 ```
 where M = ½(P + Q) and D_KL is Kullback-Leibler divergence.
 
+**Optimizations:**
+- SIMD f64x4 for 256-element distribution operations
+- Fused mixture + KL computation reducing memory passes
+- Dual accumulators for better ILP
+
 ### Multi-Scale Entropy (RCMSE)
 Refined Composite Multi-Scale Entropy using coarse-graining:
 1. Coarse-grain signal at multiple scales τ
 2. Compute sample entropy at each scale
 3. Average across coarse-grained sequences
 4. Aggregate into complexity score
+
+**Optimizations:**
+- Direct byte processing (eliminates intermediate f64 allocation)
+- SIMD coarse-graining with u32x4 accumulation
+- Parallel scale computation with per-thread buffers
 
 ### Wavelet Transform (SSECS)
 Orthonormal Haar wavelet decomposition following Wojnowicz et al.:
@@ -238,13 +262,43 @@ Orthonormal Haar wavelet decomposition following Wojnowicz et al.:
 3. **Energy Spectrum**: E_j = Σ(d_{jk})² for each resolution level j
 4. **SSECS Score**: Logistic model based on coarse/fine energy ratio
 
-The key insight is that malware exhibits suspicious patterns of entropic change at coarse spatial scales due to transitions between native code, encrypted payloads, and padding.
+**Optimizations:**
+- SIMD Haar transform using f64x4
+- Thread-local scratch buffers with UnsafeCell
+- 8-way energy spectrum computation with dual accumulators
 
 ### Hilbert Curve
 The Hilbert curve dimension is chosen as the smallest power of 2 where n² >= file_size. This ensures all bytes can be mapped while maintaining the locality-preserving property.
 
+**Optimizations:**
+- Precomputed lookup tables for dimensions 64, 128, 256, 512 (O(1) access)
+- Lazy initialization with `OnceLock`
+- Batch conversion functions for SIMD-friendly processing
+
 ### GPU Acceleration
-When available, visualization rendering uses wgpu compute shaders for parallel pixel generation. Falls back to CPU (with rayon parallelization) when GPU is unavailable or for modes requiring CPU-side computation (KOL, JSD, MSE, WAV).
+When available, visualization rendering uses wgpu compute shaders (WGSL) for parallel pixel generation:
+- **Hilbert**: Computes d2xy transform and byte analysis per pixel
+- **Digraph**: Parallel frequency counting with atomic operations
+- **Phase Space**: Trajectory accumulation with position coloring
+- **Similarity Matrix**: Chi-squared distance computation
+
+Falls back to CPU (with rayon parallelization) for modes requiring CPU-side computation (KOL, JSD, MSE, WAV) or when GPU is unavailable.
+
+### Progressive Rendering
+Files larger than 100MB use a two-phase rendering approach:
+1. **Coarse pass**: ~10K hierarchical samples for instant preview
+2. **Fine pass**: Full precision sequential computation in background
+
+The main thread reads computed values lock-free while the background thread refines data progressively.
+
+## Performance
+
+- **Large Files**: 100MB+ files handled efficiently via viewport-aware rendering and memory-mapped I/O
+- **Pre-computation**: Kolmogorov, RCMSE, and wavelet maps computed at load time using parallel processing
+- **GPU Acceleration**: Significant speedup for Hilbert, Digraph, Phase Space, and Similarity Matrix modes
+- **Portable SIMD**: AVX2 on x86_64, NEON on ARM64 via the `wide` crate
+- **Texture Caching**: Smart regeneration thresholds prevent excessive recomputation during navigation
+- **Memory Efficient**: Streaming hex view renders only visible rows; mmap for file access
 
 ## File Type Detection
 
@@ -252,7 +306,7 @@ Apeiron automatically detects common file types via magic bytes:
 
 | Category | Formats |
 |----------|---------|
-| Executables | PE (EXE/DLL), ELF, Mach-O |
+| Executables | PE (EXE/DLL), ELF, Mach-O (all variants) |
 | Archives | ZIP, RAR, GZIP, BZIP2, 7-Zip, XZ |
 | Images | PNG, JPEG, GIF, BMP, TIFF |
 | Documents | PDF |
@@ -270,31 +324,12 @@ Apeiron automatically detects common file types via magic bytes:
 - **Security Research**: Analyze encryption patterns, study packing techniques
 - **CTF Competitions**: Quickly identify steganography, hidden data, or unusual structures
 
-## Performance
-
-- **Large Files**: 100MB+ files handled efficiently via viewport-aware rendering
-- **Pre-computation**: Kolmogorov, RCMSE, and wavelet maps computed at load time using parallel processing
-- **GPU Acceleration**: Significant speedup for Hilbert, Digraph, Phase Space, and Similarity Matrix modes
-- **Texture Caching**: Smart regeneration thresholds prevent excessive recomputation during navigation
-- **Memory Efficient**: Streaming hex view renders only visible rows
-
-## Architecture
-
-```
-src/
-├── main.rs           # Application, UI, visualization rendering
-├── analysis.rs       # Entropy, complexity, JSD, RCMSE calculations
-├── wavelet_malware.rs # SSECS implementation (Wojnowicz et al.)
-├── hilbert.rs        # Hilbert curve algorithms (d2xy, xy2d)
-├── gpu.rs            # wgpu compute shaders for GPU acceleration
-└── lib.rs            # Library exports
-```
-
 ## References
 
 - Wojnowicz, M., et al. (2016). "Wavelet Decomposition of Software Entropy Reveals Symptoms of Malicious Code." *Journal of Innovation in Digital Ecosystems*, 3, 130-140. [DOI](https://doi.org/10.1016/j.jides.2016.10.009)
 - Lyda, R., & Hamrock, J. (2007). "Using Entropy Analysis to Find Encrypted and Packed Malware." *IEEE Security & Privacy*, 5(2), 40-45.
 - Costa, M., et al. (2002). "Multiscale entropy analysis of complex physiologic time series." *Physical Review Letters*, 89(6).
+- Hilbert, D. (1891). "Über die stetige Abbildung einer Linie auf ein Flächenstück." *Mathematische Annalen*, 38, 459-460.
 
 ## License
 
@@ -306,5 +341,6 @@ MIT License - See [LICENSE](LICENSE) for details.
 - SSECS methodology from Cylance research (Wojnowicz et al.)
 - Uses [egui](https://github.com/emilk/egui) for the immediate mode GUI
 - GPU compute via [wgpu](https://github.com/gfx-rs/wgpu)
+- Portable SIMD via [wide](https://github.com/Lokathor/wide)
 - File dialogs via [rfd](https://github.com/PolyMeilex/rfd)
 - Parallel processing via [rayon](https://github.com/rayon-rs/rayon)
