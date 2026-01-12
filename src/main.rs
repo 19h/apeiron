@@ -1,6 +1,6 @@
 //! Apeiron - Binary file entropy and complexity visualizer using Hilbert curves.
 //!
-//! A Rust port of NeuroCore, providing visual analysis of binary files
+//! Apeiron - GPU-accelerated binary entropy visualizer using Hilbert curves
 //! through entropy-based color mapping on a Hilbert curve layout.
 
 #![warn(clippy::all, clippy::pedantic)]
@@ -136,7 +136,7 @@ impl VisualizationMode {
 }
 
 /// Main application state.
-struct NeuroCoreApp {
+struct ApeironApp {
     /// Loaded file data.
     file_data: Option<FileData>,
     /// Viewport state for pan/zoom.
@@ -165,6 +165,8 @@ struct NeuroCoreApp {
     gpu_renderer: Option<gpu::GpuRenderer>,
     /// Background computation tasks.
     background_tasks: Option<BackgroundTasks>,
+    /// Initial file to load (from command-line argument).
+    initial_file: Option<PathBuf>,
 }
 
 /// Parameters used to generate the current texture.
@@ -393,7 +395,7 @@ impl HexView {
 // Application Implementation
 // =============================================================================
 
-impl Default for NeuroCoreApp {
+impl Default for ApeironApp {
     fn default() -> Self {
         Self {
             file_data: None,
@@ -410,13 +412,20 @@ impl Default for NeuroCoreApp {
             last_fit_view_size: None,
             gpu_renderer: None,
             background_tasks: None,
+            initial_file: None,
         }
     }
 }
 
-impl NeuroCoreApp {
+impl ApeironApp {
     /// Create a new application instance.
-    fn new(_cc: &eframe::CreationContext<'_>) -> Self {
+    #[allow(dead_code)]
+    fn new(cc: &eframe::CreationContext<'_>) -> Self {
+        Self::new_with_file(cc, None)
+    }
+
+    /// Create a new application instance with an optional initial file to load.
+    fn new_with_file(_cc: &eframe::CreationContext<'_>, initial_file: Option<PathBuf>) -> Self {
         let gpu_renderer = gpu::GpuRenderer::new();
         if gpu_renderer.is_some() {
             println!("GPU acceleration enabled");
@@ -425,6 +434,7 @@ impl NeuroCoreApp {
         }
         Self {
             gpu_renderer,
+            initial_file,
             ..Self::default()
         }
     }
@@ -1707,8 +1717,14 @@ impl NeuroCoreApp {
 // UI Implementation
 // =============================================================================
 
-impl eframe::App for NeuroCoreApp {
+impl eframe::App for ApeironApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // Load initial file from command-line argument (first frame only)
+        if let Some(path) = self.initial_file.take() {
+            println!("Loading file from command line: {}", path.display());
+            self.load_file(path);
+        }
+
         // Poll for completed background tasks
         let task_completed = self.poll_background_tasks();
 
@@ -1839,7 +1855,7 @@ impl eframe::App for NeuroCoreApp {
 
         // Help popup
         if self.show_help {
-            egui::Window::new("NeuroCore Guide")
+            egui::Window::new("Apeiron Guide")
                 .collapsible(false)
                 .resizable(false)
                 .show(ctx, |ui| {
@@ -1849,7 +1865,7 @@ impl eframe::App for NeuroCoreApp {
     }
 }
 
-impl NeuroCoreApp {
+impl ApeironApp {
     /// Draw the entropy visualization panel.
     fn draw_visualization(&mut self, ui: &mut egui::Ui) {
         let available_rect = ui.available_rect_before_wrap();
@@ -3186,6 +3202,20 @@ fn similarity_to_color(similarity: f64, is_diagonal: bool) -> Color32 {
 // =============================================================================
 
 fn main() -> eframe::Result<()> {
+    // Parse command-line arguments
+    let args: Vec<String> = std::env::args().collect();
+    let initial_file = if args.len() > 1 {
+        let path = PathBuf::from(&args[1]);
+        if path.exists() {
+            Some(path)
+        } else {
+            eprintln!("Warning: File not found: {}", args[1]);
+            None
+        }
+    } else {
+        None
+    };
+
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1200.0, 800.0])
@@ -3197,6 +3227,6 @@ fn main() -> eframe::Result<()> {
     eframe::run_native(
         "Apeiron",
         options,
-        Box::new(|cc| Ok(Box::new(NeuroCoreApp::new(cc)))),
+        Box::new(move |cc| Ok(Box::new(ApeironApp::new_with_file(cc, initial_file)))),
     )
 }
