@@ -146,6 +146,63 @@ pub fn byte_distribution(data: &[u8]) -> [f64; 256] {
     dist
 }
 
+/// Calculate byte frequency distribution using sampling for large files.
+///
+/// For files smaller than 10MB, this uses the full distribution.
+/// For larger files, it samples strategically to avoid O(n) iteration:
+/// - First 1MB is fully counted (headers often have distinct patterns)
+/// - Remaining file is sampled at regular intervals
+///
+/// This provides an accurate distribution estimate while being O(1) for large files.
+pub fn byte_distribution_sampled(data: &[u8]) -> [f64; 256] {
+    const SMALL_FILE_THRESHOLD: usize = 10 * 1024 * 1024; // 10MB
+    const HEADER_SIZE: usize = 1024 * 1024; // 1MB of header to fully count
+    const TARGET_SAMPLES: usize = 10_000_000; // ~10 million samples from body
+
+    if data.is_empty() {
+        return [1.0 / 256.0; 256];
+    }
+
+    // For small files, use full distribution
+    if data.len() <= SMALL_FILE_THRESHOLD {
+        return byte_distribution(data);
+    }
+
+    let mut counts = [0u64; 256];
+    let mut sample_count = 0u64;
+
+    // Count all bytes in the header (first 1MB)
+    let header_end = HEADER_SIZE.min(data.len());
+    for &byte in &data[..header_end] {
+        counts[byte as usize] += 1;
+        sample_count += 1;
+    }
+
+    // Sample the rest of the file
+    if data.len() > HEADER_SIZE {
+        let body = &data[HEADER_SIZE..];
+        let body_len = body.len();
+
+        // Calculate step size to get ~TARGET_SAMPLES from the body
+        let step = (body_len / TARGET_SAMPLES).max(1);
+
+        let mut offset = 0;
+        while offset < body_len {
+            counts[body[offset] as usize] += 1;
+            sample_count += 1;
+            offset += step;
+        }
+    }
+
+    // Convert counts to probabilities
+    let total = sample_count as f64;
+    let mut dist = [0.0f64; 256];
+    for i in 0..256 {
+        dist[i] = counts[i] as f64 / total;
+    }
+    dist
+}
+
 /// Calculate KL divergence D_KL(P || Q) between two probability distributions.
 ///
 /// Uses a small epsilon to avoid log(0) issues.

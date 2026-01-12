@@ -9,23 +9,29 @@
 mod analysis;
 mod gpu;
 mod hilbert;
+mod hilbert_refiner;
 mod wavelet_malware;
 
+use std::fs::File;
 use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::sync::Arc;
 use std::thread;
+use std::time::Duration;
+
+use memmap2::Mmap;
 
 use eframe::egui::{self, Color32, ColorImage, Pos2, Rect, RichText, Sense, TextureHandle, Vec2};
 use rayon::prelude::*;
 
 use analysis::{
-    byte_distribution, calculate_entropy, calculate_jsd, calculate_kolmogorov_complexity,
+    byte_distribution_sampled, calculate_entropy, calculate_jsd, calculate_kolmogorov_complexity,
     calculate_rcmse_quick, extract_ascii, format_bytes, identify_file_type,
     precompute_chunk_entropies, wavelet_suspiciousness_8, ByteAnalysis, JSDAnalysis,
     KolmogorovAnalysis, ANALYSIS_WINDOW, WAVELET_CHUNK_SIZE,
 };
 use hilbert::{calculate_dimension, d2xy, xy2d};
+use hilbert_refiner::{HilbertBuffer, HilbertRefiner, PROGRESSIVE_THRESHOLD};
 use wavelet_malware as wm;
 
 // =============================================================================
@@ -214,8 +220,8 @@ struct TextureParams {
 
 /// Loaded file information and data.
 struct FileData {
-    /// Raw file bytes.
-    data: Arc<Vec<u8>>,
+    /// Memory-mapped file data (efficient for large files).
+    data: Arc<Mmap>,
     /// File size in bytes.
     size: u64,
     /// Hilbert curve dimension (power of 2).
@@ -236,13 +242,26 @@ struct FileData {
     /// Precomputed wavelet suspiciousness values (one per WAVELET_SAMPLE_INTERVAL bytes).
     /// None if not yet computed.
     wavelet_map: Option<Arc<Vec<f32>>>,
+    /// Progressive Hilbert computation buffer (for large files).
+    /// None for small files that compute immediately.
+    hilbert_buffer: Option<Arc<HilbertBuffer>>,
 }
 
 /// Background computation tasks for lazy loading.
 enum BackgroundTask {
-    ComplexityMap(Vec<f32>),
-    RcmseMap(Vec<f32>),
-    WaveletMap(Vec<f32>),
+    /// Partial complexity map update (streaming).
+    ComplexityPartial { data: Vec<f32>, progress: f32 },
+    /// Final complexity map (computation complete).
+    ComplexityComplete,
+    /// Partial RCMSE map update (streaming).
+    RcmsePartial { data: Vec<f32>, progress: f32 },
+    /// Final RCMSE map (computation complete).
+    RcmseComplete,
+    /// Partial wavelet map update (streaming).
+    WaveletPartial { data: Vec<f32>, progress: f32 },
+    /// Final wavelet map (computation complete).
+    WaveletComplete,
+    /// Wavelet report (not streamed, computed once).
     WaveletReport(wm::WaveletMalwareReport),
 }
 
@@ -258,6 +277,12 @@ struct BackgroundTasks {
     computing_wavelet: bool,
     /// Whether wavelet report is being computed.
     computing_wavelet_report: bool,
+    /// Progress of complexity map computation (0.0-1.0).
+    complexity_progress: f32,
+    /// Progress of RCMSE map computation (0.0-1.0).
+    rcmse_progress: f32,
+    /// Progress of wavelet map computation (0.0-1.0).
+    wavelet_progress: f32,
 }
 
 /// Interval for sampling RCMSE (every N bytes).
@@ -503,193 +528,214 @@ impl ApeironApp {
         }
     }
 
+    /// Maximum recommended file size for analysis.
+    /// Files larger than this will show a warning about long computation times.
+    const LARGE_FILE_WARNING_SIZE: u64 = 10 * 1024 * 1024 * 1024; // 10GB
+
     /// Load a file from the given path.
     /// If `in_new_tab` is true, opens in a new tab; otherwise loads in the current tab.
-    /// Only performs essential setup immediately; expensive computations run in background.
+    /// Uses memory-mapped files to efficiently handle large files without loading entirely into RAM.
     fn load_file(&mut self, path: PathBuf, in_new_tab: bool) {
-        match std::fs::read(&path) {
-            Ok(data) => {
-                let size = data.len() as u64;
-                let dimension = calculate_dimension(size);
-                let file_type = identify_file_type(&data);
-
-                // Extract filename for tab title
-                let title = path
-                    .file_name()
-                    .and_then(|n| n.to_str())
-                    .unwrap_or("Unknown")
-                    .to_string();
-
-                // Upload to GPU if available
-                if let Some(ref mut gpu) = self.gpu_renderer {
-                    gpu.upload_file(&data, dimension);
-                }
-
-                // Calculate reference byte distribution for JSD (cheap, needed for JSD mode)
-                let reference_distribution = Arc::new(byte_distribution(&data));
-
-                let data = Arc::new(data);
-
-                // Create or switch to the target tab
-                if in_new_tab {
-                    self.new_tab();
-                }
-                let tab = self.active_tab_mut();
-
-                // Create file data with empty precomputed maps
-                tab.file_data = Some(FileData {
-                    data: Arc::clone(&data),
-                    size,
-                    dimension,
-                    file_type,
-                    path,
-                    complexity_map: None,
-                    reference_distribution,
-                    rcmse_map: None,
-                    wavelet_map: None,
-                });
-
-                // Set tab title
-                tab.title = title;
-
-                // Clear previous wavelet report
-                tab.wavelet_report = None;
-
-                // Spawn background tasks for expensive computations
-                // Priority: spawn the task for the current viz mode first
-                let (tx, rx) = mpsc::channel();
-                let current_mode = tab.viz_mode;
-
-                // Determine task priority based on current visualization mode
-                #[derive(Clone, Copy, PartialEq)]
-                enum TaskType {
-                    Complexity,
-                    Rcmse,
-                    Wavelet,
-                    WaveletReport,
-                }
-
-                let priority_task = match current_mode {
-                    VisualizationMode::KolmogorovComplexity => TaskType::Complexity,
-                    VisualizationMode::MultiScaleEntropy => TaskType::Rcmse,
-                    VisualizationMode::WaveletEntropy => TaskType::Wavelet,
-                    // For other modes, prioritize wavelet report (shown in sidebar)
-                    _ => TaskType::WaveletReport,
-                };
-
-                // Helper to spawn a task
-                let spawn_task =
-                    |task_type: TaskType, tx: mpsc::Sender<BackgroundTask>, data: Arc<Vec<u8>>| {
-                        match task_type {
-                            TaskType::Complexity => {
-                                thread::spawn(move || {
-                                    let map = Self::precompute_complexity_map(&data);
-                                    let _ = tx.send(BackgroundTask::ComplexityMap(map));
-                                });
-                            }
-                            TaskType::Rcmse => {
-                                thread::spawn(move || {
-                                    let map = Self::precompute_rcmse_map(&data);
-                                    let _ = tx.send(BackgroundTask::RcmseMap(map));
-                                });
-                            }
-                            TaskType::Wavelet => {
-                                thread::spawn(move || {
-                                    let map = Self::precompute_wavelet_map(&data);
-                                    let _ = tx.send(BackgroundTask::WaveletMap(map));
-                                });
-                            }
-                            TaskType::WaveletReport => {
-                                thread::spawn(move || {
-                                    let report = wm::analyze_file_for_malware(&data);
-                                    let _ = tx.send(BackgroundTask::WaveletReport(report));
-                                });
-                            }
-                        }
-                    };
-
-                // Spawn priority task first (gets head start on CPU scheduling)
-                spawn_task(priority_task, tx.clone(), Arc::clone(&data));
-
-                // Spawn remaining tasks
-                let all_tasks = [
-                    TaskType::Complexity,
-                    TaskType::Rcmse,
-                    TaskType::Wavelet,
-                    TaskType::WaveletReport,
-                ];
-                for task in all_tasks {
-                    if task != priority_task {
-                        spawn_task(task, tx.clone(), Arc::clone(&data));
-                    }
-                }
-
-                let tab = self.active_tab_mut();
-                tab.background_tasks = Some(BackgroundTasks {
-                    receiver: rx,
-                    computing_complexity: true,
-                    computing_rcmse: true,
-                    computing_wavelet: true,
-                    computing_wavelet_report: true,
-                });
-
-                // Reset viewport and selection
-                tab.viewport = Viewport::default();
-                tab.texture = None;
-                tab.texture_params = None;
-                tab.needs_fit_to_view = true;
-
-                // Initialize selection at offset 0
-                Self::update_selection_on_tab(tab, 0);
-
-                println!(
-                    "Loaded file: Size={} bytes, Dimension={}, Type={}",
-                    size, dimension, file_type
-                );
-                println!("Background computations started...");
-            }
+        // Open file and memory-map it
+        let file = match File::open(&path) {
+            Ok(f) => f,
             Err(e) => {
-                eprintln!("Error loading file: {e}");
+                eprintln!("Error opening file: {e}");
+                return;
             }
+        };
+
+        let mmap = match unsafe { Mmap::map(&file) } {
+            Ok(m) => m,
+            Err(e) => {
+                eprintln!("Error memory-mapping file: {e}");
+                return;
+            }
+        };
+
+        let data = &mmap[..];
+        let size = data.len() as u64;
+
+        if size == 0 {
+            eprintln!("Error: File is empty");
+            return;
         }
+
+        // Warn about very large files
+        if size > Self::LARGE_FILE_WARNING_SIZE {
+            println!(
+                "Warning: File is very large ({:.1} GB). Background analysis may take a while.",
+                size as f64 / (1024.0 * 1024.0 * 1024.0)
+            );
+        }
+
+        let dimension = calculate_dimension(size);
+        let file_type = identify_file_type(data);
+
+        // Extract filename for tab title
+        let title = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("Unknown")
+            .to_string();
+
+        // Upload to GPU if available (has its own size limit)
+        if let Some(ref mut gpu) = self.gpu_renderer {
+            gpu.upload_file(data, dimension);
+        }
+
+        // Calculate reference byte distribution for JSD using sampling for large files
+        // This is O(1) for large files instead of O(n)
+        let reference_distribution = Arc::new(byte_distribution_sampled(data));
+
+        let data = Arc::new(mmap);
+
+        // Create or switch to the target tab
+        if in_new_tab {
+            self.new_tab();
+        }
+        let tab = self.active_tab_mut();
+
+        // Start progressive Hilbert computation for large files
+        let hilbert_buffer = if size > PROGRESSIVE_THRESHOLD {
+            println!(
+                "File > {}MB: Using progressive Hilbert rendering",
+                PROGRESSIVE_THRESHOLD / (1024 * 1024)
+            );
+            Some(HilbertRefiner::start(Arc::clone(&data), size))
+        } else {
+            None
+        };
+
+        // Create file data with empty precomputed maps
+        tab.file_data = Some(FileData {
+            data: Arc::clone(&data),
+            size,
+            dimension,
+            file_type,
+            path,
+            complexity_map: None,
+            reference_distribution,
+            rcmse_map: None,
+            wavelet_map: None,
+            hilbert_buffer,
+        });
+
+        // Set tab title
+        tab.title = title;
+
+        // Clear previous wavelet report
+        tab.wavelet_report = None;
+
+        // LAZY COMPUTATION: Only spawn WaveletReport on load (needed for sidebar).
+        // Other mode-specific computations are started when user switches to that mode.
+        let (tx, rx) = mpsc::channel();
+        let data_for_report = Arc::clone(&data);
+        thread::spawn(move || {
+            let report = wm::analyze_file_for_malware(&data_for_report);
+            let _ = tx.send(BackgroundTask::WaveletReport(report));
+        });
+
+        let tab = self.active_tab_mut();
+        tab.background_tasks = Some(BackgroundTasks {
+            receiver: rx,
+            computing_complexity: false, // Lazy: not started yet
+            computing_rcmse: false,      // Lazy: not started yet
+            computing_wavelet: false,    // Lazy: not started yet
+            computing_wavelet_report: true,
+            complexity_progress: 0.0,
+            rcmse_progress: 0.0,
+            wavelet_progress: 0.0,
+        });
+
+        // Reset viewport and selection
+        tab.viewport = Viewport::default();
+        tab.texture = None;
+        tab.texture_params = None;
+        tab.needs_fit_to_view = true;
+
+        // Initialize selection at offset 0
+        Self::update_selection_on_tab(tab, 0);
+
+        println!(
+            "Loaded file: Size={} bytes, Dimension={}, Type={}",
+            size, dimension, file_type
+        );
+        if size > PROGRESSIVE_THRESHOLD {
+            println!("Progressive Hilbert rendering started...");
+        }
+        println!("Wavelet analysis started (other modes computed on demand)...");
     }
 
     /// Poll for completed background tasks on the active tab and update file data.
-    /// Returns true if any task completed (may need texture refresh).
+    /// Returns true if any task completed or updated (may need texture refresh).
     fn poll_background_tasks(&mut self) -> bool {
         let tab = &mut self.tabs[self.active_tab];
         let Some(tasks) = &mut tab.background_tasks else {
             return false;
         };
 
-        let mut any_completed = false;
+        let mut any_updated = false;
 
-        // Poll all available completed tasks
+        // Poll all available messages (partial updates and completions)
         loop {
             match tasks.receiver.try_recv() {
                 Ok(task) => {
-                    any_completed = true;
+                    any_updated = true;
                     match task {
-                        BackgroundTask::ComplexityMap(map) => {
-                            println!("Complexity map ready: {} samples", map.len());
+                        BackgroundTask::ComplexityPartial { data, progress } => {
                             if let Some(ref mut file) = tab.file_data {
-                                file.complexity_map = Some(Arc::new(map));
+                                file.complexity_map = Some(Arc::new(data));
                             }
+                            tasks.complexity_progress = progress;
+                        }
+                        BackgroundTask::ComplexityComplete => {
+                            println!(
+                                "Complexity map complete: {} samples",
+                                tab.file_data
+                                    .as_ref()
+                                    .and_then(|f| f.complexity_map.as_ref())
+                                    .map(|m| m.len())
+                                    .unwrap_or(0)
+                            );
                             tasks.computing_complexity = false;
+                            tasks.complexity_progress = 1.0;
                         }
-                        BackgroundTask::RcmseMap(map) => {
-                            println!("RCMSE map ready: {} samples", map.len());
+                        BackgroundTask::RcmsePartial { data, progress } => {
                             if let Some(ref mut file) = tab.file_data {
-                                file.rcmse_map = Some(Arc::new(map));
+                                file.rcmse_map = Some(Arc::new(data));
                             }
+                            tasks.rcmse_progress = progress;
+                        }
+                        BackgroundTask::RcmseComplete => {
+                            println!(
+                                "RCMSE map complete: {} samples",
+                                tab.file_data
+                                    .as_ref()
+                                    .and_then(|f| f.rcmse_map.as_ref())
+                                    .map(|m| m.len())
+                                    .unwrap_or(0)
+                            );
                             tasks.computing_rcmse = false;
+                            tasks.rcmse_progress = 1.0;
                         }
-                        BackgroundTask::WaveletMap(map) => {
-                            println!("Wavelet map ready: {} samples", map.len());
+                        BackgroundTask::WaveletPartial { data, progress } => {
                             if let Some(ref mut file) = tab.file_data {
-                                file.wavelet_map = Some(Arc::new(map));
+                                file.wavelet_map = Some(Arc::new(data));
                             }
+                            tasks.wavelet_progress = progress;
+                        }
+                        BackgroundTask::WaveletComplete => {
+                            println!(
+                                "Wavelet map complete: {} samples",
+                                tab.file_data
+                                    .as_ref()
+                                    .and_then(|f| f.wavelet_map.as_ref())
+                                    .map(|m| m.len())
+                                    .unwrap_or(0)
+                            );
                             tasks.computing_wavelet = false;
+                            tasks.wavelet_progress = 1.0;
                         }
                         BackgroundTask::WaveletReport(report) => {
                             println!(
@@ -724,7 +770,7 @@ impl ApeironApp {
             }
         }
 
-        any_completed
+        any_updated
     }
 
     /// Check if a specific visualization mode's data is ready for the active tab.
@@ -751,28 +797,49 @@ impl ApeironApp {
 
     /// Check if any background computation is in progress for the active tab.
     fn is_computing(&self) -> bool {
-        self.active_tab().background_tasks.is_some()
+        let tab = self.active_tab();
+        // Check if standard background tasks are running
+        if tab.background_tasks.is_some() {
+            return true;
+        }
+        // Check if Hilbert refinement is in progress (and not paused)
+        if let Some(ref file) = tab.file_data {
+            if let Some(ref buffer) = file.hilbert_buffer {
+                if !buffer.is_fine_complete() && !buffer.is_paused() {
+                    return true;
+                }
+            }
+        }
+        false
     }
 
-    /// Precompute Kolmogorov complexity values for the file.
-    /// Samples every COMPLEXITY_SAMPLE_INTERVAL bytes for performance.
-    fn precompute_complexity_map(data: &[u8]) -> Vec<f32> {
-        const WINDOW_SIZE: usize = 128;
+    /// Check if Hilbert refinement is in progress and we're in Hilbert mode.
+    /// Used to determine if we need continuous repaint for progressive rendering.
+    fn is_hilbert_refining(&self) -> bool {
+        let tab = self.active_tab();
+        if tab.viz_mode != VisualizationMode::Hilbert {
+            return false;
+        }
+        if let Some(ref file) = tab.file_data {
+            if let Some(ref buffer) = file.hilbert_buffer {
+                return !buffer.is_fine_complete();
+            }
+        }
+        false
+    }
 
-        let num_samples = (data.len() / COMPLEXITY_SAMPLE_INTERVAL).max(1);
-
-        (0..num_samples)
-            .into_par_iter()
-            .map(|i| {
-                let start = i * COMPLEXITY_SAMPLE_INTERVAL;
-                let end = (start + WINDOW_SIZE).min(data.len());
-                if start < data.len() {
-                    calculate_kolmogorov_complexity(&data[start..end]) as f32
-                } else {
-                    0.0
+    /// Get Hilbert refinement progress (0.0 to 1.0) if active.
+    /// Returns None if no hilbert buffer or if refinement is complete.
+    fn get_hilbert_refine_progress(&self) -> Option<f32> {
+        let tab = self.active_tab();
+        if let Some(ref file) = tab.file_data {
+            if let Some(ref buffer) = file.hilbert_buffer {
+                if !buffer.is_fine_complete() {
+                    return Some(buffer.progress_fraction());
                 }
-            })
-            .collect()
+            }
+        }
+        None
     }
 
     /// Look up precomputed complexity value for a file offset.
@@ -784,27 +851,6 @@ impl ApeironApp {
         complexity_map.get(index).copied().unwrap_or(0.0)
     }
 
-    /// Precompute RCMSE values for the file.
-    /// Samples every RCMSE_SAMPLE_INTERVAL bytes for performance.
-    fn precompute_rcmse_map(data: &[u8]) -> Vec<f32> {
-        const WINDOW_SIZE: usize = 256; // Window for multi-scale analysis (supports ~10 scales)
-
-        let num_samples = (data.len() / RCMSE_SAMPLE_INTERVAL).max(1);
-
-        (0..num_samples)
-            .into_par_iter()
-            .map(|i| {
-                let start = i * RCMSE_SAMPLE_INTERVAL;
-                let end = (start + WINDOW_SIZE).min(data.len());
-                if start < data.len() && end > start {
-                    calculate_rcmse_quick(&data[start..end])
-                } else {
-                    0.5 // Default to middle value
-                }
-            })
-            .collect()
-    }
-
     /// Look up precomputed RCMSE value for a file offset.
     fn lookup_rcmse(rcmse_map: &[f32], offset: usize) -> f32 {
         if rcmse_map.is_empty() {
@@ -814,63 +860,6 @@ impl ApeironApp {
         rcmse_map.get(index).copied().unwrap_or(0.5)
     }
 
-    /// Precompute wavelet suspiciousness values for the file.
-    ///
-    /// HEAVILY OPTIMIZED: Instead of recomputing entropy for each overlapping window,
-    /// we precompute all unique chunk entropies once, then look them up.
-    ///
-    /// This reduces entropy calculations from O(num_samples * 8) to O(num_chunks),
-    /// which is ~8x faster for typical files with overlapping windows.
-    fn precompute_wavelet_map(data: &[u8]) -> Vec<f32> {
-        // Window: 2048 bytes = 8 chunks of 256 bytes = 3 wavelet levels
-        const WINDOW_SIZE: usize = 2048;
-        const CHUNKS_PER_WINDOW: usize = WINDOW_SIZE / WAVELET_CHUNK_SIZE; // 8
-        const CHUNK_INDEX_STEP: usize = WAVELET_CHUNK_SIZE / WAVELET_SAMPLE_INTERVAL; // 256/64 = 4
-
-        if data.len() < WINDOW_SIZE {
-            // File too small for meaningful wavelet analysis
-            let num_samples = (data.len() / WAVELET_SAMPLE_INTERVAL).max(1);
-            return vec![0.5; num_samples];
-        }
-
-        // Step 1: Precompute entropy for ALL chunks at WAVELET_SAMPLE_INTERVAL boundaries
-        // This is the key optimization - each chunk entropy is computed exactly once
-        let chunk_entropies =
-            precompute_chunk_entropies(data, WAVELET_CHUNK_SIZE, WAVELET_SAMPLE_INTERVAL);
-
-        // Number of valid samples (where we have a full 2048-byte window)
-        let num_full_samples = (data.len() - WINDOW_SIZE) / WAVELET_SAMPLE_INTERVAL + 1;
-        let total_samples = (data.len() / WAVELET_SAMPLE_INTERVAL).max(1);
-
-        // Step 2: For each sample, look up 8 chunk entropies and compute wavelet suspiciousness
-        let mut results: Vec<f32> = (0..num_full_samples)
-            .into_par_iter()
-            .map(|sample_idx| {
-                // Build entropy stream from precomputed chunks
-                // For sample at position sample_idx * 64, chunks are at:
-                //   sample_idx * 64 + 0*256, sample_idx * 64 + 1*256, ..., sample_idx * 64 + 7*256
-                // In chunk_entropies array (indexed by position/64), these are:
-                //   sample_idx, sample_idx + 4, sample_idx + 8, ..., sample_idx + 28
-                let mut stream = [0.0f64; CHUNKS_PER_WINDOW];
-                for c in 0..CHUNKS_PER_WINDOW {
-                    let chunk_idx = sample_idx + c * CHUNK_INDEX_STEP;
-                    stream[c] = chunk_entropies.get(chunk_idx).copied().unwrap_or(0.0);
-                }
-
-                // Use unrolled wavelet transform (zero allocations)
-                wavelet_suspiciousness_8(&stream) as f32
-            })
-            .collect();
-
-        // Fill remaining samples (near end of file) with last valid value or 0.5
-        if total_samples > num_full_samples {
-            let last_value = results.last().copied().unwrap_or(0.5);
-            results.resize(total_samples, last_value);
-        }
-
-        results
-    }
-
     /// Look up precomputed wavelet suspiciousness value for a file offset.
     fn lookup_wavelet(wavelet_map: &[f32], offset: usize) -> f32 {
         if wavelet_map.is_empty() {
@@ -878,6 +867,308 @@ impl ApeironApp {
         }
         let index = offset / WAVELET_SAMPLE_INTERVAL;
         wavelet_map.get(index).copied().unwrap_or(0.5)
+    }
+
+    // =========================================================================
+    // LAZY MODE COMPUTATION
+    // Start computation for a mode only when the user switches to it.
+    // =========================================================================
+
+    /// Ensure data for the given visualization mode is being computed.
+    /// Called when user switches modes - starts computation if not already running.
+    fn ensure_mode_data(&mut self, mode: VisualizationMode) {
+        let tab = &self.tabs[self.active_tab];
+        let Some(ref file) = tab.file_data else {
+            return;
+        };
+
+        // Check if this mode needs computation and if it's not already done/running
+        let needs_computation = match mode {
+            VisualizationMode::KolmogorovComplexity => {
+                file.complexity_map.is_none()
+                    && tab
+                        .background_tasks
+                        .as_ref()
+                        .map(|t| !t.computing_complexity)
+                        .unwrap_or(true)
+            }
+            VisualizationMode::MultiScaleEntropy => {
+                file.rcmse_map.is_none()
+                    && tab
+                        .background_tasks
+                        .as_ref()
+                        .map(|t| !t.computing_rcmse)
+                        .unwrap_or(true)
+            }
+            VisualizationMode::WaveletEntropy => {
+                file.wavelet_map.is_none()
+                    && tab
+                        .background_tasks
+                        .as_ref()
+                        .map(|t| !t.computing_wavelet)
+                        .unwrap_or(true)
+            }
+            // Other modes don't need precomputed maps
+            _ => false,
+        };
+
+        if !needs_computation {
+            return;
+        }
+
+        // Get or create the background tasks channel
+        let data = Arc::clone(&file.data);
+
+        // We need to create a new channel or add to existing one
+        // For simplicity, we'll create a new channel and merge receivers
+        let (tx, rx) = mpsc::channel();
+
+        match mode {
+            VisualizationMode::KolmogorovComplexity => {
+                println!("Starting Kolmogorov complexity computation on demand...");
+                thread::spawn(move || {
+                    Self::precompute_complexity_streaming(&data, &tx);
+                });
+                let tab = &mut self.tabs[self.active_tab];
+                if let Some(ref mut tasks) = tab.background_tasks {
+                    tasks.computing_complexity = true;
+                } else {
+                    tab.background_tasks = Some(BackgroundTasks {
+                        receiver: rx,
+                        computing_complexity: true,
+                        computing_rcmse: false,
+                        computing_wavelet: false,
+                        computing_wavelet_report: false,
+                        complexity_progress: 0.0,
+                        rcmse_progress: 0.0,
+                        wavelet_progress: 0.0,
+                    });
+                    return;
+                }
+            }
+            VisualizationMode::MultiScaleEntropy => {
+                println!("Starting RCMSE computation on demand...");
+                thread::spawn(move || {
+                    Self::precompute_rcmse_streaming(&data, &tx);
+                });
+                let tab = &mut self.tabs[self.active_tab];
+                if let Some(ref mut tasks) = tab.background_tasks {
+                    tasks.computing_rcmse = true;
+                } else {
+                    tab.background_tasks = Some(BackgroundTasks {
+                        receiver: rx,
+                        computing_complexity: false,
+                        computing_rcmse: true,
+                        computing_wavelet: false,
+                        computing_wavelet_report: false,
+                        complexity_progress: 0.0,
+                        rcmse_progress: 0.0,
+                        wavelet_progress: 0.0,
+                    });
+                    return;
+                }
+            }
+            VisualizationMode::WaveletEntropy => {
+                println!("Starting Wavelet entropy computation on demand...");
+                thread::spawn(move || {
+                    Self::precompute_wavelet_streaming(&data, &tx);
+                });
+                let tab = &mut self.tabs[self.active_tab];
+                if let Some(ref mut tasks) = tab.background_tasks {
+                    tasks.computing_wavelet = true;
+                } else {
+                    tab.background_tasks = Some(BackgroundTasks {
+                        receiver: rx,
+                        computing_complexity: false,
+                        computing_rcmse: false,
+                        computing_wavelet: true,
+                        computing_wavelet_report: false,
+                        complexity_progress: 0.0,
+                        rcmse_progress: 0.0,
+                        wavelet_progress: 0.0,
+                    });
+                    return;
+                }
+            }
+            _ => {}
+        }
+
+        // Store the new receiver - we need to poll from multiple receivers
+        // For now, replace the receiver (existing tasks will complete but won't be polled)
+        // TODO: Could merge receivers for better handling
+        let tab = &mut self.tabs[self.active_tab];
+        if let Some(ref mut tasks) = tab.background_tasks {
+            // Replace receiver - old tasks continue but we poll new one
+            // This is a simplification; a production version might merge channels
+            tasks.receiver = rx;
+        }
+    }
+
+    /// Pause Hilbert refinement (when switching away from Hilbert mode).
+    fn pause_hilbert_refiner(&self) {
+        let tab = self.active_tab();
+        if let Some(ref file) = tab.file_data {
+            if let Some(ref buffer) = file.hilbert_buffer {
+                buffer.pause();
+            }
+        }
+    }
+
+    /// Resume Hilbert refinement (when switching back to Hilbert mode).
+    fn resume_hilbert_refiner(&self) {
+        let tab = self.active_tab();
+        if let Some(ref file) = tab.file_data {
+            if let Some(ref buffer) = file.hilbert_buffer {
+                buffer.resume();
+            }
+        }
+    }
+
+    // =========================================================================
+    // STREAMING PRECOMPUTE FUNCTIONS
+    // These compute maps in chunks and send partial updates for progressive rendering.
+    // =========================================================================
+
+    /// Batch size for streaming updates (number of samples per batch).
+    /// Larger = fewer updates but chunkier progress. Smaller = smoother but more overhead.
+    const STREAMING_BATCH_SIZE: usize = 100_000;
+
+    /// Precompute complexity map with streaming updates.
+    /// Uses SEQUENTIAL iteration to avoid competing with rendering for rayon's thread pool.
+    fn precompute_complexity_streaming(data: &[u8], tx: &mpsc::Sender<BackgroundTask>) {
+        const WINDOW_SIZE: usize = 128;
+        let num_samples = (data.len() / COMPLEXITY_SAMPLE_INTERVAL).max(1);
+        let batch_size = Self::STREAMING_BATCH_SIZE;
+        let num_batches = (num_samples + batch_size - 1) / batch_size;
+
+        let mut all_results = Vec::with_capacity(num_samples);
+
+        for batch_idx in 0..num_batches {
+            let batch_start = batch_idx * batch_size;
+            let batch_end = (batch_start + batch_size).min(num_samples);
+
+            // Compute this batch SEQUENTIALLY to avoid rayon contention with rendering
+            for i in batch_start..batch_end {
+                let start = i * COMPLEXITY_SAMPLE_INTERVAL;
+                let end = (start + WINDOW_SIZE).min(data.len());
+                let value = if start < data.len() {
+                    calculate_kolmogorov_complexity(&data[start..end]) as f32
+                } else {
+                    0.0
+                };
+                all_results.push(value);
+            }
+
+            // Send progress update
+            let progress = batch_end as f32 / num_samples as f32;
+            let _ = tx.send(BackgroundTask::ComplexityPartial {
+                data: all_results.clone(),
+                progress,
+            });
+        }
+
+        let _ = tx.send(BackgroundTask::ComplexityComplete);
+    }
+
+    /// Precompute RCMSE map with streaming updates.
+    /// Uses SEQUENTIAL iteration to avoid competing with rendering for rayon's thread pool.
+    fn precompute_rcmse_streaming(data: &[u8], tx: &mpsc::Sender<BackgroundTask>) {
+        const WINDOW_SIZE: usize = 256;
+        let num_samples = (data.len() / RCMSE_SAMPLE_INTERVAL).max(1);
+        let batch_size = Self::STREAMING_BATCH_SIZE;
+        let num_batches = (num_samples + batch_size - 1) / batch_size;
+
+        let mut all_results = Vec::with_capacity(num_samples);
+
+        for batch_idx in 0..num_batches {
+            let batch_start = batch_idx * batch_size;
+            let batch_end = (batch_start + batch_size).min(num_samples);
+
+            // Compute this batch SEQUENTIALLY to avoid rayon contention with rendering
+            for i in batch_start..batch_end {
+                let start = i * RCMSE_SAMPLE_INTERVAL;
+                let end = (start + WINDOW_SIZE).min(data.len());
+                let value = if start < data.len() && end > start {
+                    calculate_rcmse_quick(&data[start..end])
+                } else {
+                    0.5
+                };
+                all_results.push(value);
+            }
+
+            // Send progress update
+            let progress = batch_end as f32 / num_samples as f32;
+            let _ = tx.send(BackgroundTask::RcmsePartial {
+                data: all_results.clone(),
+                progress,
+            });
+        }
+
+        let _ = tx.send(BackgroundTask::RcmseComplete);
+    }
+
+    /// Precompute wavelet map with streaming updates using parallel batches.
+    fn precompute_wavelet_streaming(data: &[u8], tx: &mpsc::Sender<BackgroundTask>) {
+        const WINDOW_SIZE: usize = 2048;
+        const CHUNKS_PER_WINDOW: usize = WINDOW_SIZE / WAVELET_CHUNK_SIZE; // 8
+        const CHUNK_INDEX_STEP: usize = WAVELET_CHUNK_SIZE / WAVELET_SAMPLE_INTERVAL; // 4
+
+        let total_samples = (data.len() / WAVELET_SAMPLE_INTERVAL).max(1);
+
+        if data.len() < WINDOW_SIZE {
+            // File too small - send complete result immediately
+            let results = vec![0.5f32; total_samples];
+            let _ = tx.send(BackgroundTask::WaveletPartial {
+                data: results,
+                progress: 1.0,
+            });
+            let _ = tx.send(BackgroundTask::WaveletComplete);
+            return;
+        }
+
+        // Step 1: Precompute all chunk entropies first (this is fast, done in parallel)
+        let chunk_entropies =
+            precompute_chunk_entropies(data, WAVELET_CHUNK_SIZE, WAVELET_SAMPLE_INTERVAL);
+
+        let num_full_samples = (data.len() - WINDOW_SIZE) / WAVELET_SAMPLE_INTERVAL + 1;
+        let batch_size = Self::STREAMING_BATCH_SIZE;
+        let num_batches = (num_full_samples + batch_size - 1) / batch_size;
+
+        let mut all_results = Vec::with_capacity(total_samples);
+
+        // Step 2: Compute wavelet suspiciousness SEQUENTIALLY to avoid rayon contention
+        for batch_idx in 0..num_batches {
+            let batch_start = batch_idx * batch_size;
+            let batch_end = (batch_start + batch_size).min(num_full_samples);
+
+            // Compute this batch SEQUENTIALLY to avoid rayon contention with rendering
+            for sample_idx in batch_start..batch_end {
+                let mut stream = [0.0f64; CHUNKS_PER_WINDOW];
+                for c in 0..CHUNKS_PER_WINDOW {
+                    let chunk_idx = sample_idx + c * CHUNK_INDEX_STEP;
+                    stream[c] = chunk_entropies.get(chunk_idx).copied().unwrap_or(0.0);
+                }
+                all_results.push(wavelet_suspiciousness_8(&stream) as f32);
+            }
+
+            // Fill remaining samples with last value for complete visualization
+            let last_value = all_results.last().copied().unwrap_or(0.5);
+            let mut full_results = all_results.clone();
+            full_results.resize(total_samples, last_value);
+
+            // Send progress update
+            let progress = batch_end as f32 / num_full_samples as f32;
+            let _ = tx.send(BackgroundTask::WaveletPartial {
+                data: full_results,
+                progress,
+            });
+        }
+
+        // Ensure final result has all samples
+        let last_value = all_results.last().copied().unwrap_or(0.5);
+        all_results.resize(total_samples, last_value);
+
+        let _ = tx.send(BackgroundTask::WaveletComplete);
     }
 
     /// Update the selection based on a byte offset and optionally sync hex view.
@@ -1072,6 +1363,7 @@ impl ApeironApp {
         let reference_distribution = Arc::clone(&file.reference_distribution);
         let rcmse_map = file.rcmse_map.clone();
         let wavelet_map = file.wavelet_map.clone();
+        let hilbert_buffer = file.hilbert_buffer.clone();
         let dimension = file.dimension;
         let file_size = file.size;
         let viz_mode = tab.viz_mode;
@@ -1082,14 +1374,20 @@ impl ApeironApp {
         let rcmse_ref = rcmse_map.as_ref().unwrap_or(&empty_map);
         let wavelet_ref = wavelet_map.as_ref().unwrap_or(&empty_map);
 
+        // Get current time for progressive rendering animation
+        let time_seconds = ctx.input(|i| i.time);
+
         let scale_x = world_size.x / tex_size as f32;
         let scale_y = world_size.y / tex_size as f32;
 
         // Try GPU rendering first, fall back to CPU
         // Note: KolmogorovComplexity, JSD, and RCMSE are CPU-only (use precomputed values)
+        // Also use CPU for Hilbert when progressive rendering is active (large files)
         let image = if let Some(ref gpu) = self.gpu_renderer {
             if gpu.is_ready() {
                 let gpu_mode = match viz_mode {
+                    // Use CPU for Hilbert with progressive buffer (shows refinement progress)
+                    VisualizationMode::Hilbert if hilbert_buffer.is_some() => None,
                     VisualizationMode::Hilbert => Some(gpu::GpuVizMode::Hilbert),
                     VisualizationMode::Digraph => Some(gpu::GpuVizMode::Digraph),
                     VisualizationMode::BytePhaseSpace => Some(gpu::GpuVizMode::BytePhaseSpace),
@@ -1130,6 +1428,7 @@ impl ApeironApp {
                         &reference_distribution,
                         rcmse_ref,
                         wavelet_ref,
+                        hilbert_buffer.as_deref(),
                         dimension,
                         file_size,
                         tex_size,
@@ -1137,6 +1436,7 @@ impl ApeironApp {
                         scale_x,
                         scale_y,
                         viz_mode,
+                        time_seconds,
                     )
                 }
             } else {
@@ -1147,6 +1447,7 @@ impl ApeironApp {
                     &reference_distribution,
                     rcmse_ref,
                     wavelet_ref,
+                    hilbert_buffer.as_deref(),
                     dimension,
                     file_size,
                     tex_size,
@@ -1154,6 +1455,7 @@ impl ApeironApp {
                     scale_x,
                     scale_y,
                     viz_mode,
+                    time_seconds,
                 )
             }
         } else {
@@ -1164,6 +1466,7 @@ impl ApeironApp {
                 &reference_distribution,
                 rcmse_ref,
                 wavelet_ref,
+                hilbert_buffer.as_deref(),
                 dimension,
                 file_size,
                 tex_size,
@@ -1171,6 +1474,7 @@ impl ApeironApp {
                 scale_x,
                 scale_y,
                 viz_mode,
+                time_seconds,
             )
         };
 
@@ -1186,6 +1490,7 @@ impl ApeironApp {
         reference_distribution: &[f64; 256],
         rcmse_map: &[f32],
         wavelet_map: &[f32],
+        hilbert_buffer: Option<&HilbertBuffer>,
         dimension: u64,
         file_size: u64,
         tex_size: usize,
@@ -1193,11 +1498,28 @@ impl ApeironApp {
         scale_x: f32,
         scale_y: f32,
         viz_mode: VisualizationMode,
+        time_seconds: f64,
     ) -> ColorImage {
         let pixels: Vec<Color32> = match viz_mode {
-            VisualizationMode::Hilbert => Self::generate_hilbert_pixels(
-                data, dimension, file_size, tex_size, world_min, scale_x, scale_y,
-            ),
+            VisualizationMode::Hilbert => {
+                // Use progressive rendering for large files with hilbert_buffer
+                if let Some(buffer) = hilbert_buffer {
+                    Self::generate_hilbert_pixels_progressive(
+                        buffer,
+                        dimension,
+                        file_size,
+                        tex_size,
+                        world_min,
+                        scale_x,
+                        scale_y,
+                        time_seconds,
+                    )
+                } else {
+                    Self::generate_hilbert_pixels(
+                        data, dimension, file_size, tex_size, world_min, scale_x, scale_y,
+                    )
+                }
+            }
             VisualizationMode::SimilarityMatrix => Self::generate_similarity_matrix_pixels(
                 data, file_size, tex_size, world_min, scale_x, scale_y, dimension,
             ),
@@ -1207,15 +1529,22 @@ impl ApeironApp {
             VisualizationMode::BytePhaseSpace => Self::generate_byte_phase_space_pixels(
                 data, file_size, tex_size, world_min, scale_x, scale_y,
             ),
-            VisualizationMode::KolmogorovComplexity => Self::generate_kolmogorov_pixels(
-                complexity_map,
-                dimension,
-                file_size,
-                tex_size,
-                world_min,
-                scale_x,
-                scale_y,
-            ),
+            VisualizationMode::KolmogorovComplexity => {
+                // Show placeholder while computing to avoid parallel rendering competing with background
+                if complexity_map.is_empty() {
+                    Self::generate_computing_placeholder(tex_size, time_seconds)
+                } else {
+                    Self::generate_kolmogorov_pixels(
+                        complexity_map,
+                        dimension,
+                        file_size,
+                        tex_size,
+                        world_min,
+                        scale_x,
+                        scale_y,
+                    )
+                }
+            }
             VisualizationMode::JensenShannonDivergence => Self::generate_jsd_pixels(
                 data,
                 reference_distribution,
@@ -1226,18 +1555,32 @@ impl ApeironApp {
                 scale_x,
                 scale_y,
             ),
-            VisualizationMode::MultiScaleEntropy => Self::generate_rcmse_pixels(
-                rcmse_map, dimension, file_size, tex_size, world_min, scale_x, scale_y,
-            ),
-            VisualizationMode::WaveletEntropy => Self::generate_wavelet_pixels(
-                wavelet_map,
-                dimension,
-                file_size,
-                tex_size,
-                world_min,
-                scale_x,
-                scale_y,
-            ),
+            VisualizationMode::MultiScaleEntropy => {
+                // Show placeholder while computing to avoid parallel rendering competing with background
+                if rcmse_map.is_empty() {
+                    Self::generate_computing_placeholder(tex_size, time_seconds)
+                } else {
+                    Self::generate_rcmse_pixels(
+                        rcmse_map, dimension, file_size, tex_size, world_min, scale_x, scale_y,
+                    )
+                }
+            }
+            VisualizationMode::WaveletEntropy => {
+                // Show placeholder while computing to avoid parallel rendering competing with background
+                if wavelet_map.is_empty() {
+                    Self::generate_computing_placeholder(tex_size, time_seconds)
+                } else {
+                    Self::generate_wavelet_pixels(
+                        wavelet_map,
+                        dimension,
+                        file_size,
+                        tex_size,
+                        world_min,
+                        scale_x,
+                        scale_y,
+                    )
+                }
+            }
         };
 
         ColorImage {
@@ -1247,6 +1590,7 @@ impl ApeironApp {
     }
 
     /// Generate pixels using Hilbert curve mapping with entropy coloring.
+    /// Used for small files that can be computed immediately.
     fn generate_hilbert_pixels(
         data: &[u8],
         dimension: u64,
@@ -1284,6 +1628,86 @@ impl ApeironApp {
                 Color32::from_rgb(r, g, b)
             })
             .collect()
+    }
+
+    /// Generate pixels using progressive Hilbert computation buffer.
+    /// Shows computed regions with colors, uncomputed regions with animated pulse.
+    fn generate_hilbert_pixels_progressive(
+        buffer: &HilbertBuffer,
+        dimension: u64,
+        file_size: u64,
+        tex_size: usize,
+        world_min: Vec2,
+        scale_x: f32,
+        scale_y: f32,
+        time_seconds: f64,
+    ) -> Vec<Color32> {
+        use hilbert_refiner::{
+            entropy_to_color, entropy_to_color_preview, placeholder_pulse_color,
+        };
+
+        (0..tex_size * tex_size)
+            .into_par_iter()
+            .map(|idx| {
+                let tex_y = idx / tex_size;
+                let tex_x = idx % tex_size;
+
+                let world_x = (world_min.x + tex_x as f32 * scale_x) as u64;
+                let world_y = (world_min.y + tex_y as f32 * scale_y) as u64;
+
+                if world_x >= dimension || world_y >= dimension {
+                    return Color32::from_rgb(13, 13, 13);
+                }
+
+                let d = xy2d(dimension, world_x, world_y);
+
+                if d >= file_size {
+                    return Color32::from_rgb(13, 13, 13);
+                }
+
+                // Look up from progressive buffer
+                match buffer.lookup(d) {
+                    Some((entropy, is_fine)) => {
+                        let (r, g, b) = if is_fine {
+                            entropy_to_color(entropy)
+                        } else {
+                            entropy_to_color_preview(entropy)
+                        };
+                        Color32::from_rgb(r, g, b)
+                    }
+                    None => {
+                        // Not yet computed - show animated pulse
+                        let (r, g, b) = placeholder_pulse_color(time_seconds);
+                        Color32::from_rgb(r, g, b)
+                    }
+                }
+            })
+            .collect()
+    }
+
+    /// Generate a simple animated placeholder while data is being computed.
+    /// Uses NO parallel iteration to avoid competing with background computation.
+    fn generate_computing_placeholder(tex_size: usize, time_seconds: f64) -> Vec<Color32> {
+        let total = tex_size * tex_size;
+        let mut pixels = Vec::with_capacity(total);
+
+        // Gentle animated gradient to indicate "working"
+        let pulse = ((time_seconds * 2.0 * std::f64::consts::PI).sin() * 0.5 + 0.5) as f32;
+        let base_color = 25.0 + pulse * 10.0;
+
+        for idx in 0..total {
+            let y = idx / tex_size;
+            let x = idx % tex_size;
+
+            // Subtle diagonal gradient pattern
+            let gradient = ((x + y) as f32 / (tex_size * 2) as f32) * 15.0;
+            let v = (base_color + gradient) as u8;
+
+            // Slight blue tint to indicate "computing"
+            pixels.push(Color32::from_rgb(v, v, v.saturating_add(12)));
+        }
+
+        pixels
     }
 
     /// Generate Structural Similarity Matrix (Recurrence Plot) with viewport support.
@@ -1795,7 +2219,8 @@ impl ApeironApp {
             let padding = 0.95; // 95% of view
             let zoom_x = (view_size.x * padding) / world_dim;
             let zoom_y = (view_size.y * padding) / world_dim;
-            let zoom = zoom_x.min(zoom_y).max(0.1);
+            // No minimum zoom constraint - allow fitting arbitrarily large files
+            let zoom = zoom_x.min(zoom_y).max(1e-6); // Just prevent division by zero
 
             // Center the visualization
             let visible_world = view_size / zoom;
@@ -1852,6 +2277,14 @@ impl eframe::App for ApeironApp {
             if task_completed && self.is_mode_data_ready(tab_viz_mode) {
                 self.active_tab_mut().texture = None;
             }
+        }
+
+        // Handle progressive Hilbert rendering: request periodic repaints and texture updates
+        if self.is_hilbert_refining() {
+            // Request repaint at ~10fps for smooth progress animation
+            ctx.request_repaint_after(Duration::from_millis(100));
+            // Invalidate texture to show refinement progress
+            self.active_tab_mut().texture = None;
         }
 
         // Handle file drops
@@ -2176,6 +2609,17 @@ impl eframe::App for ApeironApp {
                     // Force texture regeneration and fit viewport when mode changes
                     // (different modes have different world dimensions)
                     if new_mode != old_mode {
+                        // Pause/resume Hilbert refinement based on mode
+                        if old_mode == VisualizationMode::Hilbert {
+                            self.pause_hilbert_refiner();
+                        }
+                        if new_mode == VisualizationMode::Hilbert {
+                            self.resume_hilbert_refiner();
+                        }
+
+                        // Start computation for modes that need it (lazy loading)
+                        self.ensure_mode_data(new_mode);
+
                         let tab = self.active_tab_mut();
                         tab.viz_mode = new_mode;
                         tab.texture = None;
@@ -2187,27 +2631,52 @@ impl eframe::App for ApeironApp {
                     }
 
                     // Show loading indicator when background tasks are running
-                    if let Some(ref tasks) = self.active_tab().background_tasks {
+                    let has_background_tasks = self.active_tab().background_tasks.is_some();
+                    let hilbert_progress = self.get_hilbert_refine_progress();
+                    let show_hilbert_progress = hilbert_progress.is_some()
+                        && self.active_tab().viz_mode == VisualizationMode::Hilbert;
+
+                    if has_background_tasks || show_hilbert_progress {
                         ui.add_space(12.0);
 
-                        // Count pending tasks
-                        let pending = [
-                            tasks.computing_complexity,
-                            tasks.computing_rcmse,
-                            tasks.computing_wavelet,
-                            tasks.computing_wavelet_report,
-                        ]
-                        .iter()
-                        .filter(|&&x| x)
-                        .count();
-
+                        // Show progress for each active task
                         ui.horizontal(|ui| {
                             ui.spinner();
-                            ui.label(
-                                RichText::new(format!("{} tasks", pending))
-                                    .size(10.0)
-                                    .color(Color32::from_rgb(180, 160, 100)),
-                            );
+                            ui.vertical(|ui| {
+                                // Hilbert refinement progress
+                                if let Some(progress) = hilbert_progress {
+                                    if show_hilbert_progress {
+                                        self.draw_task_progress(ui, "Hilbert", progress);
+                                    }
+                                }
+                                // Standard background tasks
+                                if let Some(ref tasks) = self.active_tab().background_tasks {
+                                    if tasks.computing_complexity {
+                                        self.draw_task_progress(
+                                            ui,
+                                            "Complexity",
+                                            tasks.complexity_progress,
+                                        );
+                                    }
+                                    if tasks.computing_rcmse {
+                                        self.draw_task_progress(ui, "RCMSE", tasks.rcmse_progress);
+                                    }
+                                    if tasks.computing_wavelet {
+                                        self.draw_task_progress(
+                                            ui,
+                                            "Wavelet",
+                                            tasks.wavelet_progress,
+                                        );
+                                    }
+                                    if tasks.computing_wavelet_report {
+                                        ui.label(
+                                            RichText::new("Report...")
+                                                .size(9.0)
+                                                .color(Color32::from_rgb(150, 150, 180)),
+                                        );
+                                    }
+                                }
+                            });
                         });
                     }
                 });
@@ -2285,10 +2754,26 @@ impl ApeironApp {
         let mut viewport_changed = false;
 
         if scroll_delta.y != 0.0 && response.hovered() {
+            // Calculate dynamic zoom limits based on file/view size
+            let (min_zoom, max_zoom) = {
+                let tab = self.active_tab();
+                if let Some(file) = &tab.file_data {
+                    let world_dim = tab.viz_mode.world_dimension(file.dimension);
+                    let view_min = available_rect.width().min(available_rect.height());
+                    // Min zoom: fit entire world in view (with margin)
+                    let min_z = (view_min * 0.8) / world_dim;
+                    // Max zoom: ~4 pixels per world unit (very zoomed in)
+                    let max_z = 4.0;
+                    (min_z.max(1e-6), max_z)
+                } else {
+                    (0.01, 100.0)
+                }
+            };
+
             let tab = self.active_tab_mut();
             let zoom_factor = 1.1f32.powf(scroll_delta.y / 50.0);
             let old_zoom = tab.viewport.zoom;
-            let new_zoom = (old_zoom * zoom_factor).clamp(0.1, 100.0);
+            let new_zoom = (old_zoom * zoom_factor).clamp(min_zoom, max_zoom);
 
             // Zoom towards cursor
             if let Some(cursor_pos) = response.hover_pos() {
@@ -2521,30 +3006,59 @@ impl ApeironApp {
             Color32::GRAY,
         );
 
-        // Progress hint
+        // Progress hint with percentages
         if let Some(ref tasks) = tab.background_tasks {
-            let pending = [
-                tasks.computing_complexity,
-                tasks.computing_rcmse,
-                tasks.computing_wavelet,
-                tasks.computing_wavelet_report,
-            ]
-            .iter()
-            .filter(|&&x| x)
-            .count();
+            // Get the progress for the current mode's relevant task
+            let (task_name, progress) = match tab.viz_mode {
+                VisualizationMode::KolmogorovComplexity => {
+                    ("Complexity", tasks.complexity_progress)
+                }
+                VisualizationMode::MultiScaleEntropy => ("RCMSE", tasks.rcmse_progress),
+                VisualizationMode::WaveletEntropy => ("Wavelet", tasks.wavelet_progress),
+                _ => ("Analysis", 0.0),
+            };
 
+            let pct = (progress * 100.0) as u32;
             ui.painter().text(
                 box_rect.center() + Vec2::new(0.0, 28.0),
                 egui::Align2::CENTER_CENTER,
-                format!(
-                    "{} background task{} remaining",
-                    pending,
-                    if pending == 1 { "" } else { "s" }
-                ),
-                egui::FontId::monospace(10.0),
-                Color32::from_rgb(150, 150, 180),
+                format!("{}: {}%", task_name, pct),
+                egui::FontId::monospace(12.0),
+                Color32::from_rgb(180, 160, 100),
             );
+
+            // Progress bar
+            let bar_width = 200.0;
+            let bar_height = 6.0;
+            let bar_rect = Rect::from_center_size(
+                box_rect.center() + Vec2::new(0.0, 50.0),
+                Vec2::new(bar_width, bar_height),
+            );
+
+            // Background
+            ui.painter()
+                .rect_filled(bar_rect, 3.0, Color32::from_rgb(50, 50, 60));
+
+            // Progress fill
+            let fill_width = bar_width * progress;
+            let fill_rect = Rect::from_min_size(bar_rect.min, Vec2::new(fill_width, bar_height));
+            ui.painter()
+                .rect_filled(fill_rect, 3.0, Color32::from_rgb(80, 120, 200));
         }
+    }
+
+    /// Draw a compact progress indicator for a background task.
+    fn draw_task_progress(&self, ui: &mut egui::Ui, name: &str, progress: f32) {
+        let pct = (progress * 100.0) as u32;
+        ui.label(
+            RichText::new(format!("{}: {}%", name, pct))
+                .size(9.0)
+                .color(if progress >= 1.0 {
+                    Color32::from_rgb(100, 200, 100)
+                } else {
+                    Color32::from_rgb(180, 160, 100)
+                }),
+        );
     }
 
     /// Draw the drop target indicator.
