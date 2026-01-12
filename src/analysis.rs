@@ -683,6 +683,8 @@ pub fn calculate_rcmse_quick(data: &[u8]) -> f32 {
 pub const WAVELET_CHUNK_SIZE: usize = 256;
 
 /// Compute Shannon entropy for a single chunk (returns 0-8 bits)
+/// Note: Used by tests and the non-optimized path. Production uses chunk_entropy_fast.
+#[allow(dead_code)]
 #[inline]
 fn chunk_entropy(chunk: &[u8]) -> f64 {
     if chunk.is_empty() {
@@ -709,6 +711,8 @@ fn chunk_entropy(chunk: &[u8]) -> f64 {
 
 /// Compute the entropy stream from raw file data.
 /// Each element is the Shannon entropy of a 256-byte chunk.
+/// Note: Used by tests and the non-optimized path. Production uses precompute_chunk_entropies.
+#[allow(dead_code)]
 pub fn compute_entropy_stream(data: &[u8]) -> Vec<f64> {
     if data.is_empty() {
         return Vec::new();
@@ -730,6 +734,8 @@ pub fn compute_entropy_stream(data: &[u8]) -> Vec<f64> {
 /// Returns wavelet coefficients organized by level: Vec<Vec<f64>>
 /// Level 0 is coarsest (1 coefficient), level J-1 is finest (2^(J-1) coefficients)
 /// where J = floor(log2(signal.len()))
+/// Note: Used by tests and WaveletAnalysis. Production uses wavelet_suspiciousness_8.
+#[allow(dead_code)]
 pub fn haar_wavelet_transform(signal: &[f64]) -> Vec<Vec<f64>> {
     if signal.is_empty() {
         return Vec::new();
@@ -780,6 +786,8 @@ pub fn haar_wavelet_transform(signal: &[f64]) -> Vec<Vec<f64>> {
 /// Compute energy spectrum from wavelet coefficients.
 /// Energy at level j = sum of squared coefficients at that level.
 /// Returns Vec<f64> where index 0 is coarsest level energy.
+/// Note: Used by tests and WaveletAnalysis. Production computes energy inline.
+#[allow(dead_code)]
 pub fn wavelet_energy_spectrum(coefficients: &[Vec<f64>]) -> Vec<f64> {
     coefficients
         .iter()
@@ -788,6 +796,8 @@ pub fn wavelet_energy_spectrum(coefficients: &[Vec<f64>]) -> Vec<f64> {
 }
 
 /// Wavelet entropy analysis results for visualization and classification.
+/// Note: Used by tests. Production uses wavelet_suspiciousness_8 directly.
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct WaveletAnalysis {
     /// Energy at each resolution level (index 0 = coarsest)
@@ -916,6 +926,8 @@ impl WaveletAnalysis {
 
 /// Calculate a quick wavelet suspiciousness value for visualization.
 /// Returns a value between 0.0 and 1.0.
+/// Note: Used by tests. Production uses precompute_chunk_entropies + wavelet_suspiciousness_8.
+#[allow(dead_code)]
 pub fn calculate_wavelet_suspiciousness(data: &[u8]) -> f32 {
     let stream = compute_entropy_stream(data);
     if stream.len() < 4 {
@@ -923,6 +935,248 @@ pub fn calculate_wavelet_suspiciousness(data: &[u8]) -> f32 {
     }
     let analysis = WaveletAnalysis::from_entropy_stream(&stream);
     analysis.suspiciousness as f32
+}
+
+// =============================================================================
+// Optimized Wavelet Analysis (Zero-Allocation, Unrolled)
+// =============================================================================
+
+/// Optimized entropy calculation for a 256-byte chunk.
+/// Uses precomputed reciprocal and avoids branching where possible.
+#[inline(always)]
+fn chunk_entropy_fast(chunk: &[u8]) -> f64 {
+    debug_assert!(!chunk.is_empty());
+
+    let mut counts = [0u32; 256];
+    for &byte in chunk {
+        counts[byte as usize] += 1;
+    }
+
+    let total = chunk.len() as f64;
+    let inv_total = 1.0 / total;
+    let log2_total = total.log2();
+
+    // H = -Σ p_i * log2(p_i) = -Σ (c_i/n) * log2(c_i/n)
+    //   = -Σ (c_i/n) * (log2(c_i) - log2(n))
+    //   = -Σ (c_i/n) * log2(c_i) + Σ (c_i/n) * log2(n)
+    //   = log2(n) - (1/n) * Σ c_i * log2(c_i)
+    let mut sum_c_log_c = 0.0f64;
+    for &count in &counts {
+        if count > 0 {
+            let c = count as f64;
+            sum_c_log_c += c * c.log2();
+        }
+    }
+
+    log2_total - inv_total * sum_c_log_c
+}
+
+/// Precompute entropy values for all chunks at a given interval.
+/// Returns entropies for chunks starting at positions 0, interval, 2*interval, ...
+pub fn precompute_chunk_entropies(data: &[u8], chunk_size: usize, interval: usize) -> Vec<f64> {
+    if data.len() < chunk_size {
+        return Vec::new();
+    }
+
+    let num_positions = (data.len() - chunk_size) / interval + 1;
+
+    (0..num_positions)
+        .into_par_iter()
+        .map(|i| {
+            let start = i * interval;
+            let end = start + chunk_size;
+            if end <= data.len() {
+                chunk_entropy_fast(&data[start..end])
+            } else {
+                chunk_entropy_fast(&data[start..])
+            }
+        })
+        .collect()
+}
+
+/// Highly optimized wavelet suspiciousness for exactly 8 entropy values.
+/// Performs unrolled Haar wavelet transform and computes suspiciousness in one pass.
+/// Zero heap allocations.
+#[inline(always)]
+pub fn wavelet_suspiciousness_8(stream: &[f64; 8]) -> f64 {
+    // Unrolled Haar wavelet transform for 8 elements (3 levels)
+    //
+    // Level 2 (finest): 4 detail coefficients from pairs
+    let d2_0 = (stream[0] - stream[1]) * 0.5;
+    let d2_1 = (stream[2] - stream[3]) * 0.5;
+    let d2_2 = (stream[4] - stream[5]) * 0.5;
+    let d2_3 = (stream[6] - stream[7]) * 0.5;
+
+    // Level 2 averages (for next level)
+    let a2_0 = (stream[0] + stream[1]) * 0.5;
+    let a2_1 = (stream[2] + stream[3]) * 0.5;
+    let a2_2 = (stream[4] + stream[5]) * 0.5;
+    let a2_3 = (stream[6] + stream[7]) * 0.5;
+
+    // Level 1: 2 detail coefficients
+    let d1_0 = (a2_0 - a2_1) * 0.5;
+    let d1_1 = (a2_2 - a2_3) * 0.5;
+
+    // Level 1 averages
+    let a1_0 = (a2_0 + a2_1) * 0.5;
+    let a1_1 = (a2_2 + a2_3) * 0.5;
+
+    // Level 0 (coarsest): 1 detail coefficient
+    let d0_0 = (a1_0 - a1_1) * 0.5;
+
+    // Compute energies at each level
+    let e2 = d2_0 * d2_0 + d2_1 * d2_1 + d2_2 * d2_2 + d2_3 * d2_3; // Fine (4 coeffs)
+    let e1 = d1_0 * d1_0 + d1_1 * d1_1; // Mid (2 coeffs)
+    let e0 = d0_0 * d0_0; // Coarse (1 coeff)
+
+    let total_energy = e0 + e1 + e2;
+
+    if total_energy < 1e-10 {
+        return 0.5; // No variation, neutral suspiciousness
+    }
+
+    // Coarse energy ratio: levels 0 and 1 (first 2 of 3 levels)
+    // Per paper: malware concentrates energy at coarse levels
+    let coarse_energy = e0 + e1;
+    let coarse_ratio = coarse_energy / total_energy;
+
+    // Energy variance for additional suspiciousness signal
+    let mean_energy = total_energy * (1.0 / 3.0);
+    let var = (e0 - mean_energy) * (e0 - mean_energy)
+        + (e1 - mean_energy) * (e1 - mean_energy)
+        + (e2 - mean_energy) * (e2 - mean_energy);
+    let std = (var * (1.0 / 3.0)).sqrt();
+    let cv = std / mean_energy;
+
+    // Combined suspiciousness (same formula as WaveletAnalysis)
+    let ratio_susp = ((coarse_ratio - 0.3) * 2.5).clamp(0.0, 1.0); // 1/0.4 = 2.5
+    let var_susp = (cv * 0.5).clamp(0.0, 1.0); // 1/2.0 = 0.5
+
+    ratio_susp * 0.7 + var_susp * 0.3
+}
+
+/// Optimized wavelet suspiciousness for 4 entropy values (2 levels).
+/// Reserved for smaller window analysis.
+#[allow(dead_code)]
+#[inline(always)]
+pub fn wavelet_suspiciousness_4(stream: &[f64; 4]) -> f64 {
+    // Level 1 (finest): 2 detail coefficients
+    let d1_0 = (stream[0] - stream[1]) * 0.5;
+    let d1_1 = (stream[2] - stream[3]) * 0.5;
+
+    // Level 1 averages
+    let a1_0 = (stream[0] + stream[1]) * 0.5;
+    let a1_1 = (stream[2] + stream[3]) * 0.5;
+
+    // Level 0 (coarsest): 1 detail coefficient
+    let d0_0 = (a1_0 - a1_1) * 0.5;
+
+    // Energies
+    let e1 = d1_0 * d1_0 + d1_1 * d1_1; // Fine
+    let e0 = d0_0 * d0_0; // Coarse
+
+    let total_energy = e0 + e1;
+
+    if total_energy < 1e-10 {
+        return 0.5;
+    }
+
+    // For 2 levels, coarse = level 0 only
+    let coarse_ratio = e0 / total_energy;
+
+    let mean_energy = total_energy * 0.5;
+    let var = (e0 - mean_energy) * (e0 - mean_energy) + (e1 - mean_energy) * (e1 - mean_energy);
+    let std = (var * 0.5).sqrt();
+    let cv = std / mean_energy;
+
+    let ratio_susp = ((coarse_ratio - 0.3) * 2.5).clamp(0.0, 1.0);
+    let var_susp = (cv * 0.5).clamp(0.0, 1.0);
+
+    ratio_susp * 0.7 + var_susp * 0.3
+}
+
+/// Optimized wavelet suspiciousness for 16 entropy values (4 levels).
+/// Reserved for larger window analysis with more precision.
+#[allow(dead_code)]
+#[inline(always)]
+pub fn wavelet_suspiciousness_16(stream: &[f64; 16]) -> f64 {
+    // Level 3 (finest): 8 detail coefficients
+    let d3: [f64; 8] = [
+        (stream[0] - stream[1]) * 0.5,
+        (stream[2] - stream[3]) * 0.5,
+        (stream[4] - stream[5]) * 0.5,
+        (stream[6] - stream[7]) * 0.5,
+        (stream[8] - stream[9]) * 0.5,
+        (stream[10] - stream[11]) * 0.5,
+        (stream[12] - stream[13]) * 0.5,
+        (stream[14] - stream[15]) * 0.5,
+    ];
+
+    // Level 3 averages
+    let a3: [f64; 8] = [
+        (stream[0] + stream[1]) * 0.5,
+        (stream[2] + stream[3]) * 0.5,
+        (stream[4] + stream[5]) * 0.5,
+        (stream[6] + stream[7]) * 0.5,
+        (stream[8] + stream[9]) * 0.5,
+        (stream[10] + stream[11]) * 0.5,
+        (stream[12] + stream[13]) * 0.5,
+        (stream[14] + stream[15]) * 0.5,
+    ];
+
+    // Level 2: 4 detail coefficients
+    let d2: [f64; 4] = [
+        (a3[0] - a3[1]) * 0.5,
+        (a3[2] - a3[3]) * 0.5,
+        (a3[4] - a3[5]) * 0.5,
+        (a3[6] - a3[7]) * 0.5,
+    ];
+
+    let a2: [f64; 4] = [
+        (a3[0] + a3[1]) * 0.5,
+        (a3[2] + a3[3]) * 0.5,
+        (a3[4] + a3[5]) * 0.5,
+        (a3[6] + a3[7]) * 0.5,
+    ];
+
+    // Level 1: 2 detail coefficients
+    let d1_0 = (a2[0] - a2[1]) * 0.5;
+    let d1_1 = (a2[2] - a2[3]) * 0.5;
+
+    let a1_0 = (a2[0] + a2[1]) * 0.5;
+    let a1_1 = (a2[2] + a2[3]) * 0.5;
+
+    // Level 0 (coarsest): 1 detail coefficient
+    let d0_0 = (a1_0 - a1_1) * 0.5;
+
+    // Compute energies
+    let e3: f64 = d3.iter().map(|x| x * x).sum();
+    let e2: f64 = d2.iter().map(|x| x * x).sum();
+    let e1 = d1_0 * d1_0 + d1_1 * d1_1;
+    let e0 = d0_0 * d0_0;
+
+    let total_energy = e0 + e1 + e2 + e3;
+
+    if total_energy < 1e-10 {
+        return 0.5;
+    }
+
+    // For 4 levels, coarse = levels 0 and 1 (first half)
+    let coarse_energy = e0 + e1;
+    let coarse_ratio = coarse_energy / total_energy;
+
+    let mean_energy = total_energy * 0.25;
+    let var = (e0 - mean_energy) * (e0 - mean_energy)
+        + (e1 - mean_energy) * (e1 - mean_energy)
+        + (e2 - mean_energy) * (e2 - mean_energy)
+        + (e3 - mean_energy) * (e3 - mean_energy);
+    let std = (var * 0.25).sqrt();
+    let cv = std / mean_energy;
+
+    let ratio_susp = ((coarse_ratio - 0.3) * 2.5).clamp(0.0, 1.0);
+    let var_susp = (cv * 0.5).clamp(0.0, 1.0);
+
+    ratio_susp * 0.7 + var_susp * 0.3
 }
 
 impl JSDAnalysis {
@@ -1493,5 +1747,82 @@ mod tests {
             "Suspiciousness out of range: {}",
             suspiciousness
         );
+    }
+
+    #[test]
+    fn test_optimized_wavelet_matches_original() {
+        // Verify that wavelet_suspiciousness_8 produces same results as WaveletAnalysis
+        let test_streams: [[f64; 8]; 4] = [
+            [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0], // Linear ramp
+            [5.0, 5.0, 5.0, 5.0, 5.0, 5.0, 5.0, 5.0], // Constant
+            [1.0, 7.0, 2.0, 6.0, 3.0, 5.0, 4.0, 4.0], // Varying
+            [7.5, 7.5, 7.5, 7.5, 1.0, 1.0, 1.0, 1.0], // Step (suspicious pattern)
+        ];
+
+        for stream in &test_streams {
+            let original = super::WaveletAnalysis::from_entropy_stream(stream);
+            let optimized = super::wavelet_suspiciousness_8(stream);
+
+            let diff = (original.suspiciousness - optimized).abs();
+            assert!(
+                diff < 1e-10,
+                "Mismatch: original={}, optimized={}, diff={}",
+                original.suspiciousness,
+                optimized,
+                diff
+            );
+        }
+    }
+
+    #[test]
+    fn test_precompute_chunk_entropies() {
+        // Test that precompute_chunk_entropies produces same results as individual calls
+        let data: Vec<u8> = (0..1024).map(|i| (i % 256) as u8).collect();
+        let chunk_size = 256;
+        let interval = 64;
+
+        let precomputed = super::precompute_chunk_entropies(&data, chunk_size, interval);
+
+        // Verify each precomputed value matches direct calculation
+        for (i, &precomputed_entropy) in precomputed.iter().enumerate() {
+            let start = i * interval;
+            let end = (start + chunk_size).min(data.len());
+            let direct_entropy = super::chunk_entropy(&data[start..end]);
+
+            let diff = (precomputed_entropy - direct_entropy).abs();
+            assert!(
+                diff < 1e-10,
+                "Chunk {} mismatch: precomputed={}, direct={}, diff={}",
+                i,
+                precomputed_entropy,
+                direct_entropy,
+                diff
+            );
+        }
+    }
+
+    #[test]
+    fn test_chunk_entropy_fast_matches_original() {
+        // Verify chunk_entropy_fast produces same results as chunk_entropy
+        let test_chunks: [&[u8]; 4] = [
+            &[0u8; 256],                                                 // All zeros
+            &(0..=255).collect::<Vec<u8>>(),                             // All values
+            &vec![0xAB; 256],                                            // Single value
+            &(0..256).map(|i| (i * 7 % 256) as u8).collect::<Vec<u8>>(), // Pseudo-random
+        ];
+
+        for chunk in test_chunks {
+            let original = super::chunk_entropy(chunk);
+            let fast = super::chunk_entropy_fast(chunk);
+
+            let diff = (original - fast).abs();
+            assert!(
+                diff < 1e-10,
+                "Entropy mismatch: original={}, fast={}, diff={}",
+                original,
+                fast,
+                diff
+            );
+        }
     }
 }

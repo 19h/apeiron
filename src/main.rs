@@ -18,8 +18,9 @@ use rayon::prelude::*;
 
 use analysis::{
     byte_distribution, calculate_entropy, calculate_jsd, calculate_kolmogorov_complexity,
-    calculate_rcmse_quick, calculate_wavelet_suspiciousness, extract_ascii, format_bytes,
-    identify_file_type, ByteAnalysis, JSDAnalysis, KolmogorovAnalysis, ANALYSIS_WINDOW,
+    calculate_rcmse_quick, extract_ascii, format_bytes, identify_file_type,
+    precompute_chunk_entropies, wavelet_suspiciousness_8, ByteAnalysis, JSDAnalysis,
+    KolmogorovAnalysis, ANALYSIS_WINDOW, WAVELET_CHUNK_SIZE,
 };
 use hilbert::{calculate_dimension, d2xy, xy2d};
 
@@ -514,26 +515,60 @@ impl NeuroCoreApp {
     }
 
     /// Precompute wavelet suspiciousness values for the file.
-    /// Uses larger windows for meaningful multi-scale analysis.
+    ///
+    /// HEAVILY OPTIMIZED: Instead of recomputing entropy for each overlapping window,
+    /// we precompute all unique chunk entropies once, then look them up.
+    ///
+    /// This reduces entropy calculations from O(num_samples * 8) to O(num_chunks),
+    /// which is ~8x faster for typical files with overlapping windows.
     fn precompute_wavelet_map(data: &[u8]) -> Vec<f32> {
-        // Window needs to contain multiple 256-byte chunks for wavelet analysis
-        // 2048 bytes = 8 chunks = 3 wavelet levels
+        // Window: 2048 bytes = 8 chunks of 256 bytes = 3 wavelet levels
         const WINDOW_SIZE: usize = 2048;
+        const CHUNKS_PER_WINDOW: usize = WINDOW_SIZE / WAVELET_CHUNK_SIZE; // 8
+        const CHUNK_INDEX_STEP: usize = WAVELET_CHUNK_SIZE / WAVELET_SAMPLE_INTERVAL; // 256/64 = 4
 
-        let num_samples = (data.len() / WAVELET_SAMPLE_INTERVAL).max(1);
+        if data.len() < WINDOW_SIZE {
+            // File too small for meaningful wavelet analysis
+            let num_samples = (data.len() / WAVELET_SAMPLE_INTERVAL).max(1);
+            return vec![0.5; num_samples];
+        }
 
-        (0..num_samples)
+        // Step 1: Precompute entropy for ALL chunks at WAVELET_SAMPLE_INTERVAL boundaries
+        // This is the key optimization - each chunk entropy is computed exactly once
+        let chunk_entropies =
+            precompute_chunk_entropies(data, WAVELET_CHUNK_SIZE, WAVELET_SAMPLE_INTERVAL);
+
+        // Number of valid samples (where we have a full 2048-byte window)
+        let num_full_samples = (data.len() - WINDOW_SIZE) / WAVELET_SAMPLE_INTERVAL + 1;
+        let total_samples = (data.len() / WAVELET_SAMPLE_INTERVAL).max(1);
+
+        // Step 2: For each sample, look up 8 chunk entropies and compute wavelet suspiciousness
+        let mut results: Vec<f32> = (0..num_full_samples)
             .into_par_iter()
-            .map(|i| {
-                let start = i * WAVELET_SAMPLE_INTERVAL;
-                let end = (start + WINDOW_SIZE).min(data.len());
-                if start < data.len() && end > start {
-                    calculate_wavelet_suspiciousness(&data[start..end])
-                } else {
-                    0.5 // Default to middle value
+            .map(|sample_idx| {
+                // Build entropy stream from precomputed chunks
+                // For sample at position sample_idx * 64, chunks are at:
+                //   sample_idx * 64 + 0*256, sample_idx * 64 + 1*256, ..., sample_idx * 64 + 7*256
+                // In chunk_entropies array (indexed by position/64), these are:
+                //   sample_idx, sample_idx + 4, sample_idx + 8, ..., sample_idx + 28
+                let mut stream = [0.0f64; CHUNKS_PER_WINDOW];
+                for c in 0..CHUNKS_PER_WINDOW {
+                    let chunk_idx = sample_idx + c * CHUNK_INDEX_STEP;
+                    stream[c] = chunk_entropies.get(chunk_idx).copied().unwrap_or(0.0);
                 }
+
+                // Use unrolled wavelet transform (zero allocations)
+                wavelet_suspiciousness_8(&stream) as f32
             })
-            .collect()
+            .collect();
+
+        // Fill remaining samples (near end of file) with last valid value or 0.5
+        if total_samples > num_full_samples {
+            let last_value = results.last().copied().unwrap_or(0.5);
+            results.resize(total_samples, last_value);
+        }
+
+        results
     }
 
     /// Look up precomputed wavelet suspiciousness value for a file offset.
