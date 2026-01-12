@@ -157,6 +157,8 @@ struct NeuroCoreApp {
     is_drop_target: bool,
     /// Whether viewport needs to be fitted to view (after load or mode change).
     needs_fit_to_view: bool,
+    /// View size used for the last fit_to_view call (to detect when re-fit is needed).
+    last_fit_view_size: Option<Vec2>,
     /// GPU renderer for accelerated visualization.
     gpu_renderer: Option<gpu::GpuRenderer>,
 }
@@ -374,6 +376,7 @@ impl Default for NeuroCoreApp {
             show_help: false,
             is_drop_target: false,
             needs_fit_to_view: false,
+            last_fit_view_size: None,
             gpu_renderer: None,
         }
     }
@@ -1462,6 +1465,7 @@ impl NeuroCoreApp {
     fn reset_viewport(&mut self) {
         self.viewport = Viewport::default();
         self.needs_fit_to_view = true;
+        self.last_fit_view_size = None;
         // Clear texture so it regenerates for the new viewport
         self.texture = None;
         self.texture_params = None;
@@ -1485,8 +1489,27 @@ impl NeuroCoreApp {
 
             self.viewport.zoom = zoom;
             self.viewport.offset = Vec2::new(offset_x, offset_y);
+
+            // Store the view size used for this fit
+            self.last_fit_view_size = Some(view_size);
+
+            // Clear texture to force regeneration with new viewport
+            self.texture = None;
+            self.texture_params = None;
         }
         self.needs_fit_to_view = false;
+    }
+
+    /// Check if the view size has changed significantly since the last fit.
+    fn should_refit(&self, current_view_size: Vec2) -> bool {
+        if let Some(last_size) = self.last_fit_view_size {
+            // Re-fit if view size changed by more than 5%
+            let delta_x = (current_view_size.x - last_size.x).abs() / last_size.x.max(1.0);
+            let delta_y = (current_view_size.y - last_size.y).abs() / last_size.y.max(1.0);
+            delta_x > 0.05 || delta_y > 0.05
+        } else {
+            false
+        }
     }
 }
 
@@ -1555,6 +1578,7 @@ impl eframe::App for NeuroCoreApp {
                     // Reset viewport completely to ensure proper fit
                     self.viewport = Viewport::default();
                     self.needs_fit_to_view = true;
+                    self.last_fit_view_size = None;
                 }
             });
         });
@@ -1611,12 +1635,14 @@ impl NeuroCoreApp {
         }
 
         // Fit viewport to view if needed (after load or mode change)
+        // Also re-fit if view size changed significantly (handles layout settling, window resize)
         // Only fit if view has valid non-zero size
-        if self.needs_fit_to_view
-            && available_rect.width() > 100.0
-            && available_rect.height() > 100.0
-        {
-            self.fit_to_view(available_rect.size());
+        let view_size = available_rect.size();
+        let should_fit =
+            self.needs_fit_to_view || (self.file_data.is_some() && self.should_refit(view_size));
+
+        if should_fit && view_size.x > 100.0 && view_size.y > 100.0 {
+            self.fit_to_view(view_size);
         }
 
         // Interactive area for pan/zoom
