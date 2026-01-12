@@ -110,8 +110,9 @@ mod tests {
 
     #[test]
     fn test_dimension_calculation() {
-        assert_eq!(calculate_dimension(0), 4096);
-        assert_eq!(calculate_dimension(1000), 4096);
+        assert_eq!(calculate_dimension(0), 64);
+        assert_eq!(calculate_dimension(1000), 64); // sqrt(1000) ≈ 32, rounds up to 64
+        assert_eq!(calculate_dimension(10000), 128); // sqrt(10000) = 100, rounds up to 128
         assert!(calculate_dimension(100_000_000) >= 10000);
     }
 

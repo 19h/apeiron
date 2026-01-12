@@ -17,8 +17,9 @@ use eframe::egui::{self, Color32, ColorImage, Pos2, Rect, RichText, Sense, Textu
 use rayon::prelude::*;
 
 use analysis::{
-    calculate_entropy, calculate_kolmogorov_complexity, extract_ascii, format_bytes,
-    identify_file_type, ByteAnalysis, KolmogorovAnalysis, ANALYSIS_WINDOW,
+    byte_distribution, calculate_entropy, calculate_jsd, calculate_kolmogorov_complexity,
+    extract_ascii, format_bytes, identify_file_type, ByteAnalysis, JSDAnalysis, KolmogorovAnalysis,
+    ANALYSIS_WINDOW,
 };
 use hilbert::{calculate_dimension, d2xy, xy2d};
 
@@ -40,6 +41,8 @@ enum VisualizationMode {
     BytePhaseSpace,
     /// Kolmogorov complexity approximation - shows algorithmic complexity via compression.
     KolmogorovComplexity,
+    /// Jensen-Shannon divergence - shows distribution anomalies vs file baseline.
+    JensenShannonDivergence,
 }
 
 impl VisualizationMode {
@@ -51,6 +54,7 @@ impl VisualizationMode {
             Self::Digraph => "Byte Digraph",
             Self::BytePhaseSpace => "Byte Phase Space",
             Self::KolmogorovComplexity => "Kolmogorov Complexity",
+            Self::JensenShannonDivergence => "JS Divergence",
         }
     }
 
@@ -62,6 +66,7 @@ impl VisualizationMode {
             Self::Digraph,
             Self::BytePhaseSpace,
             Self::KolmogorovComplexity,
+            Self::JensenShannonDivergence,
         ]
     }
 
@@ -71,9 +76,10 @@ impl VisualizationMode {
     fn world_dimension(self, file_dimension: u64) -> f32 {
         match self {
             Self::Digraph | Self::BytePhaseSpace => 256.0,
-            Self::Hilbert | Self::SimilarityMatrix | Self::KolmogorovComplexity => {
-                file_dimension as f32
-            }
+            Self::Hilbert
+            | Self::SimilarityMatrix
+            | Self::KolmogorovComplexity
+            | Self::JensenShannonDivergence => file_dimension as f32,
         }
     }
 
@@ -87,8 +93,8 @@ impl VisualizationMode {
             Self::SimilarityMatrix => 2048,
             // Hilbert can use smaller textures when zoomed out
             Self::Hilbert => 512,
-            // Kolmogorov uses Hilbert mapping, same requirements
-            Self::KolmogorovComplexity => 512,
+            // Kolmogorov and JSD use Hilbert mapping, same requirements
+            Self::KolmogorovComplexity | Self::JensenShannonDivergence => 512,
         }
     }
 
@@ -101,8 +107,8 @@ impl VisualizationMode {
             Self::SimilarityMatrix => true,
             // Digraph and BytePhaseSpace are fixed 256×256, render full grid
             Self::Digraph | Self::BytePhaseSpace => true,
-            // Hilbert and Kolmogorov benefit from viewport-aware rendering for large files
-            Self::Hilbert | Self::KolmogorovComplexity => false,
+            // Hilbert, Kolmogorov and JSD benefit from viewport-aware rendering for large files
+            Self::Hilbert | Self::KolmogorovComplexity | Self::JensenShannonDivergence => false,
         }
     }
 }
@@ -160,6 +166,8 @@ struct FileData {
     path: PathBuf,
     /// Precomputed Kolmogorov complexity values (one per COMPLEXITY_SAMPLE_INTERVAL bytes).
     complexity_map: Arc<Vec<f32>>,
+    /// Reference byte distribution for JSD calculation (whole file distribution).
+    reference_distribution: Arc<[f64; 256]>,
 }
 
 /// Interval for sampling Kolmogorov complexity (every N bytes).
@@ -371,6 +379,9 @@ impl NeuroCoreApp {
                     complexity_map.len()
                 );
 
+                // Calculate reference byte distribution for JSD
+                let reference_distribution = Arc::new(byte_distribution(&data));
+
                 let data = Arc::new(data);
 
                 self.file_data = Some(FileData {
@@ -380,6 +391,7 @@ impl NeuroCoreApp {
                     file_type,
                     path,
                     complexity_map: Arc::new(complexity_map),
+                    reference_distribution,
                 });
 
                 // Reset viewport and selection
@@ -473,7 +485,9 @@ impl NeuroCoreApp {
             }
 
             match self.viz_mode {
-                VisualizationMode::Hilbert | VisualizationMode::KolmogorovComplexity => {
+                VisualizationMode::Hilbert
+                | VisualizationMode::KolmogorovComplexity
+                | VisualizationMode::JensenShannonDivergence => {
                     let x = world_pos.x as u64;
                     let y = world_pos.y as u64;
                     let n = file.dimension;
@@ -589,6 +603,7 @@ impl NeuroCoreApp {
 
         let data = Arc::clone(&file.data);
         let complexity_map = Arc::clone(&file.complexity_map);
+        let reference_distribution = Arc::clone(&file.reference_distribution);
         let dimension = file.dimension;
         let file_size = file.size;
         let viz_mode = self.viz_mode;
@@ -605,8 +620,9 @@ impl NeuroCoreApp {
                     VisualizationMode::Digraph => Some(gpu::GpuVizMode::Digraph),
                     VisualizationMode::BytePhaseSpace => Some(gpu::GpuVizMode::BytePhaseSpace),
                     VisualizationMode::SimilarityMatrix => Some(gpu::GpuVizMode::SimilarityMatrix),
-                    // Kolmogorov uses precomputed map - CPU rendering is now fast
-                    VisualizationMode::KolmogorovComplexity => None,
+                    // Kolmogorov and JSD use precomputed/calculated values - CPU rendering
+                    VisualizationMode::KolmogorovComplexity
+                    | VisualizationMode::JensenShannonDivergence => None,
                 };
 
                 if let Some(mode) = gpu_mode {
@@ -635,6 +651,7 @@ impl NeuroCoreApp {
                     Self::generate_cpu_image(
                         &data,
                         &complexity_map,
+                        &reference_distribution,
                         dimension,
                         file_size,
                         tex_size,
@@ -649,6 +666,7 @@ impl NeuroCoreApp {
                 Self::generate_cpu_image(
                     &data,
                     &complexity_map,
+                    &reference_distribution,
                     dimension,
                     file_size,
                     tex_size,
@@ -663,6 +681,7 @@ impl NeuroCoreApp {
             Self::generate_cpu_image(
                 &data,
                 &complexity_map,
+                &reference_distribution,
                 dimension,
                 file_size,
                 tex_size,
@@ -681,6 +700,7 @@ impl NeuroCoreApp {
     fn generate_cpu_image(
         data: &[u8],
         complexity_map: &[f32],
+        reference_distribution: &[f64; 256],
         dimension: u64,
         file_size: u64,
         tex_size: usize,
@@ -704,6 +724,16 @@ impl NeuroCoreApp {
             ),
             VisualizationMode::KolmogorovComplexity => Self::generate_kolmogorov_pixels(
                 complexity_map,
+                dimension,
+                file_size,
+                tex_size,
+                world_min,
+                scale_x,
+                scale_y,
+            ),
+            VisualizationMode::JensenShannonDivergence => Self::generate_jsd_pixels(
+                data,
+                reference_distribution,
                 dimension,
                 file_size,
                 tex_size,
@@ -1043,6 +1073,58 @@ impl NeuroCoreApp {
             .collect()
     }
 
+    /// Generate Jensen-Shannon Divergence visualization using Hilbert curve mapping.
+    ///
+    /// Shows how different each region's byte distribution is from the overall file.
+    /// Highlights anomalous regions with unusual byte distributions.
+    ///
+    /// Color legend:
+    /// - Dark blue/purple: Very similar to file average (normal regions)
+    /// - Cyan/teal: Slightly different distribution
+    /// - Green/yellow: Moderately different (interesting regions)
+    /// - Orange/red: Very different (anomalous regions - headers, compressed sections, etc.)
+    fn generate_jsd_pixels(
+        data: &[u8],
+        reference_distribution: &[f64; 256],
+        dimension: u64,
+        file_size: u64,
+        tex_size: usize,
+        world_min: Vec2,
+        scale_x: f32,
+        scale_y: f32,
+    ) -> Vec<Color32> {
+        (0..tex_size * tex_size)
+            .into_par_iter()
+            .map(|idx| {
+                let tex_y = idx / tex_size;
+                let tex_x = idx % tex_size;
+
+                let world_x = (world_min.x + tex_x as f32 * scale_x) as u64;
+                let world_y = (world_min.y + tex_y as f32 * scale_y) as u64;
+
+                if world_x >= dimension || world_y >= dimension {
+                    return Color32::from_rgb(13, 13, 13);
+                }
+
+                let d = xy2d(dimension, world_x, world_y);
+
+                if d >= file_size {
+                    return Color32::from_rgb(13, 13, 13);
+                }
+
+                let start = d as usize;
+                let end = (start + ANALYSIS_WINDOW).min(data.len());
+                let chunk = &data[start..end];
+
+                // Calculate JSD against reference distribution
+                let jsd = calculate_jsd(chunk, reference_distribution);
+                let analysis = JSDAnalysis { divergence: jsd };
+                let [r, g, b] = analysis.to_color();
+                Color32::from_rgb(r, g, b)
+            })
+            .collect()
+    }
+
     /// Reset viewport to default.
     fn reset_viewport(&mut self) {
         self.viewport = Viewport::default();
@@ -1268,10 +1350,12 @@ impl NeuroCoreApp {
                 );
             }
 
-            // Draw hex view region outline (only for Hilbert/Kolmogorov modes)
+            // Draw hex view region outline (for Hilbert-based modes)
             if matches!(
                 self.viz_mode,
-                VisualizationMode::Hilbert | VisualizationMode::KolmogorovComplexity
+                VisualizationMode::Hilbert
+                    | VisualizationMode::KolmogorovComplexity
+                    | VisualizationMode::JensenShannonDivergence
             ) {
                 self.draw_hex_region_outline(ui, available_rect);
             }
@@ -1418,6 +1502,7 @@ impl NeuroCoreApp {
             VisualizationMode::Digraph => "DIG",
             VisualizationMode::BytePhaseSpace => "PHS",
             VisualizationMode::KolmogorovComplexity => "KOL",
+            VisualizationMode::JensenShannonDivergence => "JSD",
         };
 
         let text = format!(
@@ -2026,6 +2111,17 @@ impl NeuroCoreApp {
             ui.label(RichText::new("  Algorithmic complexity via compression.").small());
             ui.label(RichText::new("  Approximates shortest program length.").small());
             ui.label(RichText::new("  Low = simple/repetitive, High = random.").small());
+            ui.add_space(8.0);
+
+            ui.label(
+                RichText::new("JS Divergence [JSD]")
+                    .strong()
+                    .monospace()
+                    .color(Color32::from_rgb(255, 100, 150)),
+            );
+            ui.label(RichText::new("  Jensen-Shannon divergence from file average.").small());
+            ui.label(RichText::new("  Measures distribution anomalies.").small());
+            ui.label(RichText::new("  Low = normal, High = unusual byte dist.").small());
 
             ui.add_space(8.0);
             ui.separator();

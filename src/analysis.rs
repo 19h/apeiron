@@ -116,6 +116,130 @@ impl KolmogorovAnalysis {
     }
 }
 
+// =============================================================================
+// Jensen-Shannon Divergence
+// =============================================================================
+
+/// Calculate byte frequency distribution (probability distribution) for a byte slice.
+///
+/// Returns an array of 256 probabilities, one for each possible byte value.
+pub fn byte_distribution(data: &[u8]) -> [f64; 256] {
+    if data.is_empty() {
+        // Return uniform distribution for empty data
+        return [1.0 / 256.0; 256];
+    }
+
+    let mut counts = [0u64; 256];
+    for &byte in data {
+        counts[byte as usize] += 1;
+    }
+
+    let total = data.len() as f64;
+    let mut dist = [0.0f64; 256];
+    for i in 0..256 {
+        dist[i] = counts[i] as f64 / total;
+    }
+    dist
+}
+
+/// Calculate KL divergence D_KL(P || Q) between two probability distributions.
+///
+/// Uses a small epsilon to avoid log(0) issues.
+fn kl_divergence(p: &[f64; 256], q: &[f64; 256]) -> f64 {
+    const EPSILON: f64 = 1e-10;
+    let mut divergence = 0.0;
+
+    for i in 0..256 {
+        let p_i = p[i];
+        let q_i = q[i];
+
+        if p_i > EPSILON {
+            // Add epsilon to q to avoid log(0)
+            divergence += p_i * (p_i / (q_i + EPSILON)).ln();
+        }
+    }
+
+    divergence / std::f64::consts::LN_2 // Convert to bits (log base 2)
+}
+
+/// Calculate Jensen-Shannon divergence between two probability distributions.
+///
+/// JSD is a symmetric and bounded measure of similarity between distributions.
+/// JSD(P || Q) = 0.5 * KL(P || M) + 0.5 * KL(Q || M), where M = 0.5 * (P + Q)
+///
+/// Returns a value between 0.0 (identical distributions) and 1.0 (maximally different).
+pub fn jensen_shannon_divergence(p: &[f64; 256], q: &[f64; 256]) -> f64 {
+    // Calculate M = 0.5 * (P + Q)
+    let mut m = [0.0f64; 256];
+    for i in 0..256 {
+        m[i] = 0.5 * (p[i] + q[i]);
+    }
+
+    // JSD = 0.5 * KL(P || M) + 0.5 * KL(Q || M)
+    let jsd = 0.5 * kl_divergence(p, &m) + 0.5 * kl_divergence(q, &m);
+
+    // JSD is bounded [0, 1] when using log base 2
+    jsd.clamp(0.0, 1.0)
+}
+
+/// Calculate Jensen-Shannon divergence of a data chunk against a reference distribution.
+///
+/// Returns a value between 0.0 (identical to reference) and 1.0 (maximally different).
+pub fn calculate_jsd(data: &[u8], reference: &[f64; 256]) -> f64 {
+    let local_dist = byte_distribution(data);
+    jensen_shannon_divergence(&local_dist, reference)
+}
+
+/// Jensen-Shannon divergence analysis results for color mapping.
+#[derive(Debug, Clone, Copy)]
+pub struct JSDAnalysis {
+    /// JSD value (0.0 = similar to reference, 1.0 = very different).
+    pub divergence: f64,
+}
+
+impl JSDAnalysis {
+    /// Map JSD to RGB color.
+    ///
+    /// Color legend (divergence from reference):
+    /// - Dark blue/purple: Very similar to reference (low divergence)
+    /// - Cyan/teal: Slightly different
+    /// - Green/yellow: Moderately different
+    /// - Orange: Significantly different
+    /// - Red/magenta: Very different (high divergence/anomalous)
+    pub fn to_color(&self) -> [u8; 3] {
+        let t = self.divergence.clamp(0.0, 1.0);
+
+        // Cool-to-hot colormap emphasizing anomalies
+        let (r, g, b) = if t < 0.15 {
+            // Dark blue - very similar
+            let s = t / 0.15;
+            (0.1, 0.1 + s * 0.2, 0.4 + s * 0.3)
+        } else if t < 0.3 {
+            // Blue to cyan
+            let s = (t - 0.15) / 0.15;
+            (0.1, 0.3 + s * 0.4, 0.7 - s * 0.1)
+        } else if t < 0.5 {
+            // Cyan to green
+            let s = (t - 0.3) / 0.2;
+            (0.1 + s * 0.3, 0.7 - s * 0.1, 0.6 - s * 0.4)
+        } else if t < 0.7 {
+            // Green to yellow
+            let s = (t - 0.5) / 0.2;
+            (0.4 + s * 0.6, 0.6 + s * 0.3, 0.2 - s * 0.1)
+        } else if t < 0.85 {
+            // Yellow to orange
+            let s = (t - 0.7) / 0.15;
+            (1.0, 0.9 - s * 0.4, 0.1)
+        } else {
+            // Orange to red/magenta - anomalous
+            let s = (t - 0.85) / 0.15;
+            (1.0, 0.5 - s * 0.3, 0.1 + s * 0.4)
+        };
+
+        [(r * 255.0) as u8, (g * 255.0) as u8, (b * 255.0) as u8]
+    }
+}
+
 /// Format data as a hex dump string.
 ///
 /// Format: `XXXXXXXX  XX XX XX XX XX XX XX XX  XX XX XX XX XX XX XX XX  |................|`
