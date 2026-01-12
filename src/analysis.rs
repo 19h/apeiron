@@ -1,3 +1,7 @@
+// Allow unused code - this module provides a library of analysis utilities,
+// not all of which are used in every visualization mode.
+#![allow(dead_code)]
+
 //! Analysis utilities for binary data inspection.
 //!
 //! Provides entropy calculation, hex dump formatting, file type detection,

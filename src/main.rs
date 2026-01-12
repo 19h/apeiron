@@ -12,7 +12,9 @@ mod hilbert;
 mod wavelet_malware;
 
 use std::path::PathBuf;
+use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::sync::Arc;
+use std::thread;
 
 use eframe::egui::{self, Color32, ColorImage, Pos2, Rect, RichText, Sense, TextureHandle, Vec2};
 use rayon::prelude::*;
@@ -161,6 +163,8 @@ struct NeuroCoreApp {
     last_fit_view_size: Option<Vec2>,
     /// GPU renderer for accelerated visualization.
     gpu_renderer: Option<gpu::GpuRenderer>,
+    /// Background computation tasks.
+    background_tasks: Option<BackgroundTasks>,
 }
 
 /// Parameters used to generate the current texture.
@@ -189,13 +193,38 @@ struct FileData {
     #[allow(dead_code)]
     path: PathBuf,
     /// Precomputed Kolmogorov complexity values (one per COMPLEXITY_SAMPLE_INTERVAL bytes).
-    complexity_map: Arc<Vec<f32>>,
+    /// None if not yet computed.
+    complexity_map: Option<Arc<Vec<f32>>>,
     /// Reference byte distribution for JSD calculation (whole file distribution).
     reference_distribution: Arc<[f64; 256]>,
     /// Precomputed RCMSE values (one per RCMSE_SAMPLE_INTERVAL bytes).
-    rcmse_map: Arc<Vec<f32>>,
+    /// None if not yet computed.
+    rcmse_map: Option<Arc<Vec<f32>>>,
     /// Precomputed wavelet suspiciousness values (one per WAVELET_SAMPLE_INTERVAL bytes).
-    wavelet_map: Arc<Vec<f32>>,
+    /// None if not yet computed.
+    wavelet_map: Option<Arc<Vec<f32>>>,
+}
+
+/// Background computation tasks for lazy loading.
+enum BackgroundTask {
+    ComplexityMap(Vec<f32>),
+    RcmseMap(Vec<f32>),
+    WaveletMap(Vec<f32>),
+    WaveletReport(wm::WaveletMalwareReport),
+}
+
+/// Pending background computations.
+struct BackgroundTasks {
+    /// Receiver for completed tasks.
+    receiver: Receiver<BackgroundTask>,
+    /// Whether complexity map is being computed.
+    computing_complexity: bool,
+    /// Whether RCMSE map is being computed.
+    computing_rcmse: bool,
+    /// Whether wavelet map is being computed.
+    computing_wavelet: bool,
+    /// Whether wavelet report is being computed.
+    computing_wavelet_report: bool,
 }
 
 /// Interval for sampling RCMSE (every N bytes).
@@ -250,6 +279,8 @@ struct HexView {
     /// Bytes per row (typically 16).
     bytes_per_row: usize,
     /// Currently hovered row in hex view (for highlighting).
+    /// Reserved for future row hover highlighting feature.
+    #[allow(dead_code)]
     hovered_row: Option<usize>,
     /// Cached outline data for the visible region.
     outline_cache: Option<OutlineCache>,
@@ -378,6 +409,7 @@ impl Default for NeuroCoreApp {
             needs_fit_to_view: false,
             last_fit_view_size: None,
             gpu_renderer: None,
+            background_tasks: None,
         }
     }
 }
@@ -398,6 +430,7 @@ impl NeuroCoreApp {
     }
 
     /// Load a file from the given path.
+    /// Only performs essential setup immediately; expensive computations run in background.
     fn load_file(&mut self, path: PathBuf) {
         match std::fs::read(&path) {
             Ok(data) => {
@@ -410,51 +443,103 @@ impl NeuroCoreApp {
                     gpu.upload_file(&data, dimension);
                 }
 
-                // Precompute Kolmogorov complexity map (sampled)
-                let complexity_map = Self::precompute_complexity_map(&data);
-                println!(
-                    "Precomputed complexity map: {} samples",
-                    complexity_map.len()
-                );
-
-                // Precompute RCMSE map (sampled, more expensive than complexity)
-                let rcmse_map = Self::precompute_rcmse_map(&data);
-                println!("Precomputed RCMSE map: {} samples", rcmse_map.len());
-
-                // Precompute wavelet suspiciousness map
-                let wavelet_map = Self::precompute_wavelet_map(&data);
-                println!("Precomputed wavelet map: {} samples", wavelet_map.len());
-
-                // Calculate reference byte distribution for JSD
+                // Calculate reference byte distribution for JSD (cheap, needed for JSD mode)
                 let reference_distribution = Arc::new(byte_distribution(&data));
 
                 let data = Arc::new(data);
 
+                // Create file data with empty precomputed maps
                 self.file_data = Some(FileData {
-                    data,
+                    data: Arc::clone(&data),
                     size,
                     dimension,
                     file_type,
                     path,
-                    complexity_map: Arc::new(complexity_map),
+                    complexity_map: None,
                     reference_distribution,
-                    rcmse_map: Arc::new(rcmse_map),
-                    wavelet_map: Arc::new(wavelet_map),
+                    rcmse_map: None,
+                    wavelet_map: None,
                 });
 
-                // Compute wavelet-based malware detection analysis (SSECS)
-                let data_clone = Arc::clone(&self.file_data.as_ref().unwrap().data);
-                self.wavelet_report = Some(wm::analyze_file_for_malware(&data_clone));
-                println!(
-                    "Wavelet analysis: SSECS={:.3}, Malware Prob={:.1}%",
-                    self.wavelet_report.as_ref().unwrap().ssecs.ssecs_score,
-                    self.wavelet_report
-                        .as_ref()
-                        .unwrap()
-                        .ssecs
-                        .probability_malware
-                        * 100.0
-                );
+                // Clear previous wavelet report
+                self.wavelet_report = None;
+
+                // Spawn background tasks for expensive computations
+                // Priority: spawn the task for the current viz mode first
+                let (tx, rx) = mpsc::channel();
+                let current_mode = self.viz_mode;
+
+                // Determine task priority based on current visualization mode
+                #[derive(Clone, Copy, PartialEq)]
+                enum TaskType {
+                    Complexity,
+                    Rcmse,
+                    Wavelet,
+                    WaveletReport,
+                }
+
+                let priority_task = match current_mode {
+                    VisualizationMode::KolmogorovComplexity => TaskType::Complexity,
+                    VisualizationMode::MultiScaleEntropy => TaskType::Rcmse,
+                    VisualizationMode::WaveletEntropy => TaskType::Wavelet,
+                    // For other modes, prioritize wavelet report (shown in sidebar)
+                    _ => TaskType::WaveletReport,
+                };
+
+                // Helper to spawn a task
+                let spawn_task =
+                    |task_type: TaskType, tx: mpsc::Sender<BackgroundTask>, data: Arc<Vec<u8>>| {
+                        match task_type {
+                            TaskType::Complexity => {
+                                thread::spawn(move || {
+                                    let map = Self::precompute_complexity_map(&data);
+                                    let _ = tx.send(BackgroundTask::ComplexityMap(map));
+                                });
+                            }
+                            TaskType::Rcmse => {
+                                thread::spawn(move || {
+                                    let map = Self::precompute_rcmse_map(&data);
+                                    let _ = tx.send(BackgroundTask::RcmseMap(map));
+                                });
+                            }
+                            TaskType::Wavelet => {
+                                thread::spawn(move || {
+                                    let map = Self::precompute_wavelet_map(&data);
+                                    let _ = tx.send(BackgroundTask::WaveletMap(map));
+                                });
+                            }
+                            TaskType::WaveletReport => {
+                                thread::spawn(move || {
+                                    let report = wm::analyze_file_for_malware(&data);
+                                    let _ = tx.send(BackgroundTask::WaveletReport(report));
+                                });
+                            }
+                        }
+                    };
+
+                // Spawn priority task first (gets head start on CPU scheduling)
+                spawn_task(priority_task, tx.clone(), Arc::clone(&data));
+
+                // Spawn remaining tasks
+                let all_tasks = [
+                    TaskType::Complexity,
+                    TaskType::Rcmse,
+                    TaskType::Wavelet,
+                    TaskType::WaveletReport,
+                ];
+                for task in all_tasks {
+                    if task != priority_task {
+                        spawn_task(task, tx.clone(), Arc::clone(&data));
+                    }
+                }
+
+                self.background_tasks = Some(BackgroundTasks {
+                    receiver: rx,
+                    computing_complexity: true,
+                    computing_rcmse: true,
+                    computing_wavelet: true,
+                    computing_wavelet_report: true,
+                });
 
                 // Reset viewport and selection
                 self.viewport = Viewport::default();
@@ -469,11 +554,109 @@ impl NeuroCoreApp {
                     "Loaded file: Size={} bytes, Dimension={}, Type={}",
                     size, dimension, file_type
                 );
+                println!("Background computations started...");
             }
             Err(e) => {
                 eprintln!("Error loading file: {e}");
             }
         }
+    }
+
+    /// Poll for completed background tasks and update file data.
+    /// Returns true if any task completed (may need texture refresh).
+    fn poll_background_tasks(&mut self) -> bool {
+        let Some(tasks) = &mut self.background_tasks else {
+            return false;
+        };
+
+        let mut any_completed = false;
+
+        // Poll all available completed tasks
+        loop {
+            match tasks.receiver.try_recv() {
+                Ok(task) => {
+                    any_completed = true;
+                    match task {
+                        BackgroundTask::ComplexityMap(map) => {
+                            println!("Complexity map ready: {} samples", map.len());
+                            if let Some(ref mut file) = self.file_data {
+                                file.complexity_map = Some(Arc::new(map));
+                            }
+                            tasks.computing_complexity = false;
+                        }
+                        BackgroundTask::RcmseMap(map) => {
+                            println!("RCMSE map ready: {} samples", map.len());
+                            if let Some(ref mut file) = self.file_data {
+                                file.rcmse_map = Some(Arc::new(map));
+                            }
+                            tasks.computing_rcmse = false;
+                        }
+                        BackgroundTask::WaveletMap(map) => {
+                            println!("Wavelet map ready: {} samples", map.len());
+                            if let Some(ref mut file) = self.file_data {
+                                file.wavelet_map = Some(Arc::new(map));
+                            }
+                            tasks.computing_wavelet = false;
+                        }
+                        BackgroundTask::WaveletReport(report) => {
+                            println!(
+                                "Wavelet analysis ready: SSECS={:.3}, Malware Prob={:.1}%",
+                                report.ssecs.ssecs_score,
+                                report.ssecs.probability_malware * 100.0
+                            );
+                            self.wavelet_report = Some(report);
+                            tasks.computing_wavelet_report = false;
+                        }
+                    }
+                }
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => {
+                    // All senders dropped, no more tasks coming
+                    self.background_tasks = None;
+                    break;
+                }
+            }
+        }
+
+        // Clear background tasks if all done
+        if let Some(tasks) = &self.background_tasks {
+            if !tasks.computing_complexity
+                && !tasks.computing_rcmse
+                && !tasks.computing_wavelet
+                && !tasks.computing_wavelet_report
+            {
+                self.background_tasks = None;
+                println!("All background computations complete.");
+            }
+        }
+
+        any_completed
+    }
+
+    /// Check if a specific visualization mode's data is ready.
+    fn is_mode_data_ready(&self, mode: VisualizationMode) -> bool {
+        let Some(ref file) = self.file_data else {
+            return false;
+        };
+
+        match mode {
+            // These modes don't need precomputed maps
+            VisualizationMode::Hilbert
+            | VisualizationMode::SimilarityMatrix
+            | VisualizationMode::Digraph
+            | VisualizationMode::BytePhaseSpace => true,
+            // JSD needs reference distribution (always computed eagerly)
+            VisualizationMode::JensenShannonDivergence => true,
+            // These need precomputed maps
+            VisualizationMode::KolmogorovComplexity => file.complexity_map.is_some(),
+            VisualizationMode::MultiScaleEntropy => file.rcmse_map.is_some(),
+            VisualizationMode::WaveletEntropy => file.wavelet_map.is_some(),
+        }
+    }
+
+    /// Check if any background computation is in progress.
+    fn is_computing(&self) -> bool {
+        self.background_tasks.is_some()
     }
 
     /// Precompute Kolmogorov complexity values for the file.
@@ -762,13 +945,20 @@ impl NeuroCoreApp {
         }
 
         let data = Arc::clone(&file.data);
-        let complexity_map = Arc::clone(&file.complexity_map);
+        // Get precomputed maps, using empty vec as fallback if not yet computed
+        let complexity_map = file.complexity_map.clone();
         let reference_distribution = Arc::clone(&file.reference_distribution);
-        let rcmse_map = Arc::clone(&file.rcmse_map);
-        let wavelet_map = Arc::clone(&file.wavelet_map);
+        let rcmse_map = file.rcmse_map.clone();
+        let wavelet_map = file.wavelet_map.clone();
         let dimension = file.dimension;
         let file_size = file.size;
         let viz_mode = self.viz_mode;
+
+        // Use empty slice as fallback for maps not yet computed
+        let empty_map: Arc<Vec<f32>> = Arc::new(Vec::new());
+        let complexity_ref = complexity_map.as_ref().unwrap_or(&empty_map);
+        let rcmse_ref = rcmse_map.as_ref().unwrap_or(&empty_map);
+        let wavelet_ref = wavelet_map.as_ref().unwrap_or(&empty_map);
 
         let scale_x = world_size.x / tex_size as f32;
         let scale_y = world_size.y / tex_size as f32;
@@ -814,10 +1004,10 @@ impl NeuroCoreApp {
                     // Mode not supported on GPU, use CPU
                     Self::generate_cpu_image(
                         &data,
-                        &complexity_map,
+                        complexity_ref,
                         &reference_distribution,
-                        &rcmse_map,
-                        &wavelet_map,
+                        rcmse_ref,
+                        wavelet_ref,
                         dimension,
                         file_size,
                         tex_size,
@@ -831,10 +1021,10 @@ impl NeuroCoreApp {
                 // GPU not ready, use CPU fallback
                 Self::generate_cpu_image(
                     &data,
-                    &complexity_map,
+                    complexity_ref,
                     &reference_distribution,
-                    &rcmse_map,
-                    &wavelet_map,
+                    rcmse_ref,
+                    wavelet_ref,
                     dimension,
                     file_size,
                     tex_size,
@@ -848,10 +1038,10 @@ impl NeuroCoreApp {
             // No GPU, use CPU fallback
             Self::generate_cpu_image(
                 &data,
-                &complexity_map,
+                complexity_ref,
                 &reference_distribution,
-                &rcmse_map,
-                &wavelet_map,
+                rcmse_ref,
+                wavelet_ref,
                 dimension,
                 file_size,
                 tex_size,
@@ -1519,6 +1709,18 @@ impl NeuroCoreApp {
 
 impl eframe::App for NeuroCoreApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // Poll for completed background tasks
+        let task_completed = self.poll_background_tasks();
+
+        // If background tasks are in progress or just completed, request repaint
+        if self.is_computing() || task_completed {
+            ctx.request_repaint();
+            // Invalidate texture if task completed (new data available)
+            if task_completed && self.is_mode_data_ready(self.viz_mode) {
+                self.texture = None;
+            }
+        }
+
         // Handle file drops
         ctx.input(|i| {
             self.is_drop_target = !i.raw.hovered_files.is_empty();
@@ -1579,6 +1781,44 @@ impl eframe::App for NeuroCoreApp {
                     self.viewport = Viewport::default();
                     self.needs_fit_to_view = true;
                     self.last_fit_view_size = None;
+                }
+
+                // Show loading indicator when background tasks are running
+                if let Some(ref tasks) = self.background_tasks {
+                    ui.add_space(16.0);
+                    ui.separator();
+                    ui.add_space(8.0);
+
+                    // Count pending tasks
+                    let pending = [
+                        tasks.computing_complexity,
+                        tasks.computing_rcmse,
+                        tasks.computing_wavelet,
+                        tasks.computing_wavelet_report,
+                    ]
+                    .iter()
+                    .filter(|&&x| x)
+                    .count();
+
+                    ui.horizontal(|ui| {
+                        ui.spinner();
+                        ui.label(
+                            RichText::new(format!("Computing ({pending} tasks)..."))
+                                .monospace()
+                                .small()
+                                .color(Color32::YELLOW),
+                        );
+                    });
+
+                    // Show which mode's data isn't ready yet
+                    if !self.is_mode_data_ready(self.viz_mode) {
+                        ui.label(
+                            RichText::new("(current view pending)")
+                                .monospace()
+                                .small()
+                                .color(Color32::GRAY),
+                        );
+                    }
                 }
             });
         });
@@ -1733,6 +1973,11 @@ impl NeuroCoreApp {
 
         // Draw HUD overlay
         self.draw_hud(ui, available_rect);
+
+        // Draw loading overlay if current mode's data is not ready
+        if !self.is_mode_data_ready(self.viz_mode) {
+            self.draw_loading_overlay(ui, available_rect);
+        }
     }
 
     /// Draw an outline around the hex view's visible region on the Hilbert curve.
@@ -1822,6 +2067,75 @@ impl NeuroCoreApp {
             egui::FontId::monospace(16.0),
             Color32::GRAY,
         );
+    }
+
+    /// Draw loading overlay when current mode's data is still computing.
+    fn draw_loading_overlay(&self, ui: &mut egui::Ui, rect: Rect) {
+        // Semi-transparent dark overlay
+        ui.painter()
+            .rect_filled(rect, 0.0, Color32::from_rgba_unmultiplied(20, 20, 25, 200));
+
+        // Loading message box
+        let box_size = Vec2::new(280.0, 100.0);
+        let box_rect = Rect::from_center_size(rect.center(), box_size);
+
+        ui.painter()
+            .rect_filled(box_rect, 12.0, Color32::from_rgb(35, 35, 45));
+        ui.painter().rect_stroke(
+            box_rect,
+            12.0,
+            egui::Stroke::new(2.0, Color32::from_rgb(80, 120, 200)),
+        );
+
+        // Mode name
+        let mode_name = self.viz_mode.name();
+        ui.painter().text(
+            box_rect.center() - Vec2::new(0.0, 20.0),
+            egui::Align2::CENTER_CENTER,
+            format!("Computing {}", mode_name),
+            egui::FontId::monospace(14.0),
+            Color32::WHITE,
+        );
+
+        // Animated dots (based on time)
+        let dots = match (ui.ctx().input(|i| i.time) * 3.0) as i32 % 4 {
+            0 => "",
+            1 => ".",
+            2 => "..",
+            _ => "...",
+        };
+        ui.painter().text(
+            box_rect.center() + Vec2::new(0.0, 5.0),
+            egui::Align2::CENTER_CENTER,
+            format!("Please wait{}", dots),
+            egui::FontId::monospace(12.0),
+            Color32::GRAY,
+        );
+
+        // Progress hint
+        if let Some(ref tasks) = self.background_tasks {
+            let pending = [
+                tasks.computing_complexity,
+                tasks.computing_rcmse,
+                tasks.computing_wavelet,
+                tasks.computing_wavelet_report,
+            ]
+            .iter()
+            .filter(|&&x| x)
+            .count();
+
+            ui.painter().text(
+                box_rect.center() + Vec2::new(0.0, 28.0),
+                egui::Align2::CENTER_CENTER,
+                format!(
+                    "{} background task{} remaining",
+                    pending,
+                    if pending == 1 { "" } else { "s" }
+                ),
+                egui::FontId::monospace(10.0),
+                Color32::from_rgb(150, 150, 180),
+            );
+        }
     }
 
     /// Draw the drop target indicator.
