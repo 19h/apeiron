@@ -18,8 +18,8 @@ use rayon::prelude::*;
 
 use analysis::{
     byte_distribution, calculate_entropy, calculate_jsd, calculate_kolmogorov_complexity,
-    extract_ascii, format_bytes, identify_file_type, ByteAnalysis, JSDAnalysis, KolmogorovAnalysis,
-    ANALYSIS_WINDOW,
+    calculate_rcmse_quick, extract_ascii, format_bytes, identify_file_type, ByteAnalysis,
+    JSDAnalysis, KolmogorovAnalysis, ANALYSIS_WINDOW,
 };
 use hilbert::{calculate_dimension, d2xy, xy2d};
 
@@ -43,6 +43,8 @@ enum VisualizationMode {
     KolmogorovComplexity,
     /// Jensen-Shannon divergence - shows distribution anomalies vs file baseline.
     JensenShannonDivergence,
+    /// Refined Composite Multi-Scale Entropy - reveals complexity across time scales.
+    MultiScaleEntropy,
 }
 
 impl VisualizationMode {
@@ -55,6 +57,7 @@ impl VisualizationMode {
             Self::BytePhaseSpace => "Byte Phase Space",
             Self::KolmogorovComplexity => "Kolmogorov Complexity",
             Self::JensenShannonDivergence => "JS Divergence",
+            Self::MultiScaleEntropy => "Multi-Scale Entropy (RCMSE)",
         }
     }
 
@@ -67,6 +70,7 @@ impl VisualizationMode {
             Self::BytePhaseSpace,
             Self::KolmogorovComplexity,
             Self::JensenShannonDivergence,
+            Self::MultiScaleEntropy,
         ]
     }
 
@@ -79,7 +83,8 @@ impl VisualizationMode {
             Self::Hilbert
             | Self::SimilarityMatrix
             | Self::KolmogorovComplexity
-            | Self::JensenShannonDivergence => file_dimension as f32,
+            | Self::JensenShannonDivergence
+            | Self::MultiScaleEntropy => file_dimension as f32,
         }
     }
 
@@ -93,8 +98,10 @@ impl VisualizationMode {
             Self::SimilarityMatrix => 2048,
             // Hilbert can use smaller textures when zoomed out
             Self::Hilbert => 512,
-            // Kolmogorov and JSD use Hilbert mapping, same requirements
-            Self::KolmogorovComplexity | Self::JensenShannonDivergence => 512,
+            // Kolmogorov, JSD, and RCMSE use Hilbert mapping, same requirements
+            Self::KolmogorovComplexity
+            | Self::JensenShannonDivergence
+            | Self::MultiScaleEntropy => 512,
         }
     }
 
@@ -107,8 +114,11 @@ impl VisualizationMode {
             Self::SimilarityMatrix => true,
             // Digraph and BytePhaseSpace are fixed 256×256, render full grid
             Self::Digraph | Self::BytePhaseSpace => true,
-            // Hilbert, Kolmogorov and JSD benefit from viewport-aware rendering for large files
-            Self::Hilbert | Self::KolmogorovComplexity | Self::JensenShannonDivergence => false,
+            // Hilbert, Kolmogorov, JSD, and RCMSE benefit from viewport-aware rendering for large files
+            Self::Hilbert
+            | Self::KolmogorovComplexity
+            | Self::JensenShannonDivergence
+            | Self::MultiScaleEntropy => false,
         }
     }
 }
@@ -168,7 +178,13 @@ struct FileData {
     complexity_map: Arc<Vec<f32>>,
     /// Reference byte distribution for JSD calculation (whole file distribution).
     reference_distribution: Arc<[f64; 256]>,
+    /// Precomputed RCMSE values (one per RCMSE_SAMPLE_INTERVAL bytes).
+    rcmse_map: Arc<Vec<f32>>,
 }
+
+/// Interval for sampling RCMSE (every N bytes).
+/// Same as complexity for consistent detail level.
+const RCMSE_SAMPLE_INTERVAL: usize = 64;
 
 /// Interval for sampling Kolmogorov complexity (every N bytes).
 /// Smaller = more precise but slower to precompute.
@@ -379,6 +395,10 @@ impl NeuroCoreApp {
                     complexity_map.len()
                 );
 
+                // Precompute RCMSE map (sampled, more expensive than complexity)
+                let rcmse_map = Self::precompute_rcmse_map(&data);
+                println!("Precomputed RCMSE map: {} samples", rcmse_map.len());
+
                 // Calculate reference byte distribution for JSD
                 let reference_distribution = Arc::new(byte_distribution(&data));
 
@@ -392,6 +412,7 @@ impl NeuroCoreApp {
                     path,
                     complexity_map: Arc::new(complexity_map),
                     reference_distribution,
+                    rcmse_map: Arc::new(rcmse_map),
                 });
 
                 // Reset viewport and selection
@@ -444,6 +465,36 @@ impl NeuroCoreApp {
         complexity_map.get(index).copied().unwrap_or(0.0)
     }
 
+    /// Precompute RCMSE values for the file.
+    /// Samples every RCMSE_SAMPLE_INTERVAL bytes for performance.
+    fn precompute_rcmse_map(data: &[u8]) -> Vec<f32> {
+        const WINDOW_SIZE: usize = 256; // Window for multi-scale analysis (supports ~10 scales)
+
+        let num_samples = (data.len() / RCMSE_SAMPLE_INTERVAL).max(1);
+
+        (0..num_samples)
+            .into_par_iter()
+            .map(|i| {
+                let start = i * RCMSE_SAMPLE_INTERVAL;
+                let end = (start + WINDOW_SIZE).min(data.len());
+                if start < data.len() && end > start {
+                    calculate_rcmse_quick(&data[start..end])
+                } else {
+                    0.5 // Default to middle value
+                }
+            })
+            .collect()
+    }
+
+    /// Look up precomputed RCMSE value for a file offset.
+    fn lookup_rcmse(rcmse_map: &[f32], offset: usize) -> f32 {
+        if rcmse_map.is_empty() {
+            return 0.5;
+        }
+        let index = offset / RCMSE_SAMPLE_INTERVAL;
+        rcmse_map.get(index).copied().unwrap_or(0.5)
+    }
+
     /// Update the selection based on a byte offset and optionally sync hex view.
     fn update_selection(&mut self, offset: u64) {
         self.update_selection_with_scroll(offset, true);
@@ -487,7 +538,8 @@ impl NeuroCoreApp {
             match self.viz_mode {
                 VisualizationMode::Hilbert
                 | VisualizationMode::KolmogorovComplexity
-                | VisualizationMode::JensenShannonDivergence => {
+                | VisualizationMode::JensenShannonDivergence
+                | VisualizationMode::MultiScaleEntropy => {
                     let x = world_pos.x as u64;
                     let y = world_pos.y as u64;
                     let n = file.dimension;
@@ -604,6 +656,7 @@ impl NeuroCoreApp {
         let data = Arc::clone(&file.data);
         let complexity_map = Arc::clone(&file.complexity_map);
         let reference_distribution = Arc::clone(&file.reference_distribution);
+        let rcmse_map = Arc::clone(&file.rcmse_map);
         let dimension = file.dimension;
         let file_size = file.size;
         let viz_mode = self.viz_mode;
@@ -612,7 +665,7 @@ impl NeuroCoreApp {
         let scale_y = world_size.y / tex_size as f32;
 
         // Try GPU rendering first, fall back to CPU
-        // Note: KolmogorovComplexity is CPU-only (uses precomputed values)
+        // Note: KolmogorovComplexity, JSD, and RCMSE are CPU-only (use precomputed values)
         let image = if let Some(ref gpu) = self.gpu_renderer {
             if gpu.is_ready() {
                 let gpu_mode = match viz_mode {
@@ -620,9 +673,10 @@ impl NeuroCoreApp {
                     VisualizationMode::Digraph => Some(gpu::GpuVizMode::Digraph),
                     VisualizationMode::BytePhaseSpace => Some(gpu::GpuVizMode::BytePhaseSpace),
                     VisualizationMode::SimilarityMatrix => Some(gpu::GpuVizMode::SimilarityMatrix),
-                    // Kolmogorov and JSD use precomputed/calculated values - CPU rendering
+                    // Kolmogorov, JSD, and RCMSE use precomputed/calculated values - CPU rendering
                     VisualizationMode::KolmogorovComplexity
-                    | VisualizationMode::JensenShannonDivergence => None,
+                    | VisualizationMode::JensenShannonDivergence
+                    | VisualizationMode::MultiScaleEntropy => None,
                 };
 
                 if let Some(mode) = gpu_mode {
@@ -652,6 +706,7 @@ impl NeuroCoreApp {
                         &data,
                         &complexity_map,
                         &reference_distribution,
+                        &rcmse_map,
                         dimension,
                         file_size,
                         tex_size,
@@ -667,6 +722,7 @@ impl NeuroCoreApp {
                     &data,
                     &complexity_map,
                     &reference_distribution,
+                    &rcmse_map,
                     dimension,
                     file_size,
                     tex_size,
@@ -682,6 +738,7 @@ impl NeuroCoreApp {
                 &data,
                 &complexity_map,
                 &reference_distribution,
+                &rcmse_map,
                 dimension,
                 file_size,
                 tex_size,
@@ -701,6 +758,7 @@ impl NeuroCoreApp {
         data: &[u8],
         complexity_map: &[f32],
         reference_distribution: &[f64; 256],
+        rcmse_map: &[f32],
         dimension: u64,
         file_size: u64,
         tex_size: usize,
@@ -740,6 +798,9 @@ impl NeuroCoreApp {
                 world_min,
                 scale_x,
                 scale_y,
+            ),
+            VisualizationMode::MultiScaleEntropy => Self::generate_rcmse_pixels(
+                rcmse_map, dimension, file_size, tex_size, world_min, scale_x, scale_y,
             ),
         };
 
@@ -1125,6 +1186,83 @@ impl NeuroCoreApp {
             .collect()
     }
 
+    /// Generate Refined Composite Multi-Scale Entropy (RCMSE) visualization.
+    ///
+    /// Uses precomputed RCMSE values for fast rendering.
+    /// RCMSE reveals complexity across multiple time scales, distinguishing:
+    /// - Random/encrypted data (entropy decreases with scale)
+    /// - Structured/complex data (entropy constant across scales)
+    /// - Deterministic chaos (entropy increases then decreases)
+    ///
+    /// Color legend:
+    /// - Purple/blue: Random/encrypted (steep negative slope)
+    /// - Cyan/teal: Compressed data (moderate negative slope)
+    /// - Green: Structured complexity (flat slope, 1/f-like)
+    /// - Yellow/orange: Chaotic/interesting patterns (positive early slope)
+    fn generate_rcmse_pixels(
+        rcmse_map: &[f32],
+        dimension: u64,
+        file_size: u64,
+        tex_size: usize,
+        world_min: Vec2,
+        scale_x: f32,
+        scale_y: f32,
+    ) -> Vec<Color32> {
+        (0..tex_size * tex_size)
+            .into_par_iter()
+            .map(|idx| {
+                let tex_y = idx / tex_size;
+                let tex_x = idx % tex_size;
+
+                let world_x = (world_min.x + tex_x as f32 * scale_x) as u64;
+                let world_y = (world_min.y + tex_y as f32 * scale_y) as u64;
+
+                if world_x >= dimension || world_y >= dimension {
+                    return Color32::from_rgb(13, 13, 13);
+                }
+
+                let d = xy2d(dimension, world_x, world_y);
+
+                if d >= file_size {
+                    return Color32::from_rgb(13, 13, 13);
+                }
+
+                // Use precomputed RCMSE value (0.0-1.0 range)
+                let rcmse_value = Self::lookup_rcmse(rcmse_map, d as usize);
+
+                // Map RCMSE value to color
+                // 0.0-0.3: Random (purple/blue)
+                // 0.3-0.6: Structured (green)
+                // 0.6-1.0: Chaotic (yellow/orange)
+                let t = rcmse_value.clamp(0.0, 1.0);
+
+                let (r, g, b) = if t < 0.25 {
+                    // Random: Purple to blue
+                    let s = t / 0.25;
+                    (0.4 - s * 0.2, 0.1 + s * 0.2, 0.8 + s * 0.1)
+                } else if t < 0.45 {
+                    // Transition: Blue to cyan/teal
+                    let s = (t - 0.25) / 0.2;
+                    (0.2 - s * 0.1, 0.3 + s * 0.3, 0.9 - s * 0.2)
+                } else if t < 0.65 {
+                    // Structured: Cyan/teal to green
+                    let s = (t - 0.45) / 0.2;
+                    (0.1, 0.6 + s * 0.2, 0.7 - s * 0.4)
+                } else if t < 0.85 {
+                    // Chaotic transition: Green to yellow
+                    let s = (t - 0.65) / 0.2;
+                    (0.1 + s * 0.8, 0.8, 0.3 - s * 0.2)
+                } else {
+                    // Highly chaotic: Yellow to orange
+                    let s = (t - 0.85) / 0.15;
+                    (0.9 + s * 0.1, 0.8 - s * 0.2, 0.1)
+                };
+
+                Color32::from_rgb((r * 255.0) as u8, (g * 255.0) as u8, (b * 255.0) as u8)
+            })
+            .collect()
+    }
+
     /// Reset viewport to default.
     fn reset_viewport(&mut self) {
         self.viewport = Viewport::default();
@@ -1216,6 +1354,8 @@ impl eframe::App for NeuroCoreApp {
                 if self.viz_mode != old_mode {
                     self.texture = None;
                     self.texture_params = None;
+                    // Reset viewport completely to ensure proper fit
+                    self.viewport = Viewport::default();
                     self.needs_fit_to_view = true;
                 }
             });
@@ -1273,7 +1413,11 @@ impl NeuroCoreApp {
         }
 
         // Fit viewport to view if needed (after load or mode change)
-        if self.needs_fit_to_view {
+        // Only fit if view has valid non-zero size
+        if self.needs_fit_to_view
+            && available_rect.width() > 100.0
+            && available_rect.height() > 100.0
+        {
             self.fit_to_view(available_rect.size());
         }
 
@@ -1356,6 +1500,7 @@ impl NeuroCoreApp {
                 VisualizationMode::Hilbert
                     | VisualizationMode::KolmogorovComplexity
                     | VisualizationMode::JensenShannonDivergence
+                    | VisualizationMode::MultiScaleEntropy
             ) {
                 self.draw_hex_region_outline(ui, available_rect);
             }
@@ -1503,6 +1648,7 @@ impl NeuroCoreApp {
             VisualizationMode::BytePhaseSpace => "PHS",
             VisualizationMode::KolmogorovComplexity => "KOL",
             VisualizationMode::JensenShannonDivergence => "JSD",
+            VisualizationMode::MultiScaleEntropy => "MSE",
         };
 
         let text = format!(
@@ -2275,7 +2421,7 @@ fn entropy_to_color(entropy: f64) -> Color32 {
 /// Uses "inferno" colormap style for better perceptual uniformity.
 ///
 /// - 0 (dissimilar): Black/dark purple
-/// - 0.5 (moderate): Red/orange  
+/// - 0.5 (moderate): Red/orange
 /// - 1.0 (identical): Bright yellow/white
 /// - Diagonal elements get special highlighting
 fn similarity_to_color(similarity: f64, is_diagonal: bool) -> Color32 {

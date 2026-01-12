@@ -197,6 +197,347 @@ pub struct JSDAnalysis {
     pub divergence: f64,
 }
 
+// =============================================================================
+// Refined Composite Multi-Scale Entropy (RCMSE)
+// =============================================================================
+
+/// Default parameters for RCMSE calculation.
+pub const RCMSE_EMBEDDING_DIM: usize = 2; // m parameter
+pub const RCMSE_TOLERANCE_FACTOR: f64 = 0.15; // r = 0.15 * SD
+pub const RCMSE_MAX_SCALE: usize = 20; // Maximum scale factor τ
+
+/// Coarse-grain a time series at scale τ with offset k.
+///
+/// Creates a downsampled series by averaging non-overlapping windows of size τ,
+/// starting at offset k (1 ≤ k ≤ τ).
+///
+/// Formula: y_{k,j}^(τ) = (1/τ) × Σ x_i for i from (j-1)τ+k to jτ+k-1
+fn coarse_grain(data: &[f64], scale: usize, offset: usize) -> Vec<f64> {
+    if scale == 0 || data.is_empty() || offset == 0 || offset > scale {
+        return Vec::new();
+    }
+
+    let n = data.len();
+    // Number of complete windows we can form
+    // j ranges from 1 to floor((N - k + 1) / τ)
+    let num_points = (n.saturating_sub(offset - 1)) / scale;
+
+    if num_points == 0 {
+        return Vec::new();
+    }
+
+    (0..num_points)
+        .map(|j| {
+            // Start index: (j-1)*τ + k, but j is 0-indexed so it's j*τ + (k-1)
+            let start = j * scale + (offset - 1);
+            let end = (start + scale).min(n);
+            let sum: f64 = data[start..end].iter().sum();
+            sum / scale as f64
+        })
+        .collect()
+}
+
+/// Count m-dimensional and (m+1)-dimensional matched vector pairs.
+///
+/// Two vectors match if their Chebyshev distance (max absolute difference) is ≤ r.
+/// Returns (count_m, count_m_plus_1).
+fn count_pattern_matches(series: &[f64], m: usize, r: f64) -> (u64, u64) {
+    let n = series.len();
+    if n <= m + 1 {
+        return (0, 0);
+    }
+
+    let mut count_m: u64 = 0;
+    let mut count_m_plus_1: u64 = 0;
+
+    // Compare all pairs of m-dimensional and (m+1)-dimensional vectors
+    let num_templates_m = n - m;
+    let num_templates_m_plus_1 = n - m - 1;
+
+    // For each template vector starting at i
+    for i in 0..num_templates_m {
+        // Compare with all other vectors starting at j
+        for j in (i + 1)..num_templates_m {
+            // Check m-dimensional match (Chebyshev distance)
+            let mut match_m = true;
+            for k in 0..m {
+                if (series[i + k] - series[j + k]).abs() > r {
+                    match_m = false;
+                    break;
+                }
+            }
+
+            if match_m {
+                // Count both (i,j) and (j,i) but we're only iterating upper triangle
+                count_m += 2;
+
+                // Check if also matches at m+1 dimension
+                if i < num_templates_m_plus_1 && j < num_templates_m_plus_1 {
+                    if (series[i + m] - series[j + m]).abs() <= r {
+                        count_m_plus_1 += 2;
+                    }
+                }
+            }
+        }
+    }
+
+    (count_m, count_m_plus_1)
+}
+
+/// Calculate standard deviation of a slice.
+fn std_deviation(data: &[f64]) -> f64 {
+    if data.len() < 2 {
+        return 0.0;
+    }
+    let n = data.len() as f64;
+    let mean: f64 = data.iter().sum::<f64>() / n;
+    let variance: f64 = data.iter().map(|x| (x - mean).powi(2)).sum::<f64>() / (n - 1.0);
+    variance.sqrt()
+}
+
+/// Calculate RCMSE for a single scale factor τ.
+///
+/// RCMSE(x, τ, m, r) = -ln(Σ n_{k,τ}^{m+1} / Σ n_{k,τ}^m)
+///
+/// Returns the sample entropy value at scale τ, or None if undefined.
+fn rcmse_at_scale(data: &[f64], scale: usize, m: usize, r: f64) -> Option<f64> {
+    if scale == 0 {
+        return None;
+    }
+
+    let mut total_m: u64 = 0;
+    let mut total_m_plus_1: u64 = 0;
+
+    // Process all τ coarse-grained series (offsets 1 to τ)
+    for k in 1..=scale {
+        let coarse = coarse_grain(data, scale, k);
+        if coarse.len() <= m + 1 {
+            continue;
+        }
+        let (n_m, n_m_plus_1) = count_pattern_matches(&coarse, m, r);
+        total_m += n_m;
+        total_m_plus_1 += n_m_plus_1;
+    }
+
+    // RCMSE is undefined if no matches found
+    if total_m == 0 || total_m_plus_1 == 0 {
+        return None;
+    }
+
+    let ratio = total_m_plus_1 as f64 / total_m as f64;
+    Some(-ratio.ln())
+}
+
+/// RCMSE analysis results for visualization.
+#[derive(Debug, Clone)]
+pub struct RCMSEAnalysis {
+    /// Sample entropy values at each scale (scale 1 to max_scale).
+    pub entropy_by_scale: Vec<f64>,
+    /// Linear regression slope of entropy vs scale.
+    /// - Negative slope: entropy decreases with scale (white noise-like, random/encrypted)
+    /// - Near-zero slope: entropy constant (1/f noise-like, structured complexity)
+    /// - Positive then negative: deterministic chaos pattern
+    pub slope: f64,
+    /// Complexity index based on the entropy profile.
+    /// Higher values indicate more complex, structured data.
+    pub complexity_index: f64,
+    /// Mean entropy across all scales.
+    pub mean_entropy: f64,
+    /// Classification based on entropy profile.
+    pub classification: RCMSEClassification,
+}
+
+/// Classification of data based on RCMSE profile.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RCMSEClassification {
+    /// Entropy decreases monotonically (white noise, encrypted, compressed).
+    Random,
+    /// Entropy is relatively constant across scales (1/f noise, structured complexity).
+    Structured,
+    /// Entropy increases at small scales then decreases (deterministic chaos).
+    Chaotic,
+    /// Insufficient data to classify.
+    Unknown,
+}
+
+impl RCMSEAnalysis {
+    /// Map RCMSE analysis to RGB color.
+    ///
+    /// Color legend based on complexity index and classification:
+    /// - Deep blue/purple: Random/encrypted (steep negative slope, high initial entropy)
+    /// - Cyan/teal: Compressed data (negative slope, medium complexity)
+    /// - Green: Structured/complex (flat slope, 1/f-like)
+    /// - Yellow/orange: Chaotic/interesting patterns (positive early slope)
+    /// - Red/magenta: Highly structured with low entropy (simple patterns)
+    pub fn to_color(&self) -> [u8; 3] {
+        // Normalize complexity index to [0, 1]
+        let ci = self.complexity_index.clamp(0.0, 2.0) / 2.0;
+
+        // Use slope to determine base hue
+        // slope ranges roughly from -0.3 (random) to +0.1 (chaotic)
+        let slope_normalized = ((self.slope + 0.3) / 0.4).clamp(0.0, 1.0);
+
+        match self.classification {
+            RCMSEClassification::Random => {
+                // Purple to blue gradient based on entropy level
+                let intensity = (1.0 - ci) * 0.5 + 0.3;
+                let r = (0.4 * intensity * 255.0) as u8;
+                let g = (0.1 * intensity * 255.0) as u8;
+                let b = (0.9 * intensity * 255.0) as u8;
+                [r, g, b]
+            }
+            RCMSEClassification::Structured => {
+                // Green to cyan gradient (complex, 1/f-like)
+                let intensity = ci * 0.6 + 0.4;
+                let r = (0.1 * intensity * 255.0) as u8;
+                let g = (0.8 * intensity * 255.0) as u8;
+                let b = (0.5 * intensity * 255.0) as u8;
+                [r, g, b]
+            }
+            RCMSEClassification::Chaotic => {
+                // Yellow to orange gradient (deterministic chaos)
+                let intensity = ci * 0.7 + 0.3;
+                let r = (1.0 * intensity * 255.0) as u8;
+                let g = (0.7 * intensity * 255.0) as u8;
+                let b = (0.1 * intensity * 255.0) as u8;
+                [r, g, b]
+            }
+            RCMSEClassification::Unknown => {
+                // Gray for insufficient data
+                let v = (0.3 + slope_normalized * 0.4) * 255.0;
+                [v as u8, v as u8, v as u8]
+            }
+        }
+    }
+}
+
+/// Calculate RCMSE analysis for a data chunk.
+///
+/// Computes sample entropy at multiple scales and derives complexity metrics.
+/// This is computationally expensive - use for precomputation, not real-time.
+pub fn calculate_rcmse(data: &[u8], max_scale: usize) -> RCMSEAnalysis {
+    // Convert bytes to f64 for floating-point operations
+    let data_f64: Vec<f64> = data.iter().map(|&b| b as f64).collect();
+
+    // Calculate tolerance based on standard deviation
+    let sd = std_deviation(&data_f64);
+    let r = RCMSE_TOLERANCE_FACTOR * sd;
+
+    // Need minimum data length for meaningful analysis
+    // At scale τ, coarse-grained series has length N/τ, need at least m+2 points
+    let min_length_for_scale = |scale: usize| (RCMSE_EMBEDDING_DIM + 2) * scale;
+
+    if data.len() < min_length_for_scale(1) || r == 0.0 {
+        return RCMSEAnalysis {
+            entropy_by_scale: Vec::new(),
+            slope: 0.0,
+            complexity_index: 0.0,
+            mean_entropy: 0.0,
+            classification: RCMSEClassification::Unknown,
+        };
+    }
+
+    // Calculate entropy at each scale
+    let mut entropy_by_scale = Vec::with_capacity(max_scale);
+    let mut valid_scales = Vec::new();
+
+    for scale in 1..=max_scale {
+        if data.len() < min_length_for_scale(scale) {
+            break;
+        }
+
+        if let Some(entropy) = rcmse_at_scale(&data_f64, scale, RCMSE_EMBEDDING_DIM, r) {
+            entropy_by_scale.push(entropy);
+            valid_scales.push(scale as f64);
+        } else {
+            // Use previous value or break if none
+            if !entropy_by_scale.is_empty() {
+                entropy_by_scale.push(*entropy_by_scale.last().unwrap());
+                valid_scales.push(scale as f64);
+            }
+        }
+    }
+
+    if entropy_by_scale.len() < 3 {
+        return RCMSEAnalysis {
+            entropy_by_scale,
+            slope: 0.0,
+            complexity_index: 0.0,
+            mean_entropy: 0.0,
+            classification: RCMSEClassification::Unknown,
+        };
+    }
+
+    // Calculate linear regression slope
+    let n = valid_scales.len() as f64;
+    let mean_scale: f64 = valid_scales.iter().sum::<f64>() / n;
+    let mean_entropy: f64 = entropy_by_scale.iter().sum::<f64>() / n;
+
+    let mut numerator = 0.0;
+    let mut denominator = 0.0;
+    for (scale, entropy) in valid_scales.iter().zip(entropy_by_scale.iter()) {
+        numerator += (scale - mean_scale) * (entropy - mean_entropy);
+        denominator += (scale - mean_scale).powi(2);
+    }
+
+    let slope = if denominator > 0.0 {
+        numerator / denominator
+    } else {
+        0.0
+    };
+
+    // Detect early increase (characteristic of chaotic signals)
+    let has_early_increase = entropy_by_scale.len() >= 3
+        && entropy_by_scale[1] > entropy_by_scale[0]
+        && entropy_by_scale[2] > entropy_by_scale[0];
+
+    // Classification based on slope and pattern
+    let classification = if has_early_increase && slope < 0.05 {
+        RCMSEClassification::Chaotic
+    } else if slope < -0.05 {
+        RCMSEClassification::Random
+    } else if slope.abs() < 0.05 {
+        RCMSEClassification::Structured
+    } else {
+        RCMSEClassification::Unknown
+    };
+
+    // Complexity index: combine mean entropy with slope information
+    // Higher complexity for structured (flat slope) with moderate entropy
+    let slope_factor = 1.0 - slope.abs().min(0.3) / 0.3; // 1.0 for flat, 0.0 for steep
+    let entropy_factor = (mean_entropy / 3.0).min(1.0); // Normalize assuming max ~3.0
+    let complexity_index = slope_factor * entropy_factor * 2.0;
+
+    RCMSEAnalysis {
+        entropy_by_scale,
+        slope,
+        complexity_index,
+        mean_entropy,
+        classification,
+    }
+}
+
+/// Calculate a simplified RCMSE complexity value for fast visualization.
+///
+/// Returns a value between 0.0 and 1.0:
+/// - 0.0: Random/encrypted (steep negative slope)
+/// - 0.5: Structured/complex (flat slope)
+/// - 1.0: Chaotic/interesting (positive early slope)
+pub fn calculate_rcmse_quick(data: &[u8]) -> f32 {
+    // Use fewer scales for speed (6 scales works well with 256-byte windows)
+    const QUICK_MAX_SCALE: usize = 6;
+
+    let analysis = calculate_rcmse(data, QUICK_MAX_SCALE);
+
+    // Map to 0-1 based on complexity index and classification
+    match analysis.classification {
+        RCMSEClassification::Random => 0.1 + analysis.complexity_index as f32 * 0.15,
+        RCMSEClassification::Structured => 0.4 + analysis.complexity_index as f32 * 0.25,
+        RCMSEClassification::Chaotic => 0.7 + analysis.complexity_index as f32 * 0.2,
+        RCMSEClassification::Unknown => 0.5,
+    }
+}
+
 impl JSDAnalysis {
     /// Map JSD to RGB color.
     ///
@@ -561,5 +902,99 @@ mod tests {
             complexity < 0.2,
             "Repetitive data should have low complexity: {complexity}"
         );
+    }
+
+    #[test]
+    fn test_coarse_grain_basic() {
+        // Test coarse-graining at scale 2
+        let data = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0];
+        let coarse = super::coarse_grain(&data, 2, 1);
+        // Expected: [(1+2)/2, (3+4)/2, (5+6)/2, (7+8)/2] = [1.5, 3.5, 5.5, 7.5]
+        assert_eq!(coarse.len(), 4);
+        assert!((coarse[0] - 1.5).abs() < 0.01);
+        assert!((coarse[1] - 3.5).abs() < 0.01);
+        assert!((coarse[2] - 5.5).abs() < 0.01);
+        assert!((coarse[3] - 7.5).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_coarse_grain_offset() {
+        // Test coarse-graining at scale 2 with offset 2
+        let data = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0];
+        let coarse = super::coarse_grain(&data, 2, 2);
+        // With offset 2: start at index 1, [(2+3)/2, (4+5)/2, (6+7)/2] = [2.5, 4.5, 6.5]
+        assert_eq!(coarse.len(), 3);
+        assert!((coarse[0] - 2.5).abs() < 0.01);
+        assert!((coarse[1] - 4.5).abs() < 0.01);
+        assert!((coarse[2] - 6.5).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_rcmse_uniform_data() {
+        // Uniform data should have very low entropy (highly predictable)
+        let data = vec![128u8; 500];
+        let analysis = super::calculate_rcmse(&data, 8);
+        // Uniform data has zero variance, r=0, so we get Unknown classification
+        assert_eq!(analysis.classification, super::RCMSEClassification::Unknown);
+    }
+
+    #[test]
+    fn test_rcmse_random_data() {
+        // Pseudo-random data should be classified as Random
+        let mut x: u64 = 42;
+        let data: Vec<u8> = (0..1000)
+            .map(|_| {
+                x = x.wrapping_mul(1103515245).wrapping_add(12345);
+                ((x >> 16) & 0xFF) as u8
+            })
+            .collect();
+        let analysis = super::calculate_rcmse(&data, 10);
+
+        // Random data should have negative slope (entropy decreases with scale)
+        assert!(
+            analysis.slope < 0.0,
+            "Random data should have negative slope: {}",
+            analysis.slope
+        );
+    }
+
+    #[test]
+    fn test_rcmse_quick() {
+        // Test the quick RCMSE function returns valid range
+        let data: Vec<u8> = (0..500).map(|i| (i % 256) as u8).collect();
+        let value = super::calculate_rcmse_quick(&data);
+        assert!(
+            value >= 0.0 && value <= 1.0,
+            "RCMSE quick value out of range: {}",
+            value
+        );
+    }
+
+    #[test]
+    fn test_rcmse_analysis_to_color() {
+        // Test that color mapping produces non-zero RGB values for various classifications
+        let classifications = [
+            super::RCMSEClassification::Random,
+            super::RCMSEClassification::Structured,
+            super::RCMSEClassification::Chaotic,
+            super::RCMSEClassification::Unknown,
+        ];
+
+        for classification in classifications {
+            let analysis = super::RCMSEAnalysis {
+                entropy_by_scale: vec![2.0, 1.9, 1.8, 1.7],
+                slope: -0.1,
+                complexity_index: 0.5,
+                mean_entropy: 1.85,
+                classification,
+            };
+            let color = analysis.to_color();
+            // Verify we get non-zero colors (not all black)
+            assert!(
+                color[0] > 0 || color[1] > 0 || color[2] > 0,
+                "Color should not be all zeros for {:?}",
+                classification
+            );
+        }
     }
 }
