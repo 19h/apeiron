@@ -18,8 +18,8 @@ use rayon::prelude::*;
 
 use analysis::{
     byte_distribution, calculate_entropy, calculate_jsd, calculate_kolmogorov_complexity,
-    calculate_rcmse_quick, extract_ascii, format_bytes, identify_file_type, ByteAnalysis,
-    JSDAnalysis, KolmogorovAnalysis, ANALYSIS_WINDOW,
+    calculate_rcmse_quick, calculate_wavelet_suspiciousness, extract_ascii, format_bytes,
+    identify_file_type, ByteAnalysis, JSDAnalysis, KolmogorovAnalysis, ANALYSIS_WINDOW,
 };
 use hilbert::{calculate_dimension, d2xy, xy2d};
 
@@ -45,6 +45,8 @@ enum VisualizationMode {
     JensenShannonDivergence,
     /// Refined Composite Multi-Scale Entropy - reveals complexity across time scales.
     MultiScaleEntropy,
+    /// Wavelet Entropy Decomposition - reveals suspicious entropy patterns via SSECS.
+    WaveletEntropy,
 }
 
 impl VisualizationMode {
@@ -58,6 +60,7 @@ impl VisualizationMode {
             Self::KolmogorovComplexity => "Kolmogorov Complexity",
             Self::JensenShannonDivergence => "JS Divergence",
             Self::MultiScaleEntropy => "Multi-Scale Entropy (RCMSE)",
+            Self::WaveletEntropy => "Wavelet Entropy (SSECS)",
         }
     }
 
@@ -71,6 +74,7 @@ impl VisualizationMode {
             Self::KolmogorovComplexity,
             Self::JensenShannonDivergence,
             Self::MultiScaleEntropy,
+            Self::WaveletEntropy,
         ]
     }
 
@@ -84,7 +88,8 @@ impl VisualizationMode {
             | Self::SimilarityMatrix
             | Self::KolmogorovComplexity
             | Self::JensenShannonDivergence
-            | Self::MultiScaleEntropy => file_dimension as f32,
+            | Self::MultiScaleEntropy
+            | Self::WaveletEntropy => file_dimension as f32,
         }
     }
 
@@ -98,10 +103,11 @@ impl VisualizationMode {
             Self::SimilarityMatrix => 2048,
             // Hilbert can use smaller textures when zoomed out
             Self::Hilbert => 512,
-            // Kolmogorov, JSD, and RCMSE use Hilbert mapping, same requirements
+            // Kolmogorov, JSD, RCMSE, and Wavelet use Hilbert mapping, same requirements
             Self::KolmogorovComplexity
             | Self::JensenShannonDivergence
-            | Self::MultiScaleEntropy => 512,
+            | Self::MultiScaleEntropy
+            | Self::WaveletEntropy => 512,
         }
     }
 
@@ -114,11 +120,12 @@ impl VisualizationMode {
             Self::SimilarityMatrix => true,
             // Digraph and BytePhaseSpace are fixed 256×256, render full grid
             Self::Digraph | Self::BytePhaseSpace => true,
-            // Hilbert, Kolmogorov, JSD, and RCMSE benefit from viewport-aware rendering for large files
+            // Hilbert, Kolmogorov, JSD, RCMSE, and Wavelet benefit from viewport-aware rendering
             Self::Hilbert
             | Self::KolmogorovComplexity
             | Self::JensenShannonDivergence
-            | Self::MultiScaleEntropy => false,
+            | Self::MultiScaleEntropy
+            | Self::WaveletEntropy => false,
         }
     }
 }
@@ -180,6 +187,8 @@ struct FileData {
     reference_distribution: Arc<[f64; 256]>,
     /// Precomputed RCMSE values (one per RCMSE_SAMPLE_INTERVAL bytes).
     rcmse_map: Arc<Vec<f32>>,
+    /// Precomputed wavelet suspiciousness values (one per WAVELET_SAMPLE_INTERVAL bytes).
+    wavelet_map: Arc<Vec<f32>>,
 }
 
 /// Interval for sampling RCMSE (every N bytes).
@@ -189,6 +198,10 @@ const RCMSE_SAMPLE_INTERVAL: usize = 64;
 /// Interval for sampling Kolmogorov complexity (every N bytes).
 /// Smaller = more precise but slower to precompute.
 const COMPLEXITY_SAMPLE_INTERVAL: usize = 64;
+
+/// Interval for sampling wavelet suspiciousness (every N bytes).
+/// Same as complexity/RCMSE for consistent detail level.
+const WAVELET_SAMPLE_INTERVAL: usize = 64;
 
 /// Viewport state for pan and zoom.
 #[derive(Clone, Copy)]
@@ -399,6 +412,10 @@ impl NeuroCoreApp {
                 let rcmse_map = Self::precompute_rcmse_map(&data);
                 println!("Precomputed RCMSE map: {} samples", rcmse_map.len());
 
+                // Precompute wavelet suspiciousness map
+                let wavelet_map = Self::precompute_wavelet_map(&data);
+                println!("Precomputed wavelet map: {} samples", wavelet_map.len());
+
                 // Calculate reference byte distribution for JSD
                 let reference_distribution = Arc::new(byte_distribution(&data));
 
@@ -413,6 +430,7 @@ impl NeuroCoreApp {
                     complexity_map: Arc::new(complexity_map),
                     reference_distribution,
                     rcmse_map: Arc::new(rcmse_map),
+                    wavelet_map: Arc::new(wavelet_map),
                 });
 
                 // Reset viewport and selection
@@ -495,6 +513,38 @@ impl NeuroCoreApp {
         rcmse_map.get(index).copied().unwrap_or(0.5)
     }
 
+    /// Precompute wavelet suspiciousness values for the file.
+    /// Uses larger windows for meaningful multi-scale analysis.
+    fn precompute_wavelet_map(data: &[u8]) -> Vec<f32> {
+        // Window needs to contain multiple 256-byte chunks for wavelet analysis
+        // 2048 bytes = 8 chunks = 3 wavelet levels
+        const WINDOW_SIZE: usize = 2048;
+
+        let num_samples = (data.len() / WAVELET_SAMPLE_INTERVAL).max(1);
+
+        (0..num_samples)
+            .into_par_iter()
+            .map(|i| {
+                let start = i * WAVELET_SAMPLE_INTERVAL;
+                let end = (start + WINDOW_SIZE).min(data.len());
+                if start < data.len() && end > start {
+                    calculate_wavelet_suspiciousness(&data[start..end])
+                } else {
+                    0.5 // Default to middle value
+                }
+            })
+            .collect()
+    }
+
+    /// Look up precomputed wavelet suspiciousness value for a file offset.
+    fn lookup_wavelet(wavelet_map: &[f32], offset: usize) -> f32 {
+        if wavelet_map.is_empty() {
+            return 0.5;
+        }
+        let index = offset / WAVELET_SAMPLE_INTERVAL;
+        wavelet_map.get(index).copied().unwrap_or(0.5)
+    }
+
     /// Update the selection based on a byte offset and optionally sync hex view.
     fn update_selection(&mut self, offset: u64) {
         self.update_selection_with_scroll(offset, true);
@@ -539,7 +589,8 @@ impl NeuroCoreApp {
                 VisualizationMode::Hilbert
                 | VisualizationMode::KolmogorovComplexity
                 | VisualizationMode::JensenShannonDivergence
-                | VisualizationMode::MultiScaleEntropy => {
+                | VisualizationMode::MultiScaleEntropy
+                | VisualizationMode::WaveletEntropy => {
                     let x = world_pos.x as u64;
                     let y = world_pos.y as u64;
                     let n = file.dimension;
@@ -657,6 +708,7 @@ impl NeuroCoreApp {
         let complexity_map = Arc::clone(&file.complexity_map);
         let reference_distribution = Arc::clone(&file.reference_distribution);
         let rcmse_map = Arc::clone(&file.rcmse_map);
+        let wavelet_map = Arc::clone(&file.wavelet_map);
         let dimension = file.dimension;
         let file_size = file.size;
         let viz_mode = self.viz_mode;
@@ -673,10 +725,11 @@ impl NeuroCoreApp {
                     VisualizationMode::Digraph => Some(gpu::GpuVizMode::Digraph),
                     VisualizationMode::BytePhaseSpace => Some(gpu::GpuVizMode::BytePhaseSpace),
                     VisualizationMode::SimilarityMatrix => Some(gpu::GpuVizMode::SimilarityMatrix),
-                    // Kolmogorov, JSD, and RCMSE use precomputed/calculated values - CPU rendering
+                    // Kolmogorov, JSD, RCMSE, and Wavelet use precomputed/calculated values - CPU rendering
                     VisualizationMode::KolmogorovComplexity
                     | VisualizationMode::JensenShannonDivergence
-                    | VisualizationMode::MultiScaleEntropy => None,
+                    | VisualizationMode::MultiScaleEntropy
+                    | VisualizationMode::WaveletEntropy => None,
                 };
 
                 if let Some(mode) = gpu_mode {
@@ -707,6 +760,7 @@ impl NeuroCoreApp {
                         &complexity_map,
                         &reference_distribution,
                         &rcmse_map,
+                        &wavelet_map,
                         dimension,
                         file_size,
                         tex_size,
@@ -723,6 +777,7 @@ impl NeuroCoreApp {
                     &complexity_map,
                     &reference_distribution,
                     &rcmse_map,
+                    &wavelet_map,
                     dimension,
                     file_size,
                     tex_size,
@@ -739,6 +794,7 @@ impl NeuroCoreApp {
                 &complexity_map,
                 &reference_distribution,
                 &rcmse_map,
+                &wavelet_map,
                 dimension,
                 file_size,
                 tex_size,
@@ -759,6 +815,7 @@ impl NeuroCoreApp {
         complexity_map: &[f32],
         reference_distribution: &[f64; 256],
         rcmse_map: &[f32],
+        wavelet_map: &[f32],
         dimension: u64,
         file_size: u64,
         tex_size: usize,
@@ -801,6 +858,15 @@ impl NeuroCoreApp {
             ),
             VisualizationMode::MultiScaleEntropy => Self::generate_rcmse_pixels(
                 rcmse_map, dimension, file_size, tex_size, world_min, scale_x, scale_y,
+            ),
+            VisualizationMode::WaveletEntropy => Self::generate_wavelet_pixels(
+                wavelet_map,
+                dimension,
+                file_size,
+                tex_size,
+                world_min,
+                scale_x,
+                scale_y,
             ),
         };
 
@@ -1263,6 +1329,81 @@ impl NeuroCoreApp {
             .collect()
     }
 
+    /// Generate Wavelet Entropy visualization using Hilbert curve mapping.
+    ///
+    /// Based on "Wavelet Decomposition of Software Entropy Reveals Symptoms of Malicious Code"
+    /// Uses precomputed wavelet suspiciousness values (SSECS) for fast rendering.
+    ///
+    /// Key insight: Malware concentrates entropic energy at COARSE levels (large entropy shifts
+    /// from encrypted/compressed sections), while clean files concentrate energy at FINE levels.
+    ///
+    /// Color legend:
+    /// - Deep blue/cyan: Low suspiciousness (normal, energy at fine levels)
+    /// - Green/teal: Medium-low suspiciousness
+    /// - Yellow/orange: Medium-high suspiciousness
+    /// - Red/magenta: High suspiciousness (malware-like, energy at coarse levels)
+    fn generate_wavelet_pixels(
+        wavelet_map: &[f32],
+        dimension: u64,
+        file_size: u64,
+        tex_size: usize,
+        world_min: Vec2,
+        scale_x: f32,
+        scale_y: f32,
+    ) -> Vec<Color32> {
+        (0..tex_size * tex_size)
+            .into_par_iter()
+            .map(|idx| {
+                let tex_y = idx / tex_size;
+                let tex_x = idx % tex_size;
+
+                let world_x = (world_min.x + tex_x as f32 * scale_x) as u64;
+                let world_y = (world_min.y + tex_y as f32 * scale_y) as u64;
+
+                if world_x >= dimension || world_y >= dimension {
+                    return Color32::from_rgb(13, 13, 13);
+                }
+
+                let d = xy2d(dimension, world_x, world_y);
+
+                if d >= file_size {
+                    return Color32::from_rgb(13, 13, 13);
+                }
+
+                // Use precomputed wavelet suspiciousness value (0.0-1.0 range)
+                let suspiciousness = Self::lookup_wavelet(wavelet_map, d as usize);
+
+                // Map suspiciousness to color using WaveletAnalysis color scheme
+                let t = suspiciousness.clamp(0.0, 1.0);
+
+                // Cool-to-hot colormap emphasizing suspicious regions
+                let (r, g, b) = if t < 0.2 {
+                    // Deep blue - very normal (energy at fine levels)
+                    let s = t / 0.2;
+                    (0.1 + s * 0.1, 0.2 + s * 0.3, 0.7 + s * 0.2)
+                } else if t < 0.4 {
+                    // Blue to cyan/teal
+                    let s = (t - 0.2) / 0.2;
+                    (0.2 - s * 0.1, 0.5 + s * 0.3, 0.9 - s * 0.2)
+                } else if t < 0.6 {
+                    // Cyan to green/yellow
+                    let s = (t - 0.4) / 0.2;
+                    (0.1 + s * 0.6, 0.8 - s * 0.1, 0.7 - s * 0.5)
+                } else if t < 0.8 {
+                    // Yellow to orange
+                    let s = (t - 0.6) / 0.2;
+                    (0.7 + s * 0.3, 0.7 - s * 0.3, 0.2 - s * 0.1)
+                } else {
+                    // Orange to red/magenta - highly suspicious
+                    let s = (t - 0.8) / 0.2;
+                    (1.0, 0.4 - s * 0.2, 0.1 + s * 0.3)
+                };
+
+                Color32::from_rgb((r * 255.0) as u8, (g * 255.0) as u8, (b * 255.0) as u8)
+            })
+            .collect()
+    }
+
     /// Reset viewport to default.
     fn reset_viewport(&mut self) {
         self.viewport = Viewport::default();
@@ -1501,6 +1642,7 @@ impl NeuroCoreApp {
                     | VisualizationMode::KolmogorovComplexity
                     | VisualizationMode::JensenShannonDivergence
                     | VisualizationMode::MultiScaleEntropy
+                    | VisualizationMode::WaveletEntropy
             ) {
                 self.draw_hex_region_outline(ui, available_rect);
             }
@@ -1649,6 +1791,7 @@ impl NeuroCoreApp {
             VisualizationMode::KolmogorovComplexity => "KOL",
             VisualizationMode::JensenShannonDivergence => "JSD",
             VisualizationMode::MultiScaleEntropy => "MSE",
+            VisualizationMode::WaveletEntropy => "WAV",
         };
 
         let text = format!(
@@ -2268,6 +2411,28 @@ impl NeuroCoreApp {
             ui.label(RichText::new("  Jensen-Shannon divergence from file average.").small());
             ui.label(RichText::new("  Measures distribution anomalies.").small());
             ui.label(RichText::new("  Low = normal, High = unusual byte dist.").small());
+            ui.add_space(8.0);
+
+            ui.label(
+                RichText::new("Multi-Scale Entropy [MSE]")
+                    .strong()
+                    .monospace()
+                    .color(Color32::from_rgb(100, 200, 180)),
+            );
+            ui.label(RichText::new("  RCMSE - complexity across time scales.").small());
+            ui.label(RichText::new("  Distinguishes random vs structured data.").small());
+            ui.label(RichText::new("  Purple = random, Green = structured.").small());
+            ui.add_space(8.0);
+
+            ui.label(
+                RichText::new("Wavelet Entropy [WAV]")
+                    .strong()
+                    .monospace()
+                    .color(Color32::from_rgb(255, 150, 100)),
+            );
+            ui.label(RichText::new("  SSECS - Haar wavelet decomposition.").small());
+            ui.label(RichText::new("  Detects malware-like entropy patterns.").small());
+            ui.label(RichText::new("  Blue = normal, Red = suspicious.").small());
 
             ui.add_space(8.0);
             ui.separator();

@@ -670,6 +670,261 @@ pub fn calculate_rcmse_quick(data: &[u8]) -> f32 {
     }
 }
 
+// =============================================================================
+// Wavelet Entropy Decomposition (Haar Wavelet Transform)
+// =============================================================================
+// Based on: "Wavelet Decomposition of Software Entropy Reveals Symptoms of Malicious Code"
+// Wojnowicz et al., Journal of Innovation in Digital Ecosystems (2016)
+//
+// Key insight: Malware concentrates entropic energy at COARSE levels (large entropy shifts
+// from encrypted/compressed sections), while clean files concentrate energy at FINE levels.
+
+/// Window size for computing entropy stream (256 bytes as per paper)
+pub const WAVELET_CHUNK_SIZE: usize = 256;
+
+/// Compute Shannon entropy for a single chunk (returns 0-8 bits)
+#[inline]
+fn chunk_entropy(chunk: &[u8]) -> f64 {
+    if chunk.is_empty() {
+        return 0.0;
+    }
+
+    let mut counts = [0u32; 256];
+    for &byte in chunk {
+        counts[byte as usize] += 1;
+    }
+
+    let total = chunk.len() as f64;
+    let mut entropy = 0.0;
+
+    for &count in &counts {
+        if count > 0 {
+            let p = count as f64 / total;
+            entropy -= p * p.log2();
+        }
+    }
+
+    entropy
+}
+
+/// Compute the entropy stream from raw file data.
+/// Each element is the Shannon entropy of a 256-byte chunk.
+pub fn compute_entropy_stream(data: &[u8]) -> Vec<f64> {
+    if data.is_empty() {
+        return Vec::new();
+    }
+
+    let num_chunks = (data.len() + WAVELET_CHUNK_SIZE - 1) / WAVELET_CHUNK_SIZE;
+    let mut stream = Vec::with_capacity(num_chunks);
+
+    for i in 0..num_chunks {
+        let start = i * WAVELET_CHUNK_SIZE;
+        let end = (start + WAVELET_CHUNK_SIZE).min(data.len());
+        stream.push(chunk_entropy(&data[start..end]));
+    }
+
+    stream
+}
+
+/// Perform Haar wavelet transform on a signal.
+/// Returns wavelet coefficients organized by level: Vec<Vec<f64>>
+/// Level 0 is coarsest (1 coefficient), level J-1 is finest (2^(J-1) coefficients)
+/// where J = floor(log2(signal.len()))
+pub fn haar_wavelet_transform(signal: &[f64]) -> Vec<Vec<f64>> {
+    if signal.is_empty() {
+        return Vec::new();
+    }
+
+    // Truncate to power of 2
+    let j = (signal.len() as f64).log2().floor() as usize;
+    if j == 0 {
+        return Vec::new();
+    }
+
+    let n = 1 << j; // 2^j
+    let mut data: Vec<f64> = signal[..n].to_vec();
+
+    // Store coefficients by level
+    let mut coefficients: Vec<Vec<f64>> = Vec::with_capacity(j);
+
+    // Iteratively compute wavelet coefficients from fine to coarse
+    let mut current_len = n;
+
+    while current_len > 1 {
+        let half = current_len / 2;
+        let mut averages = Vec::with_capacity(half);
+        let mut details = Vec::with_capacity(half);
+
+        // Haar wavelet: average and difference of pairs
+        for i in 0..half {
+            let left = data[2 * i];
+            let right = data[2 * i + 1];
+            averages.push((left + right) / 2.0);
+            details.push((left - right) / 2.0); // Detail coefficient (wavelet coefficient)
+        }
+
+        // Store detail coefficients (from this level)
+        // We push in reverse order so level 0 is coarsest
+        coefficients.push(details);
+
+        // Replace data with averages for next iteration
+        data = averages;
+        current_len = half;
+    }
+
+    // Reverse so level 0 is coarsest (1 coefficient), level J-1 is finest
+    coefficients.reverse();
+    coefficients
+}
+
+/// Compute energy spectrum from wavelet coefficients.
+/// Energy at level j = sum of squared coefficients at that level.
+/// Returns Vec<f64> where index 0 is coarsest level energy.
+pub fn wavelet_energy_spectrum(coefficients: &[Vec<f64>]) -> Vec<f64> {
+    coefficients
+        .iter()
+        .map(|level| level.iter().map(|d| d * d).sum())
+        .collect()
+}
+
+/// Wavelet entropy analysis results for visualization and classification.
+#[derive(Debug, Clone)]
+pub struct WaveletAnalysis {
+    /// Energy at each resolution level (index 0 = coarsest)
+    pub energy_spectrum: Vec<f64>,
+    /// Total energy in the signal
+    pub total_energy: f64,
+    /// Ratio of energy at coarse levels (first half) to total energy
+    /// Higher values = more suspicious (malware-like)
+    pub coarse_energy_ratio: f64,
+    /// Suspiciousness score (0.0 = normal, 1.0 = highly suspicious)
+    pub suspiciousness: f64,
+    /// Number of resolution levels
+    pub num_levels: usize,
+}
+
+impl WaveletAnalysis {
+    /// Analyze wavelet decomposition of an entropy signal.
+    pub fn from_entropy_stream(stream: &[f64]) -> Self {
+        let coefficients = haar_wavelet_transform(stream);
+
+        if coefficients.is_empty() {
+            return Self {
+                energy_spectrum: Vec::new(),
+                total_energy: 0.0,
+                coarse_energy_ratio: 0.5,
+                suspiciousness: 0.5,
+                num_levels: 0,
+            };
+        }
+
+        let energy_spectrum = wavelet_energy_spectrum(&coefficients);
+        let num_levels = energy_spectrum.len();
+        let total_energy: f64 = energy_spectrum.iter().sum();
+
+        if total_energy == 0.0 || num_levels < 2 {
+            return Self {
+                energy_spectrum,
+                total_energy,
+                coarse_energy_ratio: 0.5,
+                suspiciousness: 0.5,
+                num_levels,
+            };
+        }
+
+        // Calculate coarse energy ratio (first half of levels)
+        // Per the paper: malware concentrates energy at coarse levels
+        let coarse_levels = (num_levels + 1) / 2; // Round up for odd numbers
+        let coarse_energy: f64 = energy_spectrum[..coarse_levels].iter().sum();
+        let coarse_energy_ratio = coarse_energy / total_energy;
+
+        // Calculate suspiciousness score
+        // Based on paper findings:
+        // - Clean files: energy concentrated at fine levels (low coarse ratio)
+        // - Malware: energy concentrated at coarse levels (high coarse ratio)
+        //
+        // We also consider the energy magnitude and distribution
+        let mean_energy = total_energy / num_levels as f64;
+        let energy_variance: f64 = energy_spectrum
+            .iter()
+            .map(|e| (e - mean_energy).powi(2))
+            .sum::<f64>()
+            / num_levels as f64;
+        let energy_std = energy_variance.sqrt();
+
+        // Normalize coarse ratio to suspiciousness
+        // Typical clean files: coarse_ratio ~ 0.2-0.4
+        // Suspicious files: coarse_ratio ~ 0.5-0.8
+        let ratio_suspiciousness = ((coarse_energy_ratio - 0.3) / 0.4).clamp(0.0, 1.0);
+
+        // High energy variance also indicates suspicious structure
+        let cv = if mean_energy > 0.0 {
+            energy_std / mean_energy
+        } else {
+            0.0
+        };
+        let variance_suspiciousness = (cv / 2.0).clamp(0.0, 1.0);
+
+        // Combined suspiciousness (weighted)
+        let suspiciousness = ratio_suspiciousness * 0.7 + variance_suspiciousness * 0.3;
+
+        Self {
+            energy_spectrum,
+            total_energy,
+            coarse_energy_ratio,
+            suspiciousness,
+            num_levels,
+        }
+    }
+
+    /// Map wavelet analysis to RGB color.
+    ///
+    /// Color legend based on suspiciousness:
+    /// - Deep blue/cyan: Low suspiciousness (normal, energy at fine levels)
+    /// - Green/teal: Medium-low suspiciousness
+    /// - Yellow/orange: Medium-high suspiciousness
+    /// - Red/magenta: High suspiciousness (malware-like, energy at coarse levels)
+    pub fn to_color(&self) -> [u8; 3] {
+        let t = self.suspiciousness.clamp(0.0, 1.0);
+
+        // Cool-to-hot colormap emphasizing suspicious regions
+        let (r, g, b) = if t < 0.2 {
+            // Deep blue - very normal (energy at fine levels)
+            let s = t / 0.2;
+            (0.1 + s * 0.1, 0.2 + s * 0.3, 0.7 + s * 0.2)
+        } else if t < 0.4 {
+            // Blue to cyan/teal
+            let s = (t - 0.2) / 0.2;
+            (0.2 - s * 0.1, 0.5 + s * 0.3, 0.9 - s * 0.2)
+        } else if t < 0.6 {
+            // Cyan to green/yellow
+            let s = (t - 0.4) / 0.2;
+            (0.1 + s * 0.6, 0.8 - s * 0.1, 0.7 - s * 0.5)
+        } else if t < 0.8 {
+            // Yellow to orange
+            let s = (t - 0.6) / 0.2;
+            (0.7 + s * 0.3, 0.7 - s * 0.3, 0.2 - s * 0.1)
+        } else {
+            // Orange to red/magenta - highly suspicious
+            let s = (t - 0.8) / 0.2;
+            (1.0, 0.4 - s * 0.2, 0.1 + s * 0.3)
+        };
+
+        [(r * 255.0) as u8, (g * 255.0) as u8, (b * 255.0) as u8]
+    }
+}
+
+/// Calculate a quick wavelet suspiciousness value for visualization.
+/// Returns a value between 0.0 and 1.0.
+pub fn calculate_wavelet_suspiciousness(data: &[u8]) -> f32 {
+    let stream = compute_entropy_stream(data);
+    if stream.len() < 4 {
+        return 0.5; // Not enough data for meaningful analysis
+    }
+    let analysis = WaveletAnalysis::from_entropy_stream(&stream);
+    analysis.suspiciousness as f32
+}
+
 impl JSDAnalysis {
     /// Map JSD to RGB color.
     ///
@@ -1130,5 +1385,113 @@ mod tests {
                 classification
             );
         }
+    }
+
+    // =============================================================================
+    // Wavelet Entropy Tests
+    // =============================================================================
+
+    #[test]
+    fn test_compute_entropy_stream() {
+        // Test entropy stream computation
+        let data: Vec<u8> = (0..512).map(|i| (i % 256) as u8).collect();
+        let stream = super::compute_entropy_stream(&data);
+        // 512 bytes / 256 chunk size = 2 chunks
+        assert_eq!(stream.len(), 2);
+        // Each chunk has all 256 values once, so max entropy
+        assert!(stream[0] > 7.9, "Expected high entropy: {}", stream[0]);
+    }
+
+    #[test]
+    fn test_haar_wavelet_transform_basic() {
+        // Test with a simple signal of length 8
+        let signal = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0];
+        let coefficients = super::haar_wavelet_transform(&signal);
+
+        // 8 = 2^3, so we should have 3 levels
+        assert_eq!(coefficients.len(), 3);
+
+        // Level 0 (coarsest): 1 coefficient
+        assert_eq!(coefficients[0].len(), 1);
+        // Level 1: 2 coefficients
+        assert_eq!(coefficients[1].len(), 2);
+        // Level 2 (finest): 4 coefficients
+        assert_eq!(coefficients[2].len(), 4);
+    }
+
+    #[test]
+    fn test_haar_wavelet_transform_constant() {
+        // Constant signal should have zero detail coefficients
+        let signal = vec![5.0; 8];
+        let coefficients = super::haar_wavelet_transform(&signal);
+
+        // All detail coefficients should be (near) zero
+        for level in &coefficients {
+            for &coeff in level {
+                assert!(
+                    coeff.abs() < 1e-10,
+                    "Constant signal should have zero wavelet coefficients"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_wavelet_energy_spectrum() {
+        // Test energy calculation
+        let coefficients = vec![vec![2.0], vec![1.0, -1.0], vec![0.5, 0.5, -0.5, -0.5]];
+        let energy = super::wavelet_energy_spectrum(&coefficients);
+
+        assert_eq!(energy.len(), 3);
+        assert!((energy[0] - 4.0).abs() < 1e-10); // 2^2 = 4
+        assert!((energy[1] - 2.0).abs() < 1e-10); // 1^2 + 1^2 = 2
+        assert!((energy[2] - 1.0).abs() < 1e-10); // 4 * 0.25 = 1
+    }
+
+    #[test]
+    fn test_wavelet_analysis_uniform_data() {
+        // Uniform data should have low suspiciousness
+        let data = vec![128u8; 1024];
+        let stream = super::compute_entropy_stream(&data);
+        let analysis = super::WaveletAnalysis::from_entropy_stream(&stream);
+
+        // Uniform data = constant entropy = zero wavelet coefficients
+        // Should result in middle-range suspiciousness
+        assert!(
+            analysis.total_energy < 0.1,
+            "Uniform data should have near-zero wavelet energy"
+        );
+    }
+
+    #[test]
+    fn test_wavelet_analysis_to_color() {
+        // Test that color mapping produces valid RGB values
+        let stream = vec![1.0, 5.0, 7.0, 2.0, 6.0, 3.0, 4.0, 5.0];
+        let analysis = super::WaveletAnalysis::from_entropy_stream(&stream);
+        let color = analysis.to_color();
+
+        // Verify valid RGB values
+        assert!(color[0] <= 255);
+        assert!(color[1] <= 255);
+        assert!(color[2] <= 255);
+        // Should have some color (not all black)
+        assert!(
+            color[0] > 0 || color[1] > 0 || color[2] > 0,
+            "Color should not be all zeros"
+        );
+    }
+
+    #[test]
+    fn test_calculate_wavelet_suspiciousness() {
+        // Test quick suspiciousness calculation
+        let data: Vec<u8> = (0..2048).map(|i| (i % 256) as u8).collect();
+        let suspiciousness = super::calculate_wavelet_suspiciousness(&data);
+
+        // Should be in valid range
+        assert!(
+            suspiciousness >= 0.0 && suspiciousness <= 1.0,
+            "Suspiciousness out of range: {}",
+            suspiciousness
+        );
     }
 }
