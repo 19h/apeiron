@@ -4,7 +4,7 @@ A GPU-accelerated binary entropy and complexity visualizer using Hilbert curves 
 
 Apeiron provides visual analysis of binary files through eight visualization modes, helping identify patterns, encrypted regions, compressed data, and structural anomalies in executables, firmware, and other binary formats. It includes wavelet-based malware detection inspired by academic research.
 
-![Apeiron Screenshot](docs/screenshot.png)
+https://github.com/user-attachments/assets/c2ec6dc2-0296-4fa2-9494-8e86ccd562c2
 
 ## Features
 
