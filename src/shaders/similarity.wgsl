@@ -30,31 +30,31 @@ fn get_byte(offset: u32) -> u32 {
     return (word >> (byte_idx * 8u)) & 0xFFu;
 }
 
-// Compute histogram for a window - returns counts for 16 buckets (simplified)
-fn compute_histogram_16(start: u32) -> array<u32, 16> {
-    var hist: array<u32, 16>;
+// Compute histogram for a window - writes counts for 16 buckets into output pointer
+// Using pointer to avoid FXC array-by-value issues on Windows
+fn compute_histogram_16(start: u32, hist: ptr<function, array<u32, 16>>) {
+    // Initialize to zero
     for (var i = 0u; i < 16u; i = i + 1u) {
-        hist[i] = 0u;
+        (*hist)[i] = 0u;
     }
     
     let end = min(start + WINDOW_SIZE, uniforms.file_size);
     for (var i = start; i < end; i = i + 1u) {
         let byte = get_byte(i);
         let bucket = byte / 16u; // 256 bytes -> 16 buckets
-        hist[bucket] = hist[bucket] + 1u;
+        (*hist)[bucket] = (*hist)[bucket] + 1u;
     }
-    
-    return hist;
 }
 
 // Compute chi-squared distance between two histograms
-fn chi_squared_distance(hist_x: array<u32, 16>, hist_y: array<u32, 16>) -> f32 {
+// Using pointers to avoid FXC array-by-value issues on Windows
+fn chi_squared_distance(hist_x: ptr<function, array<u32, 16>>, hist_y: ptr<function, array<u32, 16>>) -> f32 {
     var total_x = 0u;
     var total_y = 0u;
     
     for (var i = 0u; i < 16u; i = i + 1u) {
-        total_x = total_x + hist_x[i];
-        total_y = total_y + hist_y[i];
+        total_x = total_x + (*hist_x)[i];
+        total_y = total_y + (*hist_y)[i];
     }
     
     if total_x == 0u || total_y == 0u {
@@ -66,8 +66,8 @@ fn chi_squared_distance(hist_x: array<u32, 16>, hist_y: array<u32, 16>) -> f32 {
     let total_y_f = f32(total_y);
     
     for (var i = 0u; i < 16u; i = i + 1u) {
-        let px = f32(hist_x[i]) / total_x_f;
-        let py = f32(hist_y[i]) / total_y_f;
+        let px = f32((*hist_x)[i]) / total_x_f;
+        let py = f32((*hist_y)[i]) / total_y_f;
         let sum = px + py;
         if sum > 0.0 {
             chi_sq = chi_sq + (px - py) * (px - py) / sum;
@@ -130,10 +130,13 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
         let pos_x = u32((world_x / dim) * f32(uniforms.file_size));
         let pos_y = u32((world_y / dim) * f32(uniforms.file_size));
         
-        let hist_x = compute_histogram_16(pos_x);
-        let hist_y = compute_histogram_16(pos_y);
+        // Compute histograms using pointers (FXC-compatible)
+        var hist_x: array<u32, 16>;
+        var hist_y: array<u32, 16>;
+        compute_histogram_16(pos_x, &hist_x);
+        compute_histogram_16(pos_y, &hist_y);
         
-        let chi_sq = chi_squared_distance(hist_x, hist_y);
+        let chi_sq = chi_squared_distance(&hist_x, &hist_y);
         
         // Convert distance to similarity (chi_sq ranges from 0 to 2)
         let similarity = 1.0 - sqrt(chi_sq / 2.0);
