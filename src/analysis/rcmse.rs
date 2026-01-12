@@ -439,6 +439,7 @@ fn std_deviation_bytes(data: &[u8]) -> f64 {
 }
 
 /// Calculate RCMSE for a single scale factor τ with optimized coarse-graining.
+/// Works directly from f64 data (used for pre-converted data).
 fn rcmse_at_scale_optimized(
     data: &[f64],
     scale: usize,
@@ -458,6 +459,45 @@ fn rcmse_at_scale_optimized(
     // Process all τ coarse-grained series (offsets 1 to τ)
     for k in 1..=scale {
         let len = coarse_grain_into(data, scale, k, buffer);
+        if len <= RCMSE_EMBEDDING_DIM + 1 {
+            continue;
+        }
+        let (n_m, n_m_plus_1) = count_pattern_matches_optimized(&buffer[..len], r);
+        total_m += n_m;
+        total_m_plus_1 += n_m_plus_1;
+    }
+
+    // RCMSE is undefined if no matches found
+    if total_m == 0 || total_m_plus_1 == 0 {
+        return None;
+    }
+
+    let ratio = total_m_plus_1 as f64 / total_m as f64;
+    Some(-ratio.ln())
+}
+
+/// Calculate RCMSE for a single scale factor τ directly from bytes.
+/// Eliminates the need for a separate byte-to-f64 conversion allocation.
+#[inline]
+fn rcmse_at_scale_from_bytes(
+    data: &[u8],
+    scale: usize,
+    r: f64,
+    buffer: &mut Vec<f64>,
+) -> Option<f64> {
+    if scale == 0 {
+        return None;
+    }
+
+    let max_coarse_len = data.len() / scale + 1;
+    buffer.resize(max_coarse_len, 0.0);
+
+    let mut total_m: u64 = 0;
+    let mut total_m_plus_1: u64 = 0;
+
+    // Process all τ coarse-grained series (offsets 1 to τ)
+    for k in 1..=scale {
+        let len = coarse_grain_bytes_into(data, scale, k, buffer);
         if len <= RCMSE_EMBEDDING_DIM + 1 {
             continue;
         }
@@ -582,17 +622,15 @@ pub fn calculate_rcmse(data: &[u8], max_scale: usize) -> RCMSEAnalysis {
         };
     }
 
-    // Convert bytes to f64 once (required for coarse-graining)
-    // Use chunked conversion for better cache usage
-    let data_f64: Vec<f64> = data.iter().map(|&b| b as f64).collect();
-
-    // Parallel computation of entropy at each scale
+    // OPTIMIZATION: Process bytes directly without f64 conversion allocation
+    // Each thread does its own coarse-graining directly from bytes
     let scale_results: Vec<(usize, Option<f64>)> = (1..=valid_max_scale)
         .into_par_iter()
         .map(|scale| {
-            // Each thread gets its own buffer
-            let mut buffer = Vec::with_capacity(data_f64.len() / scale + 1);
-            let entropy = rcmse_at_scale_optimized(&data_f64, scale, r, &mut buffer);
+            // Each thread gets its own buffer - sized for this specific scale
+            let mut buffer = Vec::with_capacity(data.len() / scale + 1);
+            // Use direct byte processing to avoid massive f64 allocation
+            let entropy = rcmse_at_scale_from_bytes(data, scale, r, &mut buffer);
             (scale, entropy)
         })
         .collect();

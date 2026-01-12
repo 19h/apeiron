@@ -271,73 +271,57 @@ fn get_lut_512() -> &'static HilbertLUT<512> {
 // Batch Conversion Functions
 // =============================================================================
 
+/// Batch process distances using a specific LUT.
+/// Inline helper to eliminate code duplication in d2xy_batch.
+#[inline(always)]
+fn d2xy_batch_with_lut<const N: usize>(
+    lut: &HilbertLUT<N>,
+    n: u64,
+    distances: &[u64],
+    out_x: &mut [u64],
+    out_y: &mut [u64],
+) {
+    // Process in chunks for better cache locality
+    for (i, &d) in distances.iter().enumerate() {
+        // LUT lookup is O(1) and always succeeds for d < N*N
+        if let Some((x, y)) = lut.lookup_d2xy(d) {
+            // SAFETY: bounds checked by debug_assert at call site
+            unsafe {
+                *out_x.get_unchecked_mut(i) = x;
+                *out_y.get_unchecked_mut(i) = y;
+            }
+        } else {
+            let (x, y) = d2xy_compute(n, d);
+            unsafe {
+                *out_x.get_unchecked_mut(i) = x;
+                *out_y.get_unchecked_mut(i) = y;
+            }
+        }
+    }
+}
+
 /// Convert multiple distances to (x, y) coordinates in batch.
 /// More efficient than calling d2xy repeatedly.
-/// Uses direct LUT access to avoid vtable dispatch.
+/// Uses direct LUT access with inlined helper to avoid code bloat.
 #[inline]
 pub fn d2xy_batch(n: u64, distances: &[u64], out_x: &mut [u64], out_y: &mut [u64]) {
     debug_assert_eq!(distances.len(), out_x.len());
     debug_assert_eq!(distances.len(), out_y.len());
 
-    // Direct match to avoid trait object overhead
+    // Direct match with inlined helper - compiler monomorphizes efficiently
     match n {
-        64 => {
-            let lut = get_lut_64();
-            for (i, &d) in distances.iter().enumerate() {
-                if let Some((x, y)) = lut.lookup_d2xy(d) {
-                    out_x[i] = x;
-                    out_y[i] = y;
-                } else {
-                    let (x, y) = d2xy_compute(n, d);
-                    out_x[i] = x;
-                    out_y[i] = y;
-                }
-            }
-        }
-        128 => {
-            let lut = get_lut_128();
-            for (i, &d) in distances.iter().enumerate() {
-                if let Some((x, y)) = lut.lookup_d2xy(d) {
-                    out_x[i] = x;
-                    out_y[i] = y;
-                } else {
-                    let (x, y) = d2xy_compute(n, d);
-                    out_x[i] = x;
-                    out_y[i] = y;
-                }
-            }
-        }
-        256 => {
-            let lut = get_lut_256();
-            for (i, &d) in distances.iter().enumerate() {
-                if let Some((x, y)) = lut.lookup_d2xy(d) {
-                    out_x[i] = x;
-                    out_y[i] = y;
-                } else {
-                    let (x, y) = d2xy_compute(n, d);
-                    out_x[i] = x;
-                    out_y[i] = y;
-                }
-            }
-        }
-        512 => {
-            let lut = get_lut_512();
-            for (i, &d) in distances.iter().enumerate() {
-                if let Some((x, y)) = lut.lookup_d2xy(d) {
-                    out_x[i] = x;
-                    out_y[i] = y;
-                } else {
-                    let (x, y) = d2xy_compute(n, d);
-                    out_x[i] = x;
-                    out_y[i] = y;
-                }
-            }
-        }
+        64 => d2xy_batch_with_lut(get_lut_64(), n, distances, out_x, out_y),
+        128 => d2xy_batch_with_lut(get_lut_128(), n, distances, out_x, out_y),
+        256 => d2xy_batch_with_lut(get_lut_256(), n, distances, out_x, out_y),
+        512 => d2xy_batch_with_lut(get_lut_512(), n, distances, out_x, out_y),
         _ => {
+            // Fallback: compute directly without LUT
             for (i, &d) in distances.iter().enumerate() {
                 let (x, y) = d2xy_compute(n, d);
-                out_x[i] = x;
-                out_y[i] = y;
+                unsafe {
+                    *out_x.get_unchecked_mut(i) = x;
+                    *out_y.get_unchecked_mut(i) = y;
+                }
             }
         }
     }

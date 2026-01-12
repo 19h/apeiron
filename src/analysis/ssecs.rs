@@ -95,19 +95,26 @@ pub struct LevelInfo {
     pub is_coarse: bool,
 }
 
-/// Compute sum of squares using SIMD.
+/// Compute sum of squares using 8-way SIMD with dual accumulators.
 #[inline]
 fn simd_sum_of_squares(data: &[f64]) -> f64 {
-    let chunks = data.chunks_exact(4);
+    let chunks = data.chunks_exact(8);
     let remainder = chunks.remainder();
 
-    let mut sum_vec = f64x4::ZERO;
+    let mut acc0 = f64x4::ZERO;
+    let mut acc1 = f64x4::ZERO;
+
     for chunk in chunks {
-        let vals = f64x4::new([chunk[0], chunk[1], chunk[2], chunk[3]]);
-        sum_vec += vals * vals;
+        let v0 = f64x4::new([chunk[0], chunk[1], chunk[2], chunk[3]]);
+        let v1 = f64x4::new([chunk[4], chunk[5], chunk[6], chunk[7]]);
+        acc0 += v0 * v0;
+        acc1 += v1 * v1;
     }
 
-    let mut sum = sum_vec.reduce_add();
+    let combined = acc0 + acc1;
+    let mut sum = combined.reduce_add();
+
+    // Handle remainder
     for &d in remainder {
         sum += d * d;
     }
@@ -190,19 +197,25 @@ impl WaveletEntropyAnalysis {
     }
 }
 
-/// SIMD sum of f64 slice.
+/// SIMD sum of f64 slice with 8-way dual accumulators.
 #[inline]
 fn simd_sum(data: &[f64]) -> f64 {
-    let chunks = data.chunks_exact(4);
+    let chunks = data.chunks_exact(8);
     let remainder = chunks.remainder();
 
-    let mut sum_vec = f64x4::ZERO;
+    let mut acc0 = f64x4::ZERO;
+    let mut acc1 = f64x4::ZERO;
+
     for chunk in chunks {
-        let vals = f64x4::new([chunk[0], chunk[1], chunk[2], chunk[3]]);
-        sum_vec += vals;
+        let v0 = f64x4::new([chunk[0], chunk[1], chunk[2], chunk[3]]);
+        let v1 = f64x4::new([chunk[4], chunk[5], chunk[6], chunk[7]]);
+        acc0 += v0;
+        acc1 += v1;
     }
 
-    let mut sum = sum_vec.reduce_add();
+    let combined = acc0 + acc1;
+    let mut sum = combined.reduce_add();
+
     for &d in remainder {
         sum += d;
     }

@@ -273,57 +273,85 @@ fn compute_histogram(data: &[u8], pos: usize, window_size: usize) -> [u32; 256] 
 }
 
 /// Compute chi-squared distance between two histograms using SIMD.
+/// Optimized with 8-way dual accumulators and branchless division.
 #[inline]
 fn chi_squared_distance_simd(hist_x: &[u32; 256], hist_y: &[u32; 256]) -> f64 {
-    // Compute totals
-    let total_x: u32 = hist_x.iter().sum();
-    let total_y: u32 = hist_y.iter().sum();
+    // SIMD total computation using u32x4
+    use wide::u32x4;
+
+    let mut sum_x = u32x4::ZERO;
+    let mut sum_y = u32x4::ZERO;
+
+    for i in (0..256).step_by(4) {
+        let hx = u32x4::new([hist_x[i], hist_x[i + 1], hist_x[i + 2], hist_x[i + 3]]);
+        let hy = u32x4::new([hist_y[i], hist_y[i + 1], hist_y[i + 2], hist_y[i + 3]]);
+        sum_x += hx;
+        sum_y += hy;
+    }
+
+    let arr_x = sum_x.to_array();
+    let arr_y = sum_y.to_array();
+    let total_x = arr_x[0] + arr_x[1] + arr_x[2] + arr_x[3];
+    let total_y = arr_y[0] + arr_y[1] + arr_y[2] + arr_y[3];
 
     if total_x == 0 || total_y == 0 {
         return 2.0; // Maximum distance
     }
 
-    let inv_total_x = 1.0 / total_x as f64;
-    let inv_total_y = 1.0 / total_y as f64;
+    let inv_total_x = f64x4::splat(1.0 / total_x as f64);
+    let inv_total_y = f64x4::splat(1.0 / total_y as f64);
 
-    // SIMD chi-squared computation
-    let mut chi_sq = f64x4::ZERO;
+    // 8-way SIMD chi-squared with dual accumulators
+    let mut chi_sq0 = f64x4::ZERO;
+    let mut chi_sq1 = f64x4::ZERO;
 
-    for i in (0..256).step_by(4) {
-        let hx = f64x4::new([
+    // Small epsilon for branchless division (avoids explicit zero check)
+    let eps = f64x4::splat(1e-30);
+
+    for i in (0..256).step_by(8) {
+        let hx0 = f64x4::new([
             hist_x[i] as f64,
             hist_x[i + 1] as f64,
             hist_x[i + 2] as f64,
             hist_x[i + 3] as f64,
         ]);
-        let hy = f64x4::new([
+        let hx1 = f64x4::new([
+            hist_x[i + 4] as f64,
+            hist_x[i + 5] as f64,
+            hist_x[i + 6] as f64,
+            hist_x[i + 7] as f64,
+        ]);
+        let hy0 = f64x4::new([
             hist_y[i] as f64,
             hist_y[i + 1] as f64,
             hist_y[i + 2] as f64,
             hist_y[i + 3] as f64,
         ]);
+        let hy1 = f64x4::new([
+            hist_y[i + 4] as f64,
+            hist_y[i + 5] as f64,
+            hist_y[i + 6] as f64,
+            hist_y[i + 7] as f64,
+        ]);
 
-        let px = hx * f64x4::splat(inv_total_x);
-        let py = hy * f64x4::splat(inv_total_y);
-        let sum = px + py;
-        let diff = px - py;
+        let px0 = hx0 * inv_total_x;
+        let px1 = hx1 * inv_total_x;
+        let py0 = hy0 * inv_total_y;
+        let py1 = hy1 * inv_total_y;
 
-        // chi_sq += (px - py)^2 / (px + py) where sum > 0
-        let diff_sq = diff * diff;
+        let sum0 = px0 + py0 + eps; // Add epsilon for branchless division
+        let sum1 = px1 + py1 + eps;
+        let diff0 = px0 - py0;
+        let diff1 = px1 - py1;
 
-        // Manual division with zero check
-        let arr_sum = sum.to_array();
-        let arr_diff_sq = diff_sq.to_array();
-        let mut contrib = [0.0f64; 4];
-        for j in 0..4 {
-            if arr_sum[j] > 0.0 {
-                contrib[j] = arr_diff_sq[j] / arr_sum[j];
-            }
-        }
-        chi_sq += f64x4::new(contrib);
+        // Branchless: (diff^2) / (sum + eps) - the epsilon makes division safe
+        chi_sq0 += (diff0 * diff0) / sum0;
+        chi_sq1 += (diff1 * diff1) / sum1;
     }
 
-    let arr = chi_sq.to_array();
+    // Combine accumulators
+    let combined = chi_sq0 + chi_sq1;
+    let arr = combined.to_array();
     arr[0] + arr[1] + arr[2] + arr[3]
 }
 

@@ -260,25 +260,43 @@ pub fn haar_wavelet_transform_inplace(signal: &mut [f64]) -> Vec<usize> {
 /// Compute energy spectrum from wavelet coefficients.
 /// Energy at level j = sum of squared coefficients at that level.
 /// Returns Vec<f64> where index 0 is coarsest level energy.
+/// Optimized with 8-way SIMD and dual accumulators for better ILP.
 pub fn wavelet_energy_spectrum(coefficients: &[Vec<f64>]) -> Vec<f64> {
     coefficients
         .iter()
         .map(|level| {
-            // SIMD energy computation
-            let mut energy = 0.0f64;
-            let chunks = level.chunks_exact(4);
+            // 8-way SIMD with dual accumulators for maximum ILP
+            let chunks = level.chunks_exact(8);
             let remainder = chunks.remainder();
 
+            let mut acc0 = f64x4::ZERO;
+            let mut acc1 = f64x4::ZERO;
+
             for chunk in chunks {
-                let v = f64x4::new([chunk[0], chunk[1], chunk[2], chunk[3]]);
-                let squared = v * v;
-                // Horizontal sum
-                let arr = squared.to_array();
-                energy += arr[0] + arr[1] + arr[2] + arr[3];
+                let v0 = f64x4::new([chunk[0], chunk[1], chunk[2], chunk[3]]);
+                let v1 = f64x4::new([chunk[4], chunk[5], chunk[6], chunk[7]]);
+                acc0 += v0 * v0;
+                acc1 += v1 * v1;
             }
 
-            for &d in remainder {
-                energy += d * d;
+            // Combine accumulators
+            let combined = acc0 + acc1;
+            let arr = combined.to_array();
+            let mut energy = arr[0] + arr[1] + arr[2] + arr[3];
+
+            // Handle remainder with 4-way SIMD if possible
+            if remainder.len() >= 4 {
+                let v = f64x4::new([remainder[0], remainder[1], remainder[2], remainder[3]]);
+                let squared = v * v;
+                let sq_arr = squared.to_array();
+                energy += sq_arr[0] + sq_arr[1] + sq_arr[2] + sq_arr[3];
+                for &d in &remainder[4..] {
+                    energy += d * d;
+                }
+            } else {
+                for &d in remainder {
+                    energy += d * d;
+                }
             }
 
             energy

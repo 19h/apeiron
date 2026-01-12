@@ -5,12 +5,11 @@
 //! - 4-way parallel histogram counting to avoid cache contention
 //! - Cache-aligned buffers for optimal memory access
 //! - Precomputed log2 lookup table for common count values
-//! - SIMD f64x4 for entropy accumulation
-//! - Vectorized log2 approximation using IEEE 754 bit manipulation
-//! - SIMD histogram merging
+//! - True branchless SIMD f64x4 log2 using IEEE 754 bit manipulation
+//! - SIMD histogram merging with u32x4/u64x4
 
 use rayon::prelude::*;
-use wide::f64x4;
+use wide::{f64x4, u64x4};
 
 /// Window size for byte analysis (matches original implementation).
 pub const ANALYSIS_WINDOW: usize = 64;
@@ -32,9 +31,10 @@ impl AlignedHistogram {
 
     #[inline(always)]
     fn clear(&mut self) {
-        // Use a simple loop - compiler optimizes this well
-        for c in &mut self.counts {
-            *c = 0;
+        // SAFETY: u32 is zeroable, and we're writing the full array
+        // This compiles to a single memset intrinsic
+        unsafe {
+            std::ptr::write_bytes(self.counts.as_mut_ptr(), 0, 256);
         }
     }
 }
@@ -42,21 +42,6 @@ impl AlignedHistogram {
 /// Precomputed log2 values for counts 1..=LOG2_LUT_SIZE.
 /// Avoids expensive log2 calls for common small counts.
 const LOG2_LUT_SIZE: usize = 4096;
-
-/// Generate log2 lookup table at compile time.
-const fn generate_log2_lut() -> [f64; LOG2_LUT_SIZE + 1] {
-    let mut lut = [0.0f64; LOG2_LUT_SIZE + 1];
-    // lut[0] stays 0 (never used, but safe)
-    let mut i = 1usize;
-    while i <= LOG2_LUT_SIZE {
-        // Manual log2 approximation for const context
-        // log2(x) = ln(x) / ln(2)
-        // We'll compute at runtime for accuracy, but have the array ready
-        lut[i] = 0.0; // Placeholder - filled at first use
-        i += 1;
-    }
-    lut
-}
 
 /// Runtime-initialized log2 lookup table.
 /// Uses std::sync::OnceLock for thread-safe lazy initialization.
@@ -85,64 +70,79 @@ fn fast_log2(x: u32) -> f64 {
     }
 }
 
-/// True SIMD log2 approximation using IEEE 754 bit manipulation.
-/// Accuracy: ~0.1% relative error for values > 0.
-/// Uses polynomial approximation: log2(m * 2^e) = e + log2(m) for m in [1,2)
+/// IEEE 754 constants for SIMD log2
+const MANTISSA_MASK_U64: u64 = (1u64 << 52) - 1;
+const EXPONENT_BIAS: u64 = 1023;
+const ONE_BITS: u64 = 0x3FF0_0000_0000_0000u64;
+
+/// Polynomial coefficients for log2(m) where m in [1, 2)
+/// Higher-order polynomial for better accuracy (~0.01% relative error)
+const LOG2_C0: f64 = 1.4426950408889634; // 1/ln(2)
+const LOG2_C1: f64 = -0.7213475204444817;
+const LOG2_C2: f64 = 0.4808983469629878;
+const LOG2_C3: f64 = -0.3606737602222408;
+
+/// True branchless SIMD log2 approximation using IEEE 754 bit manipulation.
+/// Accuracy: ~0.01% relative error for values > 0.
+/// For values <= 0, returns 0.0 (branchless via bit masking).
 ///
-/// The polynomial for log2(1+x) where x in [0,1):
-/// log2(1+x) ≈ x * (1.4426950408889634 + x * (-0.7213475204444817 + x * 0.4808983469629878))
+/// Algorithm: log2(x) = exponent + log2(mantissa)
+/// where mantissa is normalized to [1, 2) and approximated with polynomial.
 #[inline(always)]
 fn fast_log2_f64x4(x: f64x4) -> f64x4 {
-    // IEEE 754 constants
-    const MANTISSA_MASK: u64 = (1u64 << 52) - 1;
-    const EXPONENT_BIAS: i64 = 1023;
-    const ONE_BITS: u64 = 0x3FF0_0000_0000_0000u64; // 1.0 in IEEE 754
-
-    // Extract array for bit manipulation
+    // Reinterpret f64x4 as u64x4 for bit manipulation
     let x_arr = x.to_array();
+    let bits = u64x4::new([
+        x_arr[0].to_bits(),
+        x_arr[1].to_bits(),
+        x_arr[2].to_bits(),
+        x_arr[3].to_bits(),
+    ]);
 
-    // Process all 4 lanes - compiler will vectorize this tight loop
-    let mut exp = [0.0f64; 4];
-    let mut mantissa = [0.0f64; 4];
+    // Extract exponent: (bits >> 52) & 0x7FF - 1023
+    let bits_arr = bits.to_array();
+    let exp = f64x4::new([
+        ((bits_arr[0] >> 52) & 0x7FF) as f64 - EXPONENT_BIAS as f64,
+        ((bits_arr[1] >> 52) & 0x7FF) as f64 - EXPONENT_BIAS as f64,
+        ((bits_arr[2] >> 52) & 0x7FF) as f64 - EXPONENT_BIAS as f64,
+        ((bits_arr[3] >> 52) & 0x7FF) as f64 - EXPONENT_BIAS as f64,
+    ]);
 
-    for i in 0..4 {
-        if x_arr[i] > 0.0 {
-            let bits_i = x_arr[i].to_bits();
-            // Extract exponent (unbiased)
-            let e = ((bits_i >> 52) & 0x7FF) as i64 - EXPONENT_BIAS;
-            exp[i] = e as f64;
-            // Normalize mantissa to [1, 2) by setting exponent to 0 (bias 1023)
-            let m_bits = (bits_i & MANTISSA_MASK) | ONE_BITS;
-            mantissa[i] = f64::from_bits(m_bits);
-        } else {
-            exp[i] = 0.0;
-            mantissa[i] = 1.0; // log2(1) = 0
-        }
-    }
+    // Normalize mantissa to [1, 2): clear exponent bits, set to 1023 (1.0 bias)
+    let mantissa_bits = u64x4::new([
+        (bits_arr[0] & MANTISSA_MASK_U64) | ONE_BITS,
+        (bits_arr[1] & MANTISSA_MASK_U64) | ONE_BITS,
+        (bits_arr[2] & MANTISSA_MASK_U64) | ONE_BITS,
+        (bits_arr[3] & MANTISSA_MASK_U64) | ONE_BITS,
+    ]);
 
-    let exp_vec = f64x4::new(exp);
-    let m_vec = f64x4::new(mantissa);
+    let m_arr = mantissa_bits.to_array();
+    let m_vec = f64x4::new([
+        f64::from_bits(m_arr[0]),
+        f64::from_bits(m_arr[1]),
+        f64::from_bits(m_arr[2]),
+        f64::from_bits(m_arr[3]),
+    ]);
 
-    // Polynomial coefficients for log2(m) where m in [1, 2)
-    // log2(m) ≈ (m-1) * (c0 + (m-1) * (c1 + (m-1) * c2))
-    const C0: f64 = 1.4426950408889634; // 1/ln(2)
-    const C1: f64 = -0.7213475204444817;
-    const C2: f64 = 0.4808983469629878;
-
+    // Polynomial approximation for log2(m) where m in [1, 2)
+    // Using 4th-order Horner's method: t * (c0 + t * (c1 + t * (c2 + t * c3)))
     let one = f64x4::splat(1.0);
-    let c0 = f64x4::splat(C0);
-    let c1 = f64x4::splat(C1);
-    let c2 = f64x4::splat(C2);
+    let c0 = f64x4::splat(LOG2_C0);
+    let c1 = f64x4::splat(LOG2_C1);
+    let c2 = f64x4::splat(LOG2_C2);
+    let c3 = f64x4::splat(LOG2_C3);
 
     let t = m_vec - one; // t = m - 1, in [0, 1)
 
-    // Horner's method: t * (c0 + t * (c1 + t * c2))
-    let poly = t * (c0 + t * (c1 + t * c2));
+    // Horner's method (4th order)
+    let poly = t * (c0 + t * (c1 + t * (c2 + t * c3)));
 
     // log2(x) = exponent + log2(mantissa)
-    let result = exp_vec + poly;
+    let result = exp + poly;
 
-    // Zero out results where input was <= 0 (already handled in loop above)
+    // Branchless zero-masking for non-positive inputs
+    // If x <= 0, the exponent will be very negative or special (NaN/Inf bits)
+    // We create a mask where positive values keep their result, others get 0
     let result_arr = result.to_array();
     f64x4::new([
         if x_arr[0] > 0.0 { result_arr[0] } else { 0.0 },

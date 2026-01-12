@@ -25,14 +25,58 @@ thread_local! {
     static ENCODER_BUFFER: RefCell<Vec<u8>> = RefCell::new(Vec::with_capacity(4096));
 }
 
+/// Fast check if data is likely incompressible (high entropy).
+/// Uses byte frequency variance as a proxy - random data has roughly equal byte frequencies.
+/// Returns true if data appears random/encrypted (complexity will be ~1.0).
+#[inline]
+fn is_likely_incompressible(data: &[u8]) -> bool {
+    // Only use fast path for larger data where savings matter
+    if data.len() < 256 {
+        return false;
+    }
+
+    // Sample first 256 bytes to check distribution
+    let sample = &data[..256.min(data.len())];
+
+    // Count unique bytes - truly random data uses most/all byte values
+    let mut seen = [false; 256];
+    let mut unique_count = 0u32;
+    let mut high_byte_count = 0u32;
+
+    for &b in sample {
+        if !seen[b as usize] {
+            seen[b as usize] = true;
+            unique_count += 1;
+        }
+        if b >= 128 {
+            high_byte_count += 1;
+        }
+    }
+
+    // Random/encrypted data typically has:
+    // - High unique byte count (>200 for 256 samples)
+    // - Roughly 50% high bytes
+    unique_count >= 200 && high_byte_count >= 100 && high_byte_count <= 156
+}
+
 /// Approximate Kolmogorov complexity using DEFLATE compression.
 ///
 /// Returns a value between 0.0 (highly compressible/simple) and 1.0 (incompressible/random).
 /// Values > 1.0 are clamped (can occur with very small inputs due to compression overhead).
+///
+/// Optimizations:
+/// - Fast path for likely-incompressible data (random/encrypted)
+/// - Thread-local encoder buffer reuse
+/// - Compression level 6 for speed/quality balance
 #[inline]
 pub fn calculate_kolmogorov_complexity(data: &[u8]) -> f64 {
     if data.is_empty() {
         return 0.0;
+    }
+
+    // Fast path: skip compression for likely-incompressible data
+    if is_likely_incompressible(data) {
+        return 0.95; // High complexity, slightly below max to indicate "detected" vs "measured"
     }
 
     // Use thread-local buffer to avoid allocation
