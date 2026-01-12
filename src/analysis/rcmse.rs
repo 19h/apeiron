@@ -353,24 +353,84 @@ fn std_deviation(data: &[f64]) -> f64 {
 }
 
 /// Calculate standard deviation directly from bytes (avoids f64 conversion).
+/// Uses SIMD for both passes with dual accumulators.
 #[inline]
 fn std_deviation_bytes(data: &[u8]) -> f64 {
+    use wide::u32x4;
+
     if data.len() < 2 {
         return 0.0;
     }
 
     let n = data.len();
 
-    // Pass 1: Compute mean using integer arithmetic
-    let mut sum = 0u64;
-    for &b in data {
+    // Pass 1: Compute sum using SIMD u32 accumulation
+    let chunks = data.chunks_exact(8);
+    let remainder = chunks.remainder();
+
+    let mut sum_vec0 = u32x4::ZERO;
+    let mut sum_vec1 = u32x4::ZERO;
+
+    for chunk in chunks {
+        let v0 = u32x4::new([
+            chunk[0] as u32,
+            chunk[1] as u32,
+            chunk[2] as u32,
+            chunk[3] as u32,
+        ]);
+        let v1 = u32x4::new([
+            chunk[4] as u32,
+            chunk[5] as u32,
+            chunk[6] as u32,
+            chunk[7] as u32,
+        ]);
+        sum_vec0 += v0;
+        sum_vec1 += v1;
+    }
+
+    let combined = sum_vec0 + sum_vec1;
+    let arr = combined.to_array();
+    let mut sum = (arr[0] + arr[1] + arr[2] + arr[3]) as u64;
+
+    for &b in remainder {
         sum += b as u64;
     }
+
     let mean = sum as f64 / n as f64;
 
-    // Pass 2: Compute sum of squared deviations
-    let mut sq_sum = 0.0f64;
-    for &b in data {
+    // Pass 2: Compute sum of squared deviations using SIMD f64x4
+    let mean_x4 = f64x4::splat(mean);
+    let chunks = data.chunks_exact(8);
+
+    let mut sq_sum0 = f64x4::ZERO;
+    let mut sq_sum1 = f64x4::ZERO;
+
+    for chunk in chunks {
+        let v0 = f64x4::new([
+            chunk[0] as f64,
+            chunk[1] as f64,
+            chunk[2] as f64,
+            chunk[3] as f64,
+        ]);
+        let v1 = f64x4::new([
+            chunk[4] as f64,
+            chunk[5] as f64,
+            chunk[6] as f64,
+            chunk[7] as f64,
+        ]);
+
+        let diff0 = v0 - mean_x4;
+        let diff1 = v1 - mean_x4;
+
+        sq_sum0 += diff0 * diff0;
+        sq_sum1 += diff1 * diff1;
+    }
+
+    let combined_sq = sq_sum0 + sq_sum1;
+    let sq_arr = combined_sq.to_array();
+    let mut sq_sum = sq_arr[0] + sq_arr[1] + sq_arr[2] + sq_arr[3];
+
+    for &b in remainder {
         let diff = b as f64 - mean;
         sq_sum += diff * diff;
     }

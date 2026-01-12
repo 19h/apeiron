@@ -204,44 +204,67 @@ impl<const N: usize> HilbertLUT<N> {
     }
 }
 
-/// Get lookup table for dimension N.
+/// Try to use lookup table for d2xy.
+/// Uses direct match instead of trait object to eliminate vtable dispatch.
 #[inline]
-fn get_lut(n: u64) -> Option<&'static dyn HilbertLUTTrait> {
+fn d2xy_lut(n: u64, d: u64) -> Option<(u64, u64)> {
     match n {
-        64 => Some(LUT_64.get_or_init(HilbertLUT::<64>::generate)),
-        128 => Some(LUT_128.get_or_init(HilbertLUT::<128>::generate)),
-        256 => Some(LUT_256.get_or_init(HilbertLUT::<256>::generate)),
-        512 => Some(LUT_512.get_or_init(HilbertLUT::<512>::generate)),
+        64 => LUT_64
+            .get_or_init(HilbertLUT::<64>::generate)
+            .lookup_d2xy(d),
+        128 => LUT_128
+            .get_or_init(HilbertLUT::<128>::generate)
+            .lookup_d2xy(d),
+        256 => LUT_256
+            .get_or_init(HilbertLUT::<256>::generate)
+            .lookup_d2xy(d),
+        512 => LUT_512
+            .get_or_init(HilbertLUT::<512>::generate)
+            .lookup_d2xy(d),
         _ => None,
     }
 }
 
-/// Trait for type-erased LUT access.
-trait HilbertLUTTrait {
-    fn lookup_d2xy(&self, d: u64) -> Option<(u64, u64)>;
-    fn lookup_xy2d(&self, x: u64, y: u64) -> Option<u64>;
-}
-
-impl<const N: usize> HilbertLUTTrait for HilbertLUT<N> {
-    fn lookup_d2xy(&self, d: u64) -> Option<(u64, u64)> {
-        self.lookup_d2xy(d)
-    }
-
-    fn lookup_xy2d(&self, x: u64, y: u64) -> Option<u64> {
-        self.lookup_xy2d(x, y)
-    }
-}
-
-/// Try to use lookup table for d2xy.
-#[inline]
-fn d2xy_lut(n: u64, d: u64) -> Option<(u64, u64)> {
-    get_lut(n)?.lookup_d2xy(d)
-}
-
 /// Try to use lookup table for xy2d.
+/// Uses direct match instead of trait object to eliminate vtable dispatch.
 #[inline]
 fn xy2d_lut(n: u64, x: u64, y: u64) -> Option<u64> {
-    get_lut(n)?.lookup_xy2d(x, y)
+    match n {
+        64 => LUT_64
+            .get_or_init(HilbertLUT::<64>::generate)
+            .lookup_xy2d(x, y),
+        128 => LUT_128
+            .get_or_init(HilbertLUT::<128>::generate)
+            .lookup_xy2d(x, y),
+        256 => LUT_256
+            .get_or_init(HilbertLUT::<256>::generate)
+            .lookup_xy2d(x, y),
+        512 => LUT_512
+            .get_or_init(HilbertLUT::<512>::generate)
+            .lookup_xy2d(x, y),
+        _ => None,
+    }
+}
+
+/// Get lookup table for dimension N (used by batch functions).
+#[inline]
+fn get_lut_64() -> &'static HilbertLUT<64> {
+    LUT_64.get_or_init(HilbertLUT::<64>::generate)
+}
+
+#[inline]
+fn get_lut_128() -> &'static HilbertLUT<128> {
+    LUT_128.get_or_init(HilbertLUT::<128>::generate)
+}
+
+#[inline]
+fn get_lut_256() -> &'static HilbertLUT<256> {
+    LUT_256.get_or_init(HilbertLUT::<256>::generate)
+}
+
+#[inline]
+fn get_lut_512() -> &'static HilbertLUT<512> {
+    LUT_512.get_or_init(HilbertLUT::<512>::generate)
 }
 
 // =============================================================================
@@ -250,28 +273,72 @@ fn xy2d_lut(n: u64, x: u64, y: u64) -> Option<u64> {
 
 /// Convert multiple distances to (x, y) coordinates in batch.
 /// More efficient than calling d2xy repeatedly.
+/// Uses direct LUT access to avoid vtable dispatch.
 #[inline]
 pub fn d2xy_batch(n: u64, distances: &[u64], out_x: &mut [u64], out_y: &mut [u64]) {
     debug_assert_eq!(distances.len(), out_x.len());
     debug_assert_eq!(distances.len(), out_y.len());
 
-    // Use LUT if available
-    if let Some(lut) = get_lut(n) {
-        for (i, &d) in distances.iter().enumerate() {
-            if let Some((x, y)) = lut.lookup_d2xy(d) {
-                out_x[i] = x;
-                out_y[i] = y;
-            } else {
+    // Direct match to avoid trait object overhead
+    match n {
+        64 => {
+            let lut = get_lut_64();
+            for (i, &d) in distances.iter().enumerate() {
+                if let Some((x, y)) = lut.lookup_d2xy(d) {
+                    out_x[i] = x;
+                    out_y[i] = y;
+                } else {
+                    let (x, y) = d2xy_compute(n, d);
+                    out_x[i] = x;
+                    out_y[i] = y;
+                }
+            }
+        }
+        128 => {
+            let lut = get_lut_128();
+            for (i, &d) in distances.iter().enumerate() {
+                if let Some((x, y)) = lut.lookup_d2xy(d) {
+                    out_x[i] = x;
+                    out_y[i] = y;
+                } else {
+                    let (x, y) = d2xy_compute(n, d);
+                    out_x[i] = x;
+                    out_y[i] = y;
+                }
+            }
+        }
+        256 => {
+            let lut = get_lut_256();
+            for (i, &d) in distances.iter().enumerate() {
+                if let Some((x, y)) = lut.lookup_d2xy(d) {
+                    out_x[i] = x;
+                    out_y[i] = y;
+                } else {
+                    let (x, y) = d2xy_compute(n, d);
+                    out_x[i] = x;
+                    out_y[i] = y;
+                }
+            }
+        }
+        512 => {
+            let lut = get_lut_512();
+            for (i, &d) in distances.iter().enumerate() {
+                if let Some((x, y)) = lut.lookup_d2xy(d) {
+                    out_x[i] = x;
+                    out_y[i] = y;
+                } else {
+                    let (x, y) = d2xy_compute(n, d);
+                    out_x[i] = x;
+                    out_y[i] = y;
+                }
+            }
+        }
+        _ => {
+            for (i, &d) in distances.iter().enumerate() {
                 let (x, y) = d2xy_compute(n, d);
                 out_x[i] = x;
                 out_y[i] = y;
             }
-        }
-    } else {
-        for (i, &d) in distances.iter().enumerate() {
-            let (x, y) = d2xy_compute(n, d);
-            out_x[i] = x;
-            out_y[i] = y;
         }
     }
 }

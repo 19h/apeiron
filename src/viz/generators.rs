@@ -371,23 +371,31 @@ pub fn generate_similarity_matrix_pixels(
 // Digraph Visualization (Optimized with parallel counting)
 // =============================================================================
 
+/// Digraph size constant
+const DIGRAPH_SIZE: usize = 256 * 256;
+
 /// Build digraph using parallel thread-local histograms.
-/// Optimized with SIMD merging and reduced allocations.
+/// Optimized with boxed fixed-size arrays and SIMD merge using u64x4.
 fn build_digraph_parallel(data: &[u8]) -> (Vec<u64>, u64) {
+    use wide::u64x4;
+
     if data.len() < 2 {
-        return (vec![0u64; 256 * 256], 1);
+        return (vec![0u64; DIGRAPH_SIZE], 1);
     }
 
-    // Use larger chunks for better cache utilization
+    // Use larger chunks to reduce allocations - minimum 64KB per chunk
     let num_threads = rayon::current_num_threads();
-    let chunk_size = (data.len() / num_threads).max(4096);
+    let chunk_size = (data.len() / num_threads).max(65536);
 
-    // Parallel digraph counting
-    let results: Vec<Vec<u64>> = data
+    // Parallel digraph counting with boxed fixed-size arrays
+    let results: Vec<Box<[u64; DIGRAPH_SIZE]>> = data
         .par_chunks(chunk_size)
         .map(|chunk| {
-            let mut local_digraph = vec![0u64; 256 * 256];
-            // Unroll by 4 for better ILP
+            // Boxed array - single allocation, known size
+            let mut local_digraph: Box<[u64; DIGRAPH_SIZE]> =
+                unsafe { Box::new_zeroed().assume_init() };
+
+            // Process windows - unroll by 2 for better ILP
             let windows = chunk.windows(2);
             for window in windows {
                 let idx = (window[0] as usize) * 256 + (window[1] as usize);
@@ -399,26 +407,32 @@ fn build_digraph_parallel(data: &[u8]) -> (Vec<u64>, u64) {
         })
         .collect();
 
-    // Merge with SIMD-friendly loop
-    let mut digraph = vec![0u64; 256 * 256];
-    let mut max_count = 1u64;
+    // Allocate output
+    let mut digraph = vec![0u64; DIGRAPH_SIZE];
 
-    // Merge thread-local results using cache-friendly access pattern
+    // Merge with SIMD u64x4 - process 4 elements at a time
     for local in &results {
-        // Process 4 elements at a time for better vectorization
-        for i in (0..256 * 256).step_by(4) {
-            unsafe {
-                *digraph.get_unchecked_mut(i) += *local.get_unchecked(i);
-                *digraph.get_unchecked_mut(i + 1) += *local.get_unchecked(i + 1);
-                *digraph.get_unchecked_mut(i + 2) += *local.get_unchecked(i + 2);
-                *digraph.get_unchecked_mut(i + 3) += *local.get_unchecked(i + 3);
-            }
+        for i in (0..DIGRAPH_SIZE).step_by(4) {
+            let current = u64x4::new([digraph[i], digraph[i + 1], digraph[i + 2], digraph[i + 3]]);
+            let local_vals = u64x4::new([local[i], local[i + 1], local[i + 2], local[i + 3]]);
+            let sum = current + local_vals;
+            let arr = sum.to_array();
+            digraph[i] = arr[0];
+            digraph[i + 1] = arr[1];
+            digraph[i + 2] = arr[2];
+            digraph[i + 3] = arr[3];
         }
     }
 
-    // Find max in separate pass (better branch prediction)
-    for &count in &digraph {
-        max_count = max_count.max(count);
+    // Find max - scalar loop with unrolling (SIMD max not available for u64x4)
+    let mut max_count = 1u64;
+    for i in (0..DIGRAPH_SIZE).step_by(4) {
+        let m0 = digraph[i];
+        let m1 = digraph[i + 1];
+        let m2 = digraph[i + 2];
+        let m3 = digraph[i + 3];
+        // Chain of max operations - compiler optimizes this well
+        max_count = max_count.max(m0).max(m1).max(m2).max(m3);
     }
 
     // Add cross-chunk transitions
@@ -484,22 +498,24 @@ pub fn generate_digraph_pixels(
 // =============================================================================
 
 /// Build phase space using parallel counting.
-/// Optimized with better cache access and reduced branching.
+/// Optimized with boxed fixed-size arrays and better merge.
 fn build_phase_space_parallel(data: &[u8]) -> (Vec<(u64, u64)>, u64) {
     if data.len() < 2 {
-        return (vec![(0u64, 0u64); 256 * 256], 1);
+        return (vec![(0u64, 0u64); DIGRAPH_SIZE], 1);
     }
 
     let num_threads = rayon::current_num_threads();
-    let chunk_size = (data.len() / num_threads).max(4096);
+    let chunk_size = (data.len() / num_threads).max(65536);
 
-    // Each thread computes (last_pos, count) for its chunk
-    let results: Vec<(usize, Vec<(u64, u64)>)> = data
+    // Each thread computes (last_pos, count) for its chunk using boxed arrays
+    let results: Vec<(usize, Box<[(u64, u64); DIGRAPH_SIZE]>)> = data
         .par_chunks(chunk_size)
         .enumerate()
         .map(|(chunk_idx, chunk)| {
             let base_offset = chunk_idx * chunk_size;
-            let mut local_space = vec![(0u64, 0u64); 256 * 256];
+            // Boxed array - single allocation
+            let mut local_space: Box<[(u64, u64); DIGRAPH_SIZE]> =
+                unsafe { Box::new_zeroed().assume_init() };
 
             for (i, window) in chunk.windows(2).enumerate() {
                 let x = window[0] as usize;
@@ -517,25 +533,31 @@ fn build_phase_space_parallel(data: &[u8]) -> (Vec<(u64, u64)>, u64) {
         })
         .collect();
 
-    // Merge results - keep latest position and sum counts
-    let mut phase_space = vec![(0u64, 0u64); 256 * 256];
-    let mut max_count = 1u64;
+    // Merge results - process in chunk index order for correct position tracking
+    let mut phase_space = vec![(0u64, 0u64); DIGRAPH_SIZE];
 
-    // Process all results, later chunks override position (they have higher positions)
-    for (_chunk_idx, local) in &results {
-        for i in 0..256 * 256 {
+    // Sort by chunk index to process in order
+    let mut sorted_results: Vec<_> = results.into_iter().collect();
+    sorted_results.sort_by_key(|(idx, _)| *idx);
+
+    for (_chunk_idx, local) in &sorted_results {
+        // Process 4 elements at a time for better cache usage
+        for i in (0..DIGRAPH_SIZE).step_by(4) {
             unsafe {
-                let local_entry = local.get_unchecked(i);
-                if local_entry.1 > 0 {
-                    let entry = phase_space.get_unchecked_mut(i);
-                    entry.0 = local_entry.0;
-                    entry.1 += local_entry.1;
+                for j in 0..4 {
+                    let local_entry = local.get_unchecked(i + j);
+                    if local_entry.1 > 0 {
+                        let entry = phase_space.get_unchecked_mut(i + j);
+                        entry.0 = local_entry.0; // Later chunks have higher positions
+                        entry.1 += local_entry.1;
+                    }
                 }
             }
         }
     }
 
-    // Find max in separate pass (better branch prediction)
+    // Find max count using SIMD-friendly loop
+    let mut max_count = 1u64;
     for entry in &phase_space {
         max_count = max_count.max(entry.1);
     }
