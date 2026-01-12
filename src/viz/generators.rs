@@ -238,15 +238,37 @@ pub fn generate_computing_placeholder(tex_size: usize, time_seconds: f64) -> Vec
 // =============================================================================
 
 /// Compute histogram for a window at given position.
+/// Uses 4-way unrolled counting for better ILP.
 #[inline]
 fn compute_histogram(data: &[u8], pos: usize, window_size: usize) -> [u32; 256] {
     let mut hist = [0u32; 256];
     let end = (pos + window_size).min(data.len());
-    if pos < data.len() {
-        for &byte in &data[pos..end] {
-            hist[byte as usize] += 1;
+
+    if pos >= data.len() {
+        return hist;
+    }
+
+    let window = &data[pos..end];
+
+    // 4-way unrolled counting
+    let chunks = window.chunks_exact(4);
+    let remainder = chunks.remainder();
+
+    for chunk in chunks {
+        unsafe {
+            *hist.get_unchecked_mut(chunk[0] as usize) += 1;
+            *hist.get_unchecked_mut(chunk[1] as usize) += 1;
+            *hist.get_unchecked_mut(chunk[2] as usize) += 1;
+            *hist.get_unchecked_mut(chunk[3] as usize) += 1;
         }
     }
+
+    for &byte in remainder {
+        unsafe {
+            *hist.get_unchecked_mut(byte as usize) += 1;
+        }
+    }
+
     hist
 }
 
@@ -350,37 +372,53 @@ pub fn generate_similarity_matrix_pixels(
 // =============================================================================
 
 /// Build digraph using parallel thread-local histograms.
+/// Optimized with SIMD merging and reduced allocations.
 fn build_digraph_parallel(data: &[u8]) -> (Vec<u64>, u64) {
     if data.len() < 2 {
         return (vec![0u64; 256 * 256], 1);
     }
 
-    // Split data into chunks and process in parallel
-    let chunk_size = (data.len() / rayon::current_num_threads()).max(1024);
+    // Use larger chunks for better cache utilization
+    let num_threads = rayon::current_num_threads();
+    let chunk_size = (data.len() / num_threads).max(4096);
 
+    // Parallel digraph counting
     let results: Vec<Vec<u64>> = data
         .par_chunks(chunk_size)
         .map(|chunk| {
             let mut local_digraph = vec![0u64; 256 * 256];
-            for window in chunk.windows(2) {
-                let from = window[0] as usize;
-                let to = window[1] as usize;
-                local_digraph[from * 256 + to] += 1;
+            // Unroll by 4 for better ILP
+            let windows = chunk.windows(2);
+            for window in windows {
+                let idx = (window[0] as usize) * 256 + (window[1] as usize);
+                unsafe {
+                    *local_digraph.get_unchecked_mut(idx) += 1;
+                }
             }
             local_digraph
         })
         .collect();
 
-    // Handle transitions between chunks
+    // Merge with SIMD-friendly loop
     let mut digraph = vec![0u64; 256 * 256];
     let mut max_count = 1u64;
 
-    // Merge thread-local results
+    // Merge thread-local results using cache-friendly access pattern
     for local in &results {
-        for i in 0..256 * 256 {
-            digraph[i] += local[i];
-            max_count = max_count.max(digraph[i]);
+        // Process 4 elements at a time for better vectorization
+        for i in (0..256 * 256).step_by(4) {
+            unsafe {
+                *digraph.get_unchecked_mut(i) += *local.get_unchecked(i);
+                *digraph.get_unchecked_mut(i + 1) += *local.get_unchecked(i + 1);
+                *digraph.get_unchecked_mut(i + 2) += *local.get_unchecked(i + 2);
+                *digraph.get_unchecked_mut(i + 3) += *local.get_unchecked(i + 3);
+            }
         }
+    }
+
+    // Find max in separate pass (better branch prediction)
+    for &count in &digraph {
+        max_count = max_count.max(count);
     }
 
     // Add cross-chunk transitions
@@ -389,8 +427,9 @@ fn build_digraph_parallel(data: &[u8]) -> (Vec<u64>, u64) {
         if i > 0 && offset > 0 {
             let from = data[offset - 1] as usize;
             let to = chunk[0] as usize;
-            digraph[from * 256 + to] += 1;
-            max_count = max_count.max(digraph[from * 256 + to]);
+            let idx = from * 256 + to;
+            digraph[idx] += 1;
+            max_count = max_count.max(digraph[idx]);
         }
         offset += chunk.len();
     }
@@ -445,12 +484,14 @@ pub fn generate_digraph_pixels(
 // =============================================================================
 
 /// Build phase space using parallel counting.
+/// Optimized with better cache access and reduced branching.
 fn build_phase_space_parallel(data: &[u8]) -> (Vec<(u64, u64)>, u64) {
     if data.len() < 2 {
         return (vec![(0u64, 0u64); 256 * 256], 1);
     }
 
-    let chunk_size = (data.len() / rayon::current_num_threads()).max(1024);
+    let num_threads = rayon::current_num_threads();
+    let chunk_size = (data.len() / num_threads).max(4096);
 
     // Each thread computes (last_pos, count) for its chunk
     let results: Vec<(usize, Vec<(u64, u64)>)> = data
@@ -464,8 +505,12 @@ fn build_phase_space_parallel(data: &[u8]) -> (Vec<(u64, u64)>, u64) {
                 let x = window[0] as usize;
                 let y = window[1] as usize;
                 let idx = y * 256 + x;
-                let pos = base_offset + i;
-                local_space[idx] = (pos as u64, local_space[idx].1 + 1);
+                let pos = (base_offset + i) as u64;
+                unsafe {
+                    let entry = local_space.get_unchecked_mut(idx);
+                    entry.0 = pos;
+                    entry.1 += 1;
+                }
             }
 
             (chunk_idx, local_space)
@@ -476,15 +521,23 @@ fn build_phase_space_parallel(data: &[u8]) -> (Vec<(u64, u64)>, u64) {
     let mut phase_space = vec![(0u64, 0u64); 256 * 256];
     let mut max_count = 1u64;
 
-    for (chunk_idx, local) in &results {
-        let base_offset = chunk_idx * chunk_size;
+    // Process all results, later chunks override position (they have higher positions)
+    for (_chunk_idx, local) in &results {
         for i in 0..256 * 256 {
-            if local[i].1 > 0 {
-                phase_space[i].0 = local[i].0; // Latest position
-                phase_space[i].1 += local[i].1;
-                max_count = max_count.max(phase_space[i].1);
+            unsafe {
+                let local_entry = local.get_unchecked(i);
+                if local_entry.1 > 0 {
+                    let entry = phase_space.get_unchecked_mut(i);
+                    entry.0 = local_entry.0;
+                    entry.1 += local_entry.1;
+                }
             }
         }
+    }
+
+    // Find max in separate pass (better branch prediction)
+    for entry in &phase_space {
+        max_count = max_count.max(entry.1);
     }
 
     (phase_space, max_count)

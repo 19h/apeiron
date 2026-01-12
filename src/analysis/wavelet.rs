@@ -124,80 +124,104 @@ pub fn haar_wavelet_transform(signal: &[f64]) -> Vec<Vec<f64>> {
     coefficients
 }
 
-/// SIMD-accelerated Haar wavelet step.
-/// Processes 4 pairs at a time using f64x4.
-/// Uses copy of source data to avoid in-place read/write conflicts.
-#[inline]
-fn haar_step_simd(data: &mut [f64], len: usize, half: usize) {
-    // Copy source data first to avoid read/write conflicts
-    let source: Vec<f64> = data[..len].to_vec();
-
-    // Process 4 pairs at a time
-    let simd_pairs = half / 4;
-    let scalar_start = simd_pairs * 4;
-
-    // SIMD processing
-    for i in 0..simd_pairs {
-        let base = i * 4;
-
-        // Load 4 pairs from source: (source[0],source[1]), (source[2],source[3]), ...
-        let left = f64x4::new([
-            source[2 * base],
-            source[2 * (base + 1)],
-            source[2 * (base + 2)],
-            source[2 * (base + 3)],
-        ]);
-
-        let right = f64x4::new([
-            source[2 * base + 1],
-            source[2 * (base + 1) + 1],
-            source[2 * (base + 2) + 1],
-            source[2 * (base + 3) + 1],
-        ]);
-
-        // Compute averages and details
-        let averages = (left + right) * INV_SQRT2_X4;
-        let details = (left - right) * INV_SQRT2_X4;
-
-        // Store results - averages to first half, details to second half
-        let avg_arr = averages.to_array();
-        let det_arr = details.to_array();
-
-        data[base] = avg_arr[0];
-        data[base + 1] = avg_arr[1];
-        data[base + 2] = avg_arr[2];
-        data[base + 3] = avg_arr[3];
-
-        data[half + base] = det_arr[0];
-        data[half + base + 1] = det_arr[1];
-        data[half + base + 2] = det_arr[2];
-        data[half + base + 3] = det_arr[3];
-    }
-
-    // Handle remaining pairs with scalar code
-    for i in scalar_start..half {
-        let left = source[2 * i];
-        let right = source[2 * i + 1];
-        data[i] = (left + right) * INV_SQRT2;
-        data[half + i] = (left - right) * INV_SQRT2;
-    }
+/// Thread-local scratch buffer for Haar transform to avoid repeated allocations.
+thread_local! {
+    static HAAR_SCRATCH: std::cell::RefCell<Vec<f64>> = std::cell::RefCell::new(Vec::with_capacity(8192));
 }
 
-/// Scalar Haar wavelet step for small inputs.
+/// SIMD-accelerated Haar wavelet step.
+/// Processes 4 pairs at a time using f64x4.
+/// Uses thread-local scratch buffer to eliminate per-call allocations.
+#[inline]
+fn haar_step_simd(data: &mut [f64], len: usize, half: usize) {
+    // Use thread-local scratch buffer instead of allocating
+    HAAR_SCRATCH.with(|scratch| {
+        let mut scratch = scratch.borrow_mut();
+        scratch.clear();
+        scratch.reserve(len);
+        scratch.extend_from_slice(&data[..len]);
+
+        // Process 4 pairs at a time
+        let simd_pairs = half / 4;
+        let scalar_start = simd_pairs * 4;
+
+        // SIMD processing - direct pointer arithmetic for cache efficiency
+        for i in 0..simd_pairs {
+            let base = i * 4;
+
+            // Load 4 consecutive pairs using gather pattern
+            // Pairs: (scratch[0],scratch[1]), (scratch[2],scratch[3]), etc.
+            let idx0 = 2 * base;
+            let idx1 = 2 * (base + 1);
+            let idx2 = 2 * (base + 2);
+            let idx3 = 2 * (base + 3);
+
+            let left = f64x4::new([scratch[idx0], scratch[idx1], scratch[idx2], scratch[idx3]]);
+
+            let right = f64x4::new([
+                scratch[idx0 + 1],
+                scratch[idx1 + 1],
+                scratch[idx2 + 1],
+                scratch[idx3 + 1],
+            ]);
+
+            // Fused multiply-add style computation
+            let averages = (left + right) * INV_SQRT2_X4;
+            let details = (left - right) * INV_SQRT2_X4;
+
+            // Store results with explicit array writes (better codegen)
+            let avg_arr = averages.to_array();
+            let det_arr = details.to_array();
+
+            // Write averages to first half
+            unsafe {
+                *data.get_unchecked_mut(base) = avg_arr[0];
+                *data.get_unchecked_mut(base + 1) = avg_arr[1];
+                *data.get_unchecked_mut(base + 2) = avg_arr[2];
+                *data.get_unchecked_mut(base + 3) = avg_arr[3];
+
+                // Write details to second half
+                *data.get_unchecked_mut(half + base) = det_arr[0];
+                *data.get_unchecked_mut(half + base + 1) = det_arr[1];
+                *data.get_unchecked_mut(half + base + 2) = det_arr[2];
+                *data.get_unchecked_mut(half + base + 3) = det_arr[3];
+            }
+        }
+
+        // Handle remaining pairs with scalar code
+        for i in scalar_start..half {
+            let left = scratch[2 * i];
+            let right = scratch[2 * i + 1];
+            data[i] = (left + right) * INV_SQRT2;
+            data[half + i] = (left - right) * INV_SQRT2;
+        }
+    });
+}
+
+/// Small fixed buffer for scalar Haar steps (max 8 averages).
+/// For larger inputs, we use the SIMD path anyway.
 #[inline]
 fn haar_step_scalar(data: &mut [f64], _len: usize, half: usize) {
-    // Use temporary buffer for averages to avoid overwriting
-    let mut temp_avg = Vec::with_capacity(half);
+    // Stack-allocated buffer for small sizes (avoids heap allocation)
+    // half < 4 means we have at most 3 averages to store
+    debug_assert!(
+        half < 4,
+        "haar_step_scalar should only be called for half < 4"
+    );
+
+    let mut temp_avg = [0.0f64; 4];
 
     for i in 0..half {
         let left = data[2 * i];
         let right = data[2 * i + 1];
-        temp_avg.push((left + right) * INV_SQRT2);
+        temp_avg[i] = (left + right) * INV_SQRT2;
         data[half + i] = (left - right) * INV_SQRT2;
     }
 
     // Copy averages back
-    data[..half].copy_from_slice(&temp_avg);
+    for i in 0..half {
+        data[i] = temp_avg[i];
+    }
 }
 
 /// Perform in-place Haar wavelet transform (avoids all allocations except output).

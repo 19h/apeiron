@@ -21,7 +21,7 @@ pub const RCMSE_TOLERANCE_FACTOR: f64 = 0.15; // r = 0.15 * SD
 pub const RCMSE_MAX_SCALE: usize = 20; // Maximum scale factor τ
 
 /// Coarse-grain directly from bytes at scale τ with offset k.
-/// Eliminates intermediate f64 conversion for the full data.
+/// Uses SIMD for accumulating byte sums when window size >= 8.
 /// Returns the number of points written.
 #[inline]
 fn coarse_grain_bytes_into(data: &[u8], scale: usize, offset: usize, out: &mut [f64]) -> usize {
@@ -39,23 +39,67 @@ fn coarse_grain_bytes_into(data: &[u8], scale: usize, offset: usize, out: &mut [
     let inv_scale = 1.0 / scale as f64;
     let actual_points = num_points.min(out.len());
 
-    // SIMD-friendly: accumulate sums then multiply by inv_scale
-    for j in 0..actual_points {
-        let start = j * scale + (offset - 1);
-        let end = (start + scale).min(n);
+    // Use SIMD for larger windows
+    if scale >= 8 {
+        use wide::u32x4;
 
-        // Sum bytes directly (avoids intermediate f64 array)
-        let mut sum = 0u32;
-        for i in start..end {
-            sum += data[i] as u32;
+        for j in 0..actual_points {
+            let start = j * scale + (offset - 1);
+            let end = (start + scale).min(n);
+            let window = &data[start..end];
+
+            // SIMD sum: process 8 bytes at a time
+            let chunks = window.chunks_exact(8);
+            let remainder = chunks.remainder();
+
+            let mut sum_vec = u32x4::ZERO;
+            for chunk in chunks {
+                // Load 8 bytes, accumulate as u32
+                let v0 = u32x4::new([
+                    chunk[0] as u32,
+                    chunk[1] as u32,
+                    chunk[2] as u32,
+                    chunk[3] as u32,
+                ]);
+                let v1 = u32x4::new([
+                    chunk[4] as u32,
+                    chunk[5] as u32,
+                    chunk[6] as u32,
+                    chunk[7] as u32,
+                ]);
+                sum_vec += v0 + v1;
+            }
+
+            // Horizontal sum
+            let arr = sum_vec.to_array();
+            let mut sum = arr[0] + arr[1] + arr[2] + arr[3];
+
+            // Handle remainder
+            for &b in remainder {
+                sum += b as u32;
+            }
+
+            out[j] = sum as f64 * inv_scale;
         }
-        out[j] = sum as f64 * inv_scale;
+    } else {
+        // Scalar path for small windows (more efficient due to less overhead)
+        for j in 0..actual_points {
+            let start = j * scale + (offset - 1);
+            let end = (start + scale).min(n);
+
+            let mut sum = 0u32;
+            for i in start..end {
+                sum += unsafe { *data.get_unchecked(i) } as u32;
+            }
+            out[j] = sum as f64 * inv_scale;
+        }
     }
 
     actual_points
 }
 
 /// Coarse-grain a time series at scale τ with offset k, writing into a pre-allocated buffer.
+/// Uses 8-way SIMD accumulation for larger windows.
 /// Returns the number of points written.
 #[inline]
 fn coarse_grain_into(data: &[f64], scale: usize, offset: usize, out: &mut [f64]) -> usize {
@@ -71,18 +115,37 @@ fn coarse_grain_into(data: &[f64], scale: usize, offset: usize, out: &mut [f64])
     }
 
     let inv_scale = 1.0 / scale as f64;
-    let inv_scale_x4 = f64x4::splat(inv_scale);
     let actual_points = num_points.min(out.len());
 
     for j in 0..actual_points {
         let start = j * scale + (offset - 1);
         let end = (start + scale).min(n);
-
-        // SIMD sum for larger windows
-        let mut sum = 0.0f64;
         let window = &data[start..end];
 
-        if window.len() >= 4 {
+        // Use dual SIMD accumulators for 8-way parallelism and reduced dependency chains
+        let mut sum = 0.0f64;
+
+        if window.len() >= 8 {
+            let chunks = window.chunks_exact(8);
+            let remainder = chunks.remainder();
+
+            let mut simd_sum0 = f64x4::ZERO;
+            let mut simd_sum1 = f64x4::ZERO;
+
+            for chunk in chunks {
+                simd_sum0 += f64x4::new([chunk[0], chunk[1], chunk[2], chunk[3]]);
+                simd_sum1 += f64x4::new([chunk[4], chunk[5], chunk[6], chunk[7]]);
+            }
+
+            // Combine accumulators
+            let combined = simd_sum0 + simd_sum1;
+            let arr = combined.to_array();
+            sum = arr[0] + arr[1] + arr[2] + arr[3];
+
+            for &v in remainder {
+                sum += v;
+            }
+        } else if window.len() >= 4 {
             let chunks = window.chunks_exact(4);
             let remainder = chunks.remainder();
 

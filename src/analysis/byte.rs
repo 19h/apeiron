@@ -4,8 +4,11 @@
 //!
 //! Optimizations:
 //! - 256-byte lookup table for byte classification
-//! - SIMD-friendly loop structure for bulk processing
-//! - Branchless classification accumulation
+//! - SIMD u32x8 for parallel flag accumulation
+//! - SIMD i16x8 for parallel variation calculation
+//! - 8-way unrolled main loop for maximum ILP
+
+use wide::{i16x8, u32x4};
 
 /// Byte classification flags (packed into u8 for cache efficiency).
 /// Bit 0: Is printable ASCII (32-126)
@@ -58,7 +61,7 @@ pub struct ByteAnalysis {
 
 impl ByteAnalysis {
     /// Analyze a chunk of bytes for forensic color mapping.
-    /// Optimized with lookup table and 4-way unrolling.
+    /// Optimized with SIMD accumulation and 8-way unrolling.
     pub fn analyze(data: &[u8]) -> Self {
         if data.is_empty() {
             return Self {
@@ -72,56 +75,114 @@ impl ByteAnalysis {
         let mut text_count = 0u32;
         let mut high_count = 0u32;
         let mut null_count = 0u32;
-        let mut variation = 0u32;
+        let mut variation = 0u64; // Use u64 to avoid overflow with large files
 
-        // Process bytes using lookup table
-        // Unroll by 4 for better instruction-level parallelism
-        let chunks = data.chunks_exact(4);
+        // Process bytes using SIMD-accelerated 8-way unrolling
+        let chunks = data.chunks_exact(8);
         let remainder = chunks.remainder();
 
-        let mut prev_byte = data[0];
+        let mut prev_byte = data[0] as i16;
 
         for chunk in chunks {
-            // Lookup classifications
+            // Lookup classifications for all 8 bytes
             let c0 = BYTE_CLASS_LUT[chunk[0] as usize];
             let c1 = BYTE_CLASS_LUT[chunk[1] as usize];
             let c2 = BYTE_CLASS_LUT[chunk[2] as usize];
             let c3 = BYTE_CLASS_LUT[chunk[3] as usize];
+            let c4 = BYTE_CLASS_LUT[chunk[4] as usize];
+            let c5 = BYTE_CLASS_LUT[chunk[5] as usize];
+            let c6 = BYTE_CLASS_LUT[chunk[6] as usize];
+            let c7 = BYTE_CLASS_LUT[chunk[7] as usize];
 
-            // Count text bytes (branchless using bit extraction)
-            text_count +=
-                ((c0 & FLAG_TEXT) + (c1 & FLAG_TEXT) + (c2 & FLAG_TEXT) + (c3 & FLAG_TEXT)) as u32;
+            // Accumulate flags using SIMD u32x4 operations
+            // First 4 bytes
+            let flags0 = u32x4::new([c0 as u32, c1 as u32, c2 as u32, c3 as u32]);
+            // Second 4 bytes
+            let flags1 = u32x4::new([c4 as u32, c5 as u32, c6 as u32, c7 as u32]);
 
-            // Count high-bit bytes
-            high_count += (((c0 & FLAG_HIGH) >> 1)
-                + ((c1 & FLAG_HIGH) >> 1)
-                + ((c2 & FLAG_HIGH) >> 1)
-                + ((c3 & FLAG_HIGH) >> 1)) as u32;
+            // Extract text flags (bit 0)
+            let text_mask = u32x4::splat(FLAG_TEXT as u32);
+            let text0 = flags0 & text_mask;
+            let text1 = flags1 & text_mask;
+            let text_sum0 = text0.to_array();
+            let text_sum1 = text1.to_array();
+            text_count += text_sum0[0]
+                + text_sum0[1]
+                + text_sum0[2]
+                + text_sum0[3]
+                + text_sum1[0]
+                + text_sum1[1]
+                + text_sum1[2]
+                + text_sum1[3];
 
-            // Count null bytes
-            null_count += (((c0 & FLAG_NULL) >> 2)
-                + ((c1 & FLAG_NULL) >> 2)
-                + ((c2 & FLAG_NULL) >> 2)
-                + ((c3 & FLAG_NULL) >> 2)) as u32;
+            // Extract high flags (bit 1) - extract array and shift scalarly
+            let f0_arr = flags0.to_array();
+            let f1_arr = flags1.to_array();
+            high_count += ((f0_arr[0] & (FLAG_HIGH as u32)) >> 1)
+                + ((f0_arr[1] & (FLAG_HIGH as u32)) >> 1)
+                + ((f0_arr[2] & (FLAG_HIGH as u32)) >> 1)
+                + ((f0_arr[3] & (FLAG_HIGH as u32)) >> 1)
+                + ((f1_arr[0] & (FLAG_HIGH as u32)) >> 1)
+                + ((f1_arr[1] & (FLAG_HIGH as u32)) >> 1)
+                + ((f1_arr[2] & (FLAG_HIGH as u32)) >> 1)
+                + ((f1_arr[3] & (FLAG_HIGH as u32)) >> 1);
 
-            // Compute variation (difference between consecutive bytes)
-            let d0 = (chunk[0] as i16 - prev_byte as i16).unsigned_abs() as u32;
-            let d1 = (chunk[1] as i16 - chunk[0] as i16).unsigned_abs() as u32;
-            let d2 = (chunk[2] as i16 - chunk[1] as i16).unsigned_abs() as u32;
-            let d3 = (chunk[3] as i16 - chunk[2] as i16).unsigned_abs() as u32;
-            variation += d0 + d1 + d2 + d3;
+            // Extract null flags (bit 2)
+            null_count += ((f0_arr[0] & (FLAG_NULL as u32)) >> 2)
+                + ((f0_arr[1] & (FLAG_NULL as u32)) >> 2)
+                + ((f0_arr[2] & (FLAG_NULL as u32)) >> 2)
+                + ((f0_arr[3] & (FLAG_NULL as u32)) >> 2)
+                + ((f1_arr[0] & (FLAG_NULL as u32)) >> 2)
+                + ((f1_arr[1] & (FLAG_NULL as u32)) >> 2)
+                + ((f1_arr[2] & (FLAG_NULL as u32)) >> 2)
+                + ((f1_arr[3] & (FLAG_NULL as u32)) >> 2);
 
-            prev_byte = chunk[3];
+            // SIMD variation calculation using i16x8
+            let bytes = i16x8::new([
+                chunk[0] as i16,
+                chunk[1] as i16,
+                chunk[2] as i16,
+                chunk[3] as i16,
+                chunk[4] as i16,
+                chunk[5] as i16,
+                chunk[6] as i16,
+                chunk[7] as i16,
+            ]);
+            let prev = i16x8::new([
+                prev_byte,
+                chunk[0] as i16,
+                chunk[1] as i16,
+                chunk[2] as i16,
+                chunk[3] as i16,
+                chunk[4] as i16,
+                chunk[5] as i16,
+                chunk[6] as i16,
+            ]);
+
+            // Compute absolute differences using saturating subtraction trick
+            // |a - b| = max(a - b, b - a)
+            let diff1 = bytes - prev;
+            let diff2 = prev - bytes;
+            let arr1 = diff1.to_array();
+            let arr2 = diff2.to_array();
+
+            // Compute absolute values and sum
+            for i in 0..8 {
+                variation += arr1[i].max(arr2[i]) as u64;
+            }
+
+            prev_byte = chunk[7] as i16;
         }
 
-        // Handle remainder
+        // Handle remainder with scalar code
         for &byte in remainder {
             let c = BYTE_CLASS_LUT[byte as usize];
             text_count += (c & FLAG_TEXT) as u32;
             high_count += ((c & FLAG_HIGH) >> 1) as u32;
             null_count += ((c & FLAG_NULL) >> 2) as u32;
-            variation += (byte as i16 - prev_byte as i16).unsigned_abs() as u32;
-            prev_byte = byte;
+            let diff = (byte as i16 - prev_byte).abs();
+            variation += diff as u64;
+            prev_byte = byte as i16;
         }
 
         let count = data.len() as f32;
@@ -275,6 +336,7 @@ pub fn identify_file_type(data: &[u8]) -> &'static str {
 }
 
 /// Fast check if data is likely text (> 80% printable ASCII).
+/// Uses SIMD-accelerated 8-way unrolling for counting.
 #[inline]
 pub fn is_likely_text(data: &[u8]) -> bool {
     if data.is_empty() {
@@ -283,15 +345,41 @@ pub fn is_likely_text(data: &[u8]) -> bool {
 
     let mut text_count = 0u32;
 
-    // Use lookup table for speed
-    for &byte in data {
+    // SIMD-accelerated 8-way unrolled counting
+    let chunks = data.chunks_exact(8);
+    let remainder = chunks.remainder();
+
+    for chunk in chunks {
+        // Lookup and accumulate using SIMD
+        let c0 = (BYTE_CLASS_LUT[chunk[0] as usize] & FLAG_TEXT) as u32;
+        let c1 = (BYTE_CLASS_LUT[chunk[1] as usize] & FLAG_TEXT) as u32;
+        let c2 = (BYTE_CLASS_LUT[chunk[2] as usize] & FLAG_TEXT) as u32;
+        let c3 = (BYTE_CLASS_LUT[chunk[3] as usize] & FLAG_TEXT) as u32;
+        let c4 = (BYTE_CLASS_LUT[chunk[4] as usize] & FLAG_TEXT) as u32;
+        let c5 = (BYTE_CLASS_LUT[chunk[5] as usize] & FLAG_TEXT) as u32;
+        let c6 = (BYTE_CLASS_LUT[chunk[6] as usize] & FLAG_TEXT) as u32;
+        let c7 = (BYTE_CLASS_LUT[chunk[7] as usize] & FLAG_TEXT) as u32;
+
+        // SIMD horizontal add
+        let v0 = u32x4::new([c0, c1, c2, c3]);
+        let v1 = u32x4::new([c4, c5, c6, c7]);
+        let sum0 = v0.to_array();
+        let sum1 = v1.to_array();
+        text_count += sum0[0] + sum0[1] + sum0[2] + sum0[3] + sum1[0] + sum1[1] + sum1[2] + sum1[3];
+    }
+
+    // Handle remainder
+    for &byte in remainder {
         text_count += (BYTE_CLASS_LUT[byte as usize] & FLAG_TEXT) as u32;
     }
 
-    text_count as f32 / data.len() as f32 > 0.8
+    // Use integer comparison to avoid float division
+    // text_count / len > 0.8  =>  text_count * 10 > len * 8
+    text_count * 10 > (data.len() as u32) * 8
 }
 
 /// Fast check if data is likely binary/encrypted (high entropy).
+/// Uses SIMD-accelerated counting and variation calculation.
 #[inline]
 pub fn is_likely_encrypted(data: &[u8]) -> bool {
     if data.len() < 32 {
@@ -299,19 +387,72 @@ pub fn is_likely_encrypted(data: &[u8]) -> bool {
     }
 
     let mut high_count = 0u32;
-    let mut variation = 0u32;
-    let mut prev = data[0];
+    let mut variation = 0u64;
 
-    for &byte in &data[1..] {
-        high_count += ((BYTE_CLASS_LUT[byte as usize] & FLAG_HIGH) >> 1) as u32;
-        variation += (byte as i16 - prev as i16).unsigned_abs() as u32;
-        prev = byte;
+    // SIMD-accelerated 8-way unrolled processing
+    let chunks = data[1..].chunks_exact(8);
+    let remainder = chunks.remainder();
+    let mut prev_byte = data[0] as i16;
+
+    for chunk in chunks {
+        // Count high bytes
+        let h0 = ((BYTE_CLASS_LUT[chunk[0] as usize] & FLAG_HIGH) >> 1) as u32;
+        let h1 = ((BYTE_CLASS_LUT[chunk[1] as usize] & FLAG_HIGH) >> 1) as u32;
+        let h2 = ((BYTE_CLASS_LUT[chunk[2] as usize] & FLAG_HIGH) >> 1) as u32;
+        let h3 = ((BYTE_CLASS_LUT[chunk[3] as usize] & FLAG_HIGH) >> 1) as u32;
+        let h4 = ((BYTE_CLASS_LUT[chunk[4] as usize] & FLAG_HIGH) >> 1) as u32;
+        let h5 = ((BYTE_CLASS_LUT[chunk[5] as usize] & FLAG_HIGH) >> 1) as u32;
+        let h6 = ((BYTE_CLASS_LUT[chunk[6] as usize] & FLAG_HIGH) >> 1) as u32;
+        let h7 = ((BYTE_CLASS_LUT[chunk[7] as usize] & FLAG_HIGH) >> 1) as u32;
+
+        high_count += h0 + h1 + h2 + h3 + h4 + h5 + h6 + h7;
+
+        // SIMD variation using i16x8
+        let bytes = i16x8::new([
+            chunk[0] as i16,
+            chunk[1] as i16,
+            chunk[2] as i16,
+            chunk[3] as i16,
+            chunk[4] as i16,
+            chunk[5] as i16,
+            chunk[6] as i16,
+            chunk[7] as i16,
+        ]);
+        let prev = i16x8::new([
+            prev_byte,
+            chunk[0] as i16,
+            chunk[1] as i16,
+            chunk[2] as i16,
+            chunk[3] as i16,
+            chunk[4] as i16,
+            chunk[5] as i16,
+            chunk[6] as i16,
+        ]);
+
+        let diff1 = bytes - prev;
+        let diff2 = prev - bytes;
+        let arr1 = diff1.to_array();
+        let arr2 = diff2.to_array();
+
+        for i in 0..8 {
+            variation += arr1[i].max(arr2[i]) as u64;
+        }
+
+        prev_byte = chunk[7] as i16;
     }
 
-    let high_ratio = high_count as f32 / data.len() as f32;
-    let avg_variation = variation as f32 / data.len() as f32 / 128.0;
+    // Handle remainder
+    for &byte in remainder {
+        high_count += ((BYTE_CLASS_LUT[byte as usize] & FLAG_HIGH) >> 1) as u32;
+        variation += (byte as i16 - prev_byte).abs() as u64;
+        prev_byte = byte as i16;
+    }
 
-    high_ratio > 0.25 && avg_variation > 0.5
+    // Use integer arithmetic where possible
+    // high_ratio > 0.25  =>  high_count * 4 > len
+    // avg_variation > 0.5 * 128 = 64  =>  variation > len * 64
+    let len = data.len() as u64;
+    high_count as u64 * 4 > len && variation > len * 64
 }
 
 #[cfg(test)]

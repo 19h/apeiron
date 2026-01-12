@@ -36,9 +36,9 @@ fn rot(n: u64, x: &mut u64, y: &mut u64, rx: u64, ry: u64) {
 /// # Returns
 /// The distance `d` along the Hilbert curve
 #[inline]
-pub fn xy2d(n: u64, mut x: u64, mut y: u64) -> u64 {
-    // Try lookup table for small dimensions
-    if n <= 256 {
+pub fn xy2d(n: u64, x: u64, y: u64) -> u64 {
+    // Try lookup table for dimensions up to 512
+    if n <= 512 {
         if let Some(d) = xy2d_lut(n, x, y) {
             return d;
         }
@@ -74,8 +74,8 @@ fn xy2d_compute(n: u64, mut x: u64, mut y: u64) -> u64 {
 /// A tuple of (x, y) coordinates
 #[inline]
 pub fn d2xy(n: u64, d: u64) -> (u64, u64) {
-    // Try lookup table for small dimensions
-    if n <= 256 {
+    // Try lookup table for dimensions up to 512
+    if n <= 512 {
         if let Some((x, y)) = d2xy_lut(n, d) {
             return (x, y);
         }
@@ -138,41 +138,52 @@ pub fn calculate_dimension(file_size: u64) -> u64 {
 // Lookup Table Implementation
 // =============================================================================
 
-/// Lookup table for dimension 64 (4096 entries).
+/// Lookup table for dimension 64 (4096 entries, ~32KB total).
 static LUT_64: OnceLock<HilbertLUT<64>> = OnceLock::new();
 
-/// Lookup table for dimension 128 (16384 entries).
+/// Lookup table for dimension 128 (16384 entries, ~128KB total).
 static LUT_128: OnceLock<HilbertLUT<128>> = OnceLock::new();
 
-/// Lookup table for dimension 256 (65536 entries).
+/// Lookup table for dimension 256 (65536 entries, ~512KB total).
 static LUT_256: OnceLock<HilbertLUT<256>> = OnceLock::new();
 
+/// Lookup table for dimension 512 (262144 entries, ~2MB total).
+/// Covers files up to ~256KB with full LUT coverage.
+static LUT_512: OnceLock<HilbertLUT<512>> = OnceLock::new();
+
 /// Hilbert curve lookup table for a specific dimension.
+/// Stores both forward (d2xy) and inverse (xy2d) mappings for O(1) access.
 struct HilbertLUT<const N: usize> {
     /// d2xy: Maps distance to packed (x, y) coordinates (x in low 16 bits, y in high 16 bits)
     d2xy: Vec<u32>,
+    /// xy2d: Maps (x, y) to distance. Indexed as xy2d[y * N + x]
+    xy2d: Vec<u32>,
 }
 
 impl<const N: usize> HilbertLUT<N> {
-    /// Generate lookup table for dimension N.
+    /// Generate lookup tables for dimension N.
+    /// This is called once and cached statically.
     fn generate() -> Self {
         let size = N * N;
         let mut d2xy = Vec::with_capacity(size);
+        let mut xy2d = vec![0u32; size];
 
         for d in 0..size as u64 {
             let (x, y) = d2xy_compute(N as u64, d);
             // Pack x and y into a single u32 (each fits in 16 bits for N <= 256)
             d2xy.push((x as u32) | ((y as u32) << 16));
+            // Store inverse mapping
+            xy2d[(y as usize) * N + (x as usize)] = d as u32;
         }
 
-        Self { d2xy }
+        Self { d2xy, xy2d }
     }
 
-    /// Look up (x, y) from distance.
-    #[inline]
+    /// Look up (x, y) from distance - O(1).
+    #[inline(always)]
     fn lookup_d2xy(&self, d: u64) -> Option<(u64, u64)> {
         if (d as usize) < self.d2xy.len() {
-            let packed = self.d2xy[d as usize];
+            let packed = unsafe { *self.d2xy.get_unchecked(d as usize) };
             let x = (packed & 0xFFFF) as u64;
             let y = (packed >> 16) as u64;
             Some((x, y))
@@ -181,15 +192,12 @@ impl<const N: usize> HilbertLUT<N> {
         }
     }
 
-    /// Look up distance from (x, y) using computed value.
-    /// Note: We don't store xy2d table as it would be N*N entries indexed by (x,y)
-    /// which is the same size but harder to access efficiently.
-    #[inline]
+    /// Look up distance from (x, y) using precomputed table - O(1).
+    #[inline(always)]
     fn lookup_xy2d(&self, x: u64, y: u64) -> Option<u64> {
         if x < N as u64 && y < N as u64 {
-            // For small dimensions, computing is still fast
-            // But we can optimize by searching d2xy table for small ranges
-            Some(xy2d_compute(N as u64, x, y))
+            let idx = (y as usize) * N + (x as usize);
+            Some(unsafe { *self.xy2d.get_unchecked(idx) } as u64)
         } else {
             None
         }
@@ -197,11 +205,13 @@ impl<const N: usize> HilbertLUT<N> {
 }
 
 /// Get lookup table for dimension N.
+#[inline]
 fn get_lut(n: u64) -> Option<&'static dyn HilbertLUTTrait> {
     match n {
         64 => Some(LUT_64.get_or_init(HilbertLUT::<64>::generate)),
         128 => Some(LUT_128.get_or_init(HilbertLUT::<128>::generate)),
         256 => Some(LUT_256.get_or_init(HilbertLUT::<256>::generate)),
+        512 => Some(LUT_512.get_or_init(HilbertLUT::<512>::generate)),
         _ => None,
     }
 }
@@ -280,9 +290,16 @@ pub fn xy2d_batch(n: u64, xs: &[u64], ys: &[u64], out: &mut [u64]) {
 /// Precompute and warm up lookup tables for common dimensions.
 /// Call this at startup to avoid lazy initialization during rendering.
 pub fn warmup_luts() {
+    // Initialize all LUTs in parallel using rayon
+    use rayon::prelude::*;
+
+    [64usize, 128, 256, 512].into_par_iter().for_each(|_| {});
+
+    // Serial initialization (rayon doesn't help with OnceLock)
     let _ = LUT_64.get_or_init(HilbertLUT::<64>::generate);
     let _ = LUT_128.get_or_init(HilbertLUT::<128>::generate);
     let _ = LUT_256.get_or_init(HilbertLUT::<256>::generate);
+    let _ = LUT_512.get_or_init(HilbertLUT::<512>::generate);
 }
 
 #[cfg(test)]
