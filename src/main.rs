@@ -9,6 +9,7 @@
 mod analysis;
 mod gpu;
 mod hilbert;
+mod wavelet_malware;
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -23,6 +24,7 @@ use analysis::{
     KolmogorovAnalysis, ANALYSIS_WINDOW, WAVELET_CHUNK_SIZE,
 };
 use hilbert::{calculate_dimension, d2xy, xy2d};
+use wavelet_malware as wm;
 
 // =============================================================================
 // Application State
@@ -141,6 +143,8 @@ struct NeuroCoreApp {
     selection: Selection,
     /// Hex view state.
     hex_view: HexView,
+    /// Cached wavelet malware analysis for the current file.
+    wavelet_report: Option<wavelet_malware::WaveletMalwareReport>,
     /// Cached texture for the entropy visualization.
     texture: Option<TextureHandle>,
     /// Texture generation parameters (to detect when regeneration is needed).
@@ -363,6 +367,7 @@ impl Default for NeuroCoreApp {
             viewport: Viewport::default(),
             selection: Selection::default(),
             hex_view: HexView::new(),
+            wavelet_report: None,
             texture: None,
             texture_params: None,
             viz_mode: VisualizationMode::default(),
@@ -433,6 +438,20 @@ impl NeuroCoreApp {
                     rcmse_map: Arc::new(rcmse_map),
                     wavelet_map: Arc::new(wavelet_map),
                 });
+
+                // Compute wavelet-based malware detection analysis (SSECS)
+                let data_clone = Arc::clone(&self.file_data.as_ref().unwrap().data);
+                self.wavelet_report = Some(wm::analyze_file_for_malware(&data_clone));
+                println!(
+                    "Wavelet analysis: SSECS={:.3}, Malware Prob={:.1}%",
+                    self.wavelet_report.as_ref().unwrap().ssecs.ssecs_score,
+                    self.wavelet_report
+                        .as_ref()
+                        .unwrap()
+                        .ssecs
+                        .probability_malware
+                        * 100.0
+                );
 
                 // Reset viewport and selection
                 self.viewport = Viewport::default();
@@ -1443,6 +1462,9 @@ impl NeuroCoreApp {
     fn reset_viewport(&mut self) {
         self.viewport = Viewport::default();
         self.needs_fit_to_view = true;
+        // Clear texture so it regenerates for the new viewport
+        self.texture = None;
+        self.texture_params = None;
     }
 
     /// Fit the viewport so the visualization fills the available view.
@@ -2243,6 +2265,166 @@ impl NeuroCoreApp {
                                     .small()
                                     .color(Color32::GRAY),
                             );
+                        });
+
+                        ui.separator();
+
+                        // SSECS Wavelet Entropy Analysis
+                        Self::section(ui, "SSECS (WAVELET ENTROPY)", |ui| {
+                            if let Some(ref report) = self.wavelet_report {
+                                let ssecs = &report.ssecs;
+                                let available = ui.available_width();
+
+                                // Malware probability
+                                ui.horizontal(|ui| {
+                                    ui.allocate_ui_with_layout(
+                                        egui::Vec2::new(
+                                            available * 0.5,
+                                            ui.spacing().interact_size.y,
+                                        ),
+                                        egui::Layout::left_to_right(egui::Align::Center),
+                                        |ui| {
+                                            ui.label(
+                                                RichText::new("MALWARE PROB")
+                                                    .monospace()
+                                                    .color(Color32::GRAY)
+                                                    .small(),
+                                            );
+                                        },
+                                    );
+                                    ui.allocate_ui_with_layout(
+                                        egui::Vec2::new(
+                                            available * 0.5,
+                                            ui.spacing().interact_size.y,
+                                        ),
+                                        egui::Layout::right_to_left(egui::Align::Center),
+                                        |ui| {
+                                            let prob_color = match ssecs.classification {
+                                                wm::MalwareClassification::Clean => {
+                                                    Color32::from_rgb(100, 200, 100)
+                                                }
+                                                wm::MalwareClassification::Suspicious => {
+                                                    Color32::from_rgb(255, 200, 50)
+                                                }
+                                                wm::MalwareClassification::LikelyMalware => {
+                                                    Color32::from_rgb(255, 80, 80)
+                                                }
+                                                wm::MalwareClassification::Unknown => Color32::GRAY,
+                                            };
+                                            ui.label(
+                                                RichText::new(format!(
+                                                    "{:.1}%",
+                                                    ssecs.probability_malware * 100.0
+                                                ))
+                                                .monospace()
+                                                .strong()
+                                                .color(prob_color),
+                                            );
+                                        },
+                                    );
+                                });
+
+                                // Malware probability bar
+                                let bar_height = 6.0;
+                                let (bar_rect, _) = ui.allocate_exact_size(
+                                    egui::Vec2::new(ui.available_width(), bar_height),
+                                    Sense::hover(),
+                                );
+                                ui.painter()
+                                    .rect_filled(bar_rect, 3.0, Color32::from_gray(50));
+                                let fill_width =
+                                    bar_rect.width() * ssecs.probability_malware as f32;
+                                let fill_rect = Rect::from_min_size(
+                                    bar_rect.min,
+                                    egui::Vec2::new(fill_width, bar_height),
+                                );
+                                ui.painter().rect_filled(
+                                    fill_rect,
+                                    3.0,
+                                    match ssecs.classification {
+                                        wm::MalwareClassification::Clean => {
+                                            Color32::from_rgb(50, 150, 50)
+                                        }
+                                        wm::MalwareClassification::Suspicious => {
+                                            Color32::from_rgb(200, 150, 50)
+                                        }
+                                        wm::MalwareClassification::LikelyMalware => {
+                                            Color32::from_rgb(200, 50, 50)
+                                        }
+                                        wm::MalwareClassification::Unknown => Color32::GRAY,
+                                    },
+                                );
+
+                                // Classification label
+                                let classification_text = format!("{:?}", ssecs.classification);
+                                let classification_color = match ssecs.classification {
+                                    wm::MalwareClassification::Clean => {
+                                        Color32::from_rgb(100, 200, 100)
+                                    }
+                                    wm::MalwareClassification::Suspicious => {
+                                        Color32::from_rgb(255, 200, 100)
+                                    }
+                                    wm::MalwareClassification::LikelyMalware => {
+                                        Color32::from_rgb(255, 100, 100)
+                                    }
+                                    wm::MalwareClassification::Unknown => Color32::GRAY,
+                                };
+                                ui.label(
+                                    RichText::new(classification_text)
+                                        .monospace()
+                                        .strong()
+                                        .color(classification_color),
+                                );
+
+                                // Energy ratios
+                                ui.add_space(4.0);
+                                ui.label(
+                                    RichText::new("Energy Distribution")
+                                        .monospace()
+                                        .small()
+                                        .color(Color32::GRAY),
+                                );
+
+                                ui.horizontal(|ui| {
+                                    ui.label(
+                                        RichText::new(format!(
+                                            "Coarse: {:.1}%",
+                                            ssecs.coarse_energy_ratio * 100.0
+                                        ))
+                                        .monospace()
+                                        .small()
+                                        .color(Color32::LIGHT_RED),
+                                    );
+                                    ui.add_space(8.0);
+                                    ui.label(
+                                        RichText::new(format!(
+                                            "Fine: {:.1}%",
+                                            ssecs.fine_energy_ratio * 100.0
+                                        ))
+                                        .monospace()
+                                        .small()
+                                        .color(Color32::LIGHT_BLUE),
+                                    );
+                                });
+
+                                // Wavelet levels
+                                ui.add_space(4.0);
+                                ui.label(
+                                    RichText::new(format!(
+                                        "Levels: {}, Chunks: {}",
+                                        report.num_wavelet_levels, report.num_entropy_chunks
+                                    ))
+                                    .monospace()
+                                    .small()
+                                    .color(Color32::GRAY),
+                                );
+                            } else {
+                                ui.label(
+                                    RichText::new("Analyzing...")
+                                        .monospace()
+                                        .color(Color32::GRAY),
+                                );
+                            }
                         });
 
                         // String Preview (if ASCII found)

@@ -761,12 +761,14 @@ pub fn haar_wavelet_transform(signal: &[f64]) -> Vec<Vec<f64>> {
         let mut averages = Vec::with_capacity(half);
         let mut details = Vec::with_capacity(half);
 
-        // Haar wavelet: average and difference of pairs
+        // Orthonormal Haar wavelet: average and difference scaled by 1/√2
+        // This matches the paper's energy distribution (Wojnowicz et al., 2016)
+        let inv_sqrt2 = std::f64::consts::FRAC_1_SQRT_2;
         for i in 0..half {
             let left = data[2 * i];
             let right = data[2 * i + 1];
-            averages.push((left + right) / 2.0);
-            details.push((left - right) / 2.0); // Detail coefficient (wavelet coefficient)
+            averages.push((left + right) * inv_sqrt2);
+            details.push((left - right) * inv_sqrt2);
         }
 
         // Store detail coefficients (from this level)
@@ -997,32 +999,39 @@ pub fn precompute_chunk_entropies(data: &[u8], chunk_size: usize, interval: usiz
 /// Highly optimized wavelet suspiciousness for exactly 8 entropy values.
 /// Performs unrolled Haar wavelet transform and computes suspiciousness in one pass.
 /// Zero heap allocations.
+///
+/// Uses orthonormal Haar wavelet (multiply by 1/√2 ≈ 0.7071) to match the paper's
+/// energy distribution. See: Wojnowicz et al., "Wavelet Decomposition of Software
+/// Entropy Reveals Symptoms of Malicious Code" (2016), Eq. 5.
 #[inline(always)]
 pub fn wavelet_suspiciousness_8(stream: &[f64; 8]) -> f64 {
+    // Orthonormal Haar scaling factor
+    const INV_SQRT2: f64 = std::f64::consts::FRAC_1_SQRT_2; // 1/√2 ≈ 0.7071
+
     // Unrolled Haar wavelet transform for 8 elements (3 levels)
     //
     // Level 2 (finest): 4 detail coefficients from pairs
-    let d2_0 = (stream[0] - stream[1]) * 0.5;
-    let d2_1 = (stream[2] - stream[3]) * 0.5;
-    let d2_2 = (stream[4] - stream[5]) * 0.5;
-    let d2_3 = (stream[6] - stream[7]) * 0.5;
+    let d2_0 = (stream[0] - stream[1]) * INV_SQRT2;
+    let d2_1 = (stream[2] - stream[3]) * INV_SQRT2;
+    let d2_2 = (stream[4] - stream[5]) * INV_SQRT2;
+    let d2_3 = (stream[6] - stream[7]) * INV_SQRT2;
 
-    // Level 2 averages (for next level)
-    let a2_0 = (stream[0] + stream[1]) * 0.5;
-    let a2_1 = (stream[2] + stream[3]) * 0.5;
-    let a2_2 = (stream[4] + stream[5]) * 0.5;
-    let a2_3 = (stream[6] + stream[7]) * 0.5;
+    // Level 2 averages (for next level) - also use INV_SQRT2 for energy preservation
+    let a2_0 = (stream[0] + stream[1]) * INV_SQRT2;
+    let a2_1 = (stream[2] + stream[3]) * INV_SQRT2;
+    let a2_2 = (stream[4] + stream[5]) * INV_SQRT2;
+    let a2_3 = (stream[6] + stream[7]) * INV_SQRT2;
 
     // Level 1: 2 detail coefficients
-    let d1_0 = (a2_0 - a2_1) * 0.5;
-    let d1_1 = (a2_2 - a2_3) * 0.5;
+    let d1_0 = (a2_0 - a2_1) * INV_SQRT2;
+    let d1_1 = (a2_2 - a2_3) * INV_SQRT2;
 
     // Level 1 averages
-    let a1_0 = (a2_0 + a2_1) * 0.5;
-    let a1_1 = (a2_2 + a2_3) * 0.5;
+    let a1_0 = (a2_0 + a2_1) * INV_SQRT2;
+    let a1_1 = (a2_2 + a2_3) * INV_SQRT2;
 
     // Level 0 (coarsest): 1 detail coefficient
-    let d0_0 = (a1_0 - a1_1) * 0.5;
+    let d0_0 = (a1_0 - a1_1) * INV_SQRT2;
 
     // Compute energies at each level
     let e2 = d2_0 * d2_0 + d2_1 * d2_1 + d2_2 * d2_2 + d2_3 * d2_3; // Fine (4 coeffs)
@@ -1048,9 +1057,12 @@ pub fn wavelet_suspiciousness_8(stream: &[f64; 8]) -> f64 {
     let std = (var * (1.0 / 3.0)).sqrt();
     let cv = std / mean_energy;
 
-    // Combined suspiciousness (same formula as WaveletAnalysis)
-    let ratio_susp = ((coarse_ratio - 0.3) * 2.5).clamp(0.0, 1.0); // 1/0.4 = 2.5
-    let var_susp = (cv * 0.5).clamp(0.0, 1.0); // 1/2.0 = 0.5
+    // Combined suspiciousness
+    // With orthonormal Haar, coarse ratios are relatively higher than unnormalized.
+    // Adjusted baseline from 0.3 to 0.4 to account for this.
+    // Maps: coarse_ratio 0.4 → 0, coarse_ratio 0.8 → 1
+    let ratio_susp = ((coarse_ratio - 0.4) * 2.5).clamp(0.0, 1.0);
+    let var_susp = (cv * 0.5).clamp(0.0, 1.0);
 
     ratio_susp * 0.7 + var_susp * 0.3
 }
