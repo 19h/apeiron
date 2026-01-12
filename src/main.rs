@@ -135,8 +135,10 @@ impl VisualizationMode {
     }
 }
 
-/// Main application state.
-struct ApeironApp {
+/// A single tab containing an open file and its state.
+struct Tab {
+    /// Tab title (file name).
+    title: String,
     /// Loaded file data.
     file_data: Option<FileData>,
     /// Viewport state for pan/zoom.
@@ -153,20 +155,49 @@ struct ApeironApp {
     texture_params: Option<TextureParams>,
     /// Current visualization mode.
     viz_mode: VisualizationMode,
-    /// Whether the help popup is shown.
-    show_help: bool,
-    /// Whether a file is being dragged over.
-    is_drop_target: bool,
     /// Whether viewport needs to be fitted to view (after load or mode change).
     needs_fit_to_view: bool,
     /// View size used for the last fit_to_view call (to detect when re-fit is needed).
     last_fit_view_size: Option<Vec2>,
-    /// GPU renderer for accelerated visualization.
-    gpu_renderer: Option<gpu::GpuRenderer>,
     /// Background computation tasks.
     background_tasks: Option<BackgroundTasks>,
+}
+
+impl Default for Tab {
+    fn default() -> Self {
+        Self {
+            title: "New Tab".to_string(),
+            file_data: None,
+            viewport: Viewport::default(),
+            selection: Selection::default(),
+            hex_view: HexView::new(),
+            wavelet_report: None,
+            texture: None,
+            texture_params: None,
+            viz_mode: VisualizationMode::default(),
+            needs_fit_to_view: false,
+            last_fit_view_size: None,
+            background_tasks: None,
+        }
+    }
+}
+
+/// Main application state.
+struct ApeironApp {
+    /// Open tabs.
+    tabs: Vec<Tab>,
+    /// Index of the currently active tab.
+    active_tab: usize,
+    /// Whether the help popup is shown.
+    show_help: bool,
+    /// Whether a file is being dragged over.
+    is_drop_target: bool,
+    /// GPU renderer for accelerated visualization.
+    gpu_renderer: Option<gpu::GpuRenderer>,
     /// Initial file to load (from command-line argument).
     initial_file: Option<PathBuf>,
+    /// Tab currently being dragged (index).
+    dragging_tab: Option<usize>,
 }
 
 /// Parameters used to generate the current texture.
@@ -398,21 +429,13 @@ impl HexView {
 impl Default for ApeironApp {
     fn default() -> Self {
         Self {
-            file_data: None,
-            viewport: Viewport::default(),
-            selection: Selection::default(),
-            hex_view: HexView::new(),
-            wavelet_report: None,
-            texture: None,
-            texture_params: None,
-            viz_mode: VisualizationMode::default(),
+            tabs: vec![Tab::default()],
+            active_tab: 0,
             show_help: false,
             is_drop_target: false,
-            needs_fit_to_view: false,
-            last_fit_view_size: None,
             gpu_renderer: None,
-            background_tasks: None,
             initial_file: None,
+            dragging_tab: None,
         }
     }
 }
@@ -439,14 +462,63 @@ impl ApeironApp {
         }
     }
 
+    /// Get a reference to the active tab.
+    fn active_tab(&self) -> &Tab {
+        &self.tabs[self.active_tab]
+    }
+
+    /// Get a mutable reference to the active tab.
+    fn active_tab_mut(&mut self) -> &mut Tab {
+        &mut self.tabs[self.active_tab]
+    }
+
+    /// Check if any tab has a file loaded.
+    #[allow(dead_code)]
+    fn has_any_file(&self) -> bool {
+        self.tabs.iter().any(|t| t.file_data.is_some())
+    }
+
+    /// Open a new tab and make it active.
+    fn new_tab(&mut self) {
+        self.tabs.push(Tab::default());
+        self.active_tab = self.tabs.len() - 1;
+    }
+
+    /// Close the tab at the given index.
+    fn close_tab(&mut self, index: usize) {
+        if self.tabs.len() <= 1 {
+            // Don't close the last tab, just clear it
+            self.tabs[0] = Tab::default();
+            self.active_tab = 0;
+            return;
+        }
+
+        self.tabs.remove(index);
+
+        // Adjust active tab if needed
+        if self.active_tab >= self.tabs.len() {
+            self.active_tab = self.tabs.len() - 1;
+        } else if self.active_tab > index {
+            self.active_tab -= 1;
+        }
+    }
+
     /// Load a file from the given path.
+    /// If `in_new_tab` is true, opens in a new tab; otherwise loads in the current tab.
     /// Only performs essential setup immediately; expensive computations run in background.
-    fn load_file(&mut self, path: PathBuf) {
+    fn load_file(&mut self, path: PathBuf, in_new_tab: bool) {
         match std::fs::read(&path) {
             Ok(data) => {
                 let size = data.len() as u64;
                 let dimension = calculate_dimension(size);
                 let file_type = identify_file_type(&data);
+
+                // Extract filename for tab title
+                let title = path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("Unknown")
+                    .to_string();
 
                 // Upload to GPU if available
                 if let Some(ref mut gpu) = self.gpu_renderer {
@@ -458,8 +530,14 @@ impl ApeironApp {
 
                 let data = Arc::new(data);
 
+                // Create or switch to the target tab
+                if in_new_tab {
+                    self.new_tab();
+                }
+                let tab = self.active_tab_mut();
+
                 // Create file data with empty precomputed maps
-                self.file_data = Some(FileData {
+                tab.file_data = Some(FileData {
                     data: Arc::clone(&data),
                     size,
                     dimension,
@@ -471,13 +549,16 @@ impl ApeironApp {
                     wavelet_map: None,
                 });
 
+                // Set tab title
+                tab.title = title;
+
                 // Clear previous wavelet report
-                self.wavelet_report = None;
+                tab.wavelet_report = None;
 
                 // Spawn background tasks for expensive computations
                 // Priority: spawn the task for the current viz mode first
                 let (tx, rx) = mpsc::channel();
-                let current_mode = self.viz_mode;
+                let current_mode = tab.viz_mode;
 
                 // Determine task priority based on current visualization mode
                 #[derive(Clone, Copy, PartialEq)]
@@ -543,7 +624,8 @@ impl ApeironApp {
                     }
                 }
 
-                self.background_tasks = Some(BackgroundTasks {
+                let tab = self.active_tab_mut();
+                tab.background_tasks = Some(BackgroundTasks {
                     receiver: rx,
                     computing_complexity: true,
                     computing_rcmse: true,
@@ -552,13 +634,13 @@ impl ApeironApp {
                 });
 
                 // Reset viewport and selection
-                self.viewport = Viewport::default();
-                self.texture = None;
-                self.texture_params = None;
-                self.needs_fit_to_view = true;
+                tab.viewport = Viewport::default();
+                tab.texture = None;
+                tab.texture_params = None;
+                tab.needs_fit_to_view = true;
 
                 // Initialize selection at offset 0
-                self.update_selection(0);
+                Self::update_selection_on_tab(tab, 0);
 
                 println!(
                     "Loaded file: Size={} bytes, Dimension={}, Type={}",
@@ -572,10 +654,11 @@ impl ApeironApp {
         }
     }
 
-    /// Poll for completed background tasks and update file data.
+    /// Poll for completed background tasks on the active tab and update file data.
     /// Returns true if any task completed (may need texture refresh).
     fn poll_background_tasks(&mut self) -> bool {
-        let Some(tasks) = &mut self.background_tasks else {
+        let tab = &mut self.tabs[self.active_tab];
+        let Some(tasks) = &mut tab.background_tasks else {
             return false;
         };
 
@@ -589,21 +672,21 @@ impl ApeironApp {
                     match task {
                         BackgroundTask::ComplexityMap(map) => {
                             println!("Complexity map ready: {} samples", map.len());
-                            if let Some(ref mut file) = self.file_data {
+                            if let Some(ref mut file) = tab.file_data {
                                 file.complexity_map = Some(Arc::new(map));
                             }
                             tasks.computing_complexity = false;
                         }
                         BackgroundTask::RcmseMap(map) => {
                             println!("RCMSE map ready: {} samples", map.len());
-                            if let Some(ref mut file) = self.file_data {
+                            if let Some(ref mut file) = tab.file_data {
                                 file.rcmse_map = Some(Arc::new(map));
                             }
                             tasks.computing_rcmse = false;
                         }
                         BackgroundTask::WaveletMap(map) => {
                             println!("Wavelet map ready: {} samples", map.len());
-                            if let Some(ref mut file) = self.file_data {
+                            if let Some(ref mut file) = tab.file_data {
                                 file.wavelet_map = Some(Arc::new(map));
                             }
                             tasks.computing_wavelet = false;
@@ -614,7 +697,7 @@ impl ApeironApp {
                                 report.ssecs.ssecs_score,
                                 report.ssecs.probability_malware * 100.0
                             );
-                            self.wavelet_report = Some(report);
+                            tab.wavelet_report = Some(report);
                             tasks.computing_wavelet_report = false;
                         }
                     }
@@ -622,20 +705,21 @@ impl ApeironApp {
                 Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Disconnected) => {
                     // All senders dropped, no more tasks coming
-                    self.background_tasks = None;
+                    tab.background_tasks = None;
                     break;
                 }
             }
         }
 
         // Clear background tasks if all done
-        if let Some(tasks) = &self.background_tasks {
+        let tab = &mut self.tabs[self.active_tab];
+        if let Some(tasks) = &tab.background_tasks {
             if !tasks.computing_complexity
                 && !tasks.computing_rcmse
                 && !tasks.computing_wavelet
                 && !tasks.computing_wavelet_report
             {
-                self.background_tasks = None;
+                self.tabs[self.active_tab].background_tasks = None;
                 println!("All background computations complete.");
             }
         }
@@ -643,9 +727,10 @@ impl ApeironApp {
         any_completed
     }
 
-    /// Check if a specific visualization mode's data is ready.
+    /// Check if a specific visualization mode's data is ready for the active tab.
     fn is_mode_data_ready(&self, mode: VisualizationMode) -> bool {
-        let Some(ref file) = self.file_data else {
+        let tab = self.active_tab();
+        let Some(ref file) = tab.file_data else {
             return false;
         };
 
@@ -664,9 +749,9 @@ impl ApeironApp {
         }
     }
 
-    /// Check if any background computation is in progress.
+    /// Check if any background computation is in progress for the active tab.
     fn is_computing(&self) -> bool {
-        self.background_tasks.is_some()
+        self.active_tab().background_tasks.is_some()
     }
 
     /// Precompute Kolmogorov complexity values for the file.
@@ -802,7 +887,18 @@ impl ApeironApp {
 
     /// Update the selection, optionally scrolling the hex view.
     fn update_selection_with_scroll(&mut self, offset: u64, scroll_hex_view: bool) {
-        if let Some(file) = &self.file_data {
+        let tab = self.active_tab_mut();
+        Self::update_selection_on_tab_with_scroll(tab, offset, scroll_hex_view);
+    }
+
+    /// Static helper to update selection on a specific tab.
+    fn update_selection_on_tab(tab: &mut Tab, offset: u64) {
+        Self::update_selection_on_tab_with_scroll(tab, offset, true);
+    }
+
+    /// Static helper to update selection on a specific tab with scroll control.
+    fn update_selection_on_tab_with_scroll(tab: &mut Tab, offset: u64, scroll_hex_view: bool) {
+        if let Some(file) = &tab.file_data {
             if offset < file.size {
                 let start = offset as usize;
                 let end = (start + ANALYSIS_WINDOW).min(file.data.len());
@@ -813,7 +909,7 @@ impl ApeironApp {
                 let complexity_end = (start + COMPLEXITY_WINDOW).min(file.data.len());
                 let complexity_chunk = &file.data[start..complexity_end];
 
-                self.selection = Selection {
+                tab.selection = Selection {
                     offset,
                     entropy: calculate_entropy(chunk),
                     kolmogorov_complexity: calculate_kolmogorov_complexity(complexity_chunk),
@@ -822,7 +918,7 @@ impl ApeironApp {
 
                 // Scroll hex view to show the selection
                 if scroll_hex_view {
-                    self.hex_view.scroll_to(offset, file.size);
+                    tab.hex_view.scroll_to(offset, file.size);
                 }
             }
         }
@@ -830,74 +926,90 @@ impl ApeironApp {
 
     /// Handle cursor interaction on the visualization.
     fn handle_interaction(&mut self, world_pos: Vec2) {
-        if let Some(file) = &self.file_data {
-            if world_pos.x < 0.0 || world_pos.y < 0.0 {
-                return;
-            }
+        let tab = self.active_tab();
+        let Some(file) = &tab.file_data else {
+            return;
+        };
 
-            match self.viz_mode {
-                VisualizationMode::Hilbert
-                | VisualizationMode::KolmogorovComplexity
-                | VisualizationMode::JensenShannonDivergence
-                | VisualizationMode::MultiScaleEntropy
-                | VisualizationMode::WaveletEntropy => {
-                    let x = world_pos.x as u64;
-                    let y = world_pos.y as u64;
-                    let n = file.dimension;
+        if world_pos.x < 0.0 || world_pos.y < 0.0 {
+            return;
+        }
 
-                    if x < n && y < n {
-                        let d = xy2d(n, x, y);
-                        if d < file.size {
-                            self.update_selection(d);
-                            return;
-                        }
+        let viz_mode = tab.viz_mode;
+        let dimension = file.dimension;
+        let file_size = file.size;
+
+        // Find the offset based on interaction
+        let offset = match viz_mode {
+            VisualizationMode::Hilbert
+            | VisualizationMode::KolmogorovComplexity
+            | VisualizationMode::JensenShannonDivergence
+            | VisualizationMode::MultiScaleEntropy
+            | VisualizationMode::WaveletEntropy => {
+                let x = world_pos.x as u64;
+                let y = world_pos.y as u64;
+
+                if x < dimension && y < dimension {
+                    let d = xy2d(dimension, x, y);
+                    if d < file_size {
+                        Some(d)
+                    } else {
+                        Some(0)
                     }
-                    self.update_selection(0);
-                }
-                VisualizationMode::Digraph | VisualizationMode::BytePhaseSpace => {
-                    // World coordinates map to byte values (0-255)
-                    let byte_x = (world_pos.x as u64).min(255);
-                    let byte_y = (world_pos.y as u64).min(255);
-
-                    // Find first occurrence of this byte pair in the file
-                    if file.size >= 2 {
-                        for (i, window) in file.data.windows(2).enumerate() {
-                            if window[0] as u64 == byte_x && window[1] as u64 == byte_y {
-                                self.update_selection(i as u64);
-                                return;
-                            }
-                        }
-                    }
-                    self.update_selection(0);
-                }
-                VisualizationMode::SimilarityMatrix => {
-                    // Map to file positions based on X/Y
-                    let n = file.dimension;
-                    let pos_x = (world_pos.x as u64 * file.size / n).min(file.size - 1);
-                    self.update_selection(pos_x);
+                } else {
+                    Some(0)
                 }
             }
+            VisualizationMode::Digraph | VisualizationMode::BytePhaseSpace => {
+                // World coordinates map to byte values (0-255)
+                let byte_x = (world_pos.x as u64).min(255);
+                let byte_y = (world_pos.y as u64).min(255);
+
+                // Find first occurrence of this byte pair in the file
+                if file_size >= 2 {
+                    file.data
+                        .windows(2)
+                        .enumerate()
+                        .find(|(_, window)| {
+                            window[0] as u64 == byte_x && window[1] as u64 == byte_y
+                        })
+                        .map(|(i, _)| i as u64)
+                        .or(Some(0))
+                } else {
+                    Some(0)
+                }
+            }
+            VisualizationMode::SimilarityMatrix => {
+                // Map to file positions based on X/Y
+                let pos_x = (world_pos.x as u64 * file_size / dimension).min(file_size - 1);
+                Some(pos_x)
+            }
+        };
+
+        if let Some(off) = offset {
+            self.update_selection(off);
         }
     }
 
     /// Generate the entropy visualization texture for the visible viewport.
     fn generate_texture(&mut self, ctx: &egui::Context, view_rect: Rect) {
-        let Some(file) = &self.file_data else {
+        let tab = &self.tabs[self.active_tab];
+        let Some(file) = &tab.file_data else {
             return;
         };
 
         // Get world dimension based on visualization mode
-        let dim = self.viz_mode.world_dimension(file.dimension);
+        let dim = tab.viz_mode.world_dimension(file.dimension);
 
         // Calculate world region to render
-        let (world_min, world_max) = if self.viz_mode.renders_full_world() {
+        let (world_min, world_max) = if tab.viz_mode.renders_full_world() {
             // Render entire world space for consistent sampling
             (Vec2::ZERO, Vec2::new(dim, dim))
         } else {
             // Viewport-aware: only render visible region
             let view_size = view_rect.size();
-            let wmin = self.viewport.offset;
-            let wmax = wmin + Vec2::new(view_size.x, view_size.y) / self.viewport.zoom;
+            let wmin = tab.viewport.offset;
+            let wmax = wmin + Vec2::new(view_size.x, view_size.y) / tab.viewport.zoom;
             // Clamp to valid world bounds
             (
                 Vec2::new(wmin.x.max(0.0), wmin.y.max(0.0)),
@@ -912,14 +1024,14 @@ impl ApeironApp {
 
         // Determine texture size based on mode requirements
         let max_tex_size = 4096usize;
-        let min_tex_size = self.viz_mode.min_texture_size();
+        let min_tex_size = tab.viz_mode.min_texture_size();
 
-        let tex_size = if self.viz_mode.renders_full_world() {
+        let tex_size = if tab.viz_mode.renders_full_world() {
             // Use fixed resolution for full-world rendering
             min_tex_size.min(max_tex_size)
         } else {
             // Aim for ~1:1 pixel mapping, respecting min/max bounds
-            let pixels_per_world_unit = self.viewport.zoom;
+            let pixels_per_world_unit = tab.viewport.zoom;
             let ideal_tex_width = (world_size.x * pixels_per_world_unit) as usize;
             let ideal_tex_height = (world_size.y * pixels_per_world_unit) as usize;
             ideal_tex_width
@@ -932,10 +1044,10 @@ impl ApeironApp {
             world_min,
             world_max,
             tex_size,
-            viz_mode: self.viz_mode,
+            viz_mode: tab.viz_mode,
         };
 
-        if let Some(old_params) = &self.texture_params {
+        if let Some(old_params) = &tab.texture_params {
             // Only regenerate if viewport changed significantly or mode changed
             let min_delta = (new_params.world_min - old_params.world_min).length();
             let max_delta = (new_params.world_max - old_params.world_max).length();
@@ -948,7 +1060,7 @@ impl ApeironApp {
                 && max_delta < threshold
                 && !size_changed
                 && !mode_changed
-                && self.texture.is_some()
+                && tab.texture.is_some()
             {
                 return;
             }
@@ -962,7 +1074,7 @@ impl ApeironApp {
         let wavelet_map = file.wavelet_map.clone();
         let dimension = file.dimension;
         let file_size = file.size;
-        let viz_mode = self.viz_mode;
+        let viz_mode = tab.viz_mode;
 
         // Use empty slice as fallback for maps not yet computed
         let empty_map: Arc<Vec<f32>> = Arc::new(Vec::new());
@@ -1062,8 +1174,9 @@ impl ApeironApp {
             )
         };
 
-        self.texture = Some(ctx.load_texture("entropy_map", image, egui::TextureOptions::NEAREST));
-        self.texture_params = Some(new_params);
+        let tab = &mut self.tabs[self.active_tab];
+        tab.texture = Some(ctx.load_texture("entropy_map", image, egui::TextureOptions::NEAREST));
+        tab.texture_params = Some(new_params);
     }
 
     /// Generate visualization image using CPU (fallback when GPU unavailable).
@@ -1663,18 +1776,20 @@ impl ApeironApp {
 
     /// Reset viewport to default.
     fn reset_viewport(&mut self) {
-        self.viewport = Viewport::default();
-        self.needs_fit_to_view = true;
-        self.last_fit_view_size = None;
+        let tab = self.active_tab_mut();
+        tab.viewport = Viewport::default();
+        tab.needs_fit_to_view = true;
+        tab.last_fit_view_size = None;
         // Clear texture so it regenerates for the new viewport
-        self.texture = None;
-        self.texture_params = None;
+        tab.texture = None;
+        tab.texture_params = None;
     }
 
     /// Fit the viewport so the visualization fills the available view.
     fn fit_to_view(&mut self, view_size: Vec2) {
-        if let Some(file) = &self.file_data {
-            let world_dim = self.viz_mode.world_dimension(file.dimension);
+        let tab = &mut self.tabs[self.active_tab];
+        if let Some(file) = &tab.file_data {
+            let world_dim = tab.viz_mode.world_dimension(file.dimension);
 
             // Calculate zoom to fit world in view with some padding
             let padding = 0.95; // 95% of view
@@ -1687,22 +1802,23 @@ impl ApeironApp {
             let offset_x = -(visible_world.x - world_dim) / 2.0;
             let offset_y = -(visible_world.y - world_dim) / 2.0;
 
-            self.viewport.zoom = zoom;
-            self.viewport.offset = Vec2::new(offset_x, offset_y);
+            tab.viewport.zoom = zoom;
+            tab.viewport.offset = Vec2::new(offset_x, offset_y);
 
             // Store the view size used for this fit
-            self.last_fit_view_size = Some(view_size);
+            tab.last_fit_view_size = Some(view_size);
 
             // Clear texture to force regeneration with new viewport
-            self.texture = None;
-            self.texture_params = None;
+            tab.texture = None;
+            tab.texture_params = None;
         }
-        self.needs_fit_to_view = false;
+        self.tabs[self.active_tab].needs_fit_to_view = false;
     }
 
     /// Check if the view size has changed significantly since the last fit.
     fn should_refit(&self, current_view_size: Vec2) -> bool {
-        if let Some(last_size) = self.last_fit_view_size {
+        let tab = self.active_tab();
+        if let Some(last_size) = tab.last_fit_view_size {
             // Re-fit if view size changed by more than 5%
             let delta_x = (current_view_size.x - last_size.x).abs() / last_size.x.max(1.0);
             let delta_y = (current_view_size.y - last_size.y).abs() / last_size.y.max(1.0);
@@ -1722,122 +1838,381 @@ impl eframe::App for ApeironApp {
         // Load initial file from command-line argument (first frame only)
         if let Some(path) = self.initial_file.take() {
             println!("Loading file from command line: {}", path.display());
-            self.load_file(path);
+            self.load_file(path, false);
         }
 
         // Poll for completed background tasks
         let task_completed = self.poll_background_tasks();
 
         // If background tasks are in progress or just completed, request repaint
+        let tab_viz_mode = self.active_tab().viz_mode;
         if self.is_computing() || task_completed {
             ctx.request_repaint();
             // Invalidate texture if task completed (new data available)
-            if task_completed && self.is_mode_data_ready(self.viz_mode) {
-                self.texture = None;
+            if task_completed && self.is_mode_data_ready(tab_viz_mode) {
+                self.active_tab_mut().texture = None;
             }
         }
 
         // Handle file drops
-        ctx.input(|i| {
+        let dropped_file = ctx.input(|i| {
             self.is_drop_target = !i.raw.hovered_files.is_empty();
-
-            if let Some(file) = i.raw.dropped_files.first() {
-                if let Some(path) = &file.path {
-                    self.load_file(path.clone());
-                }
-            }
+            i.raw.dropped_files.first().and_then(|f| f.path.clone())
         });
+
+        if let Some(path) = dropped_file {
+            // If current tab has a file, open in new tab; otherwise load in current tab
+            let in_new_tab = self.active_tab().file_data.is_some();
+            self.load_file(path, in_new_tab);
+        }
 
         // Note: Texture generation is now done in draw_visualization with viewport info
 
-        // Top toolbar
-        egui::TopBottomPanel::top("toolbar").show(ctx, |ui| {
-            ui.horizontal(|ui| {
-                ui.add_space(8.0);
+        // Top toolbar with tabs
+        egui::TopBottomPanel::top("toolbar")
+            .frame(egui::Frame::none().fill(Color32::from_rgb(28, 28, 32)))
+            .show(ctx, |ui| {
+                let mut tab_to_close: Option<usize> = None;
+                let mut tab_to_activate: Option<usize> = None;
 
-                if ui
-                    .add_enabled(self.file_data.is_some(), egui::Button::new("Reset View"))
-                    .on_hover_text("Reset zoom and pan")
-                    .clicked()
-                {
-                    self.reset_viewport();
-                }
+                // Tab bar with drag-and-drop reordering
+                let mut tab_rects: Vec<egui::Rect> = Vec::new();
+                let mut drop_idx: Option<usize> = None;
 
-                if ui.button("Help").clicked() {
-                    self.show_help = !self.show_help;
-                }
+                ui.horizontal(|ui| {
+                    ui.add_space(6.0);
 
-                if ui.button("Open File...").clicked() {
-                    if let Some(path) = rfd::FileDialog::new().pick_file() {
-                        self.load_file(path);
-                    }
-                }
+                    // Get current drag position if dragging
+                    let drag_pos = ui.input(|i| i.pointer.hover_pos());
+                    let is_dragging_any = self.dragging_tab.is_some();
 
-                ui.add_space(16.0);
-                ui.separator();
-                ui.add_space(8.0);
+                    for (i, tab) in self.tabs.iter().enumerate() {
+                        let is_active = i == self.active_tab;
+                        let is_being_dragged = self.dragging_tab == Some(i);
+                        let title = if tab.file_data.is_some() {
+                            let t = &tab.title;
+                            if t.len() > 24 {
+                                format!("{}...", &t[..21])
+                            } else {
+                                t.clone()
+                            }
+                        } else {
+                            "New Tab".to_string()
+                        };
 
-                // Visualization mode dropdown
-                ui.label(RichText::new("Mode:").monospace().small());
-                let old_mode = self.viz_mode;
-                egui::ComboBox::from_id_salt("viz_mode")
-                    .selected_text(self.viz_mode.name())
-                    .show_ui(ui, |ui| {
-                        for mode in VisualizationMode::all() {
-                            ui.selectable_value(&mut self.viz_mode, *mode, mode.name());
+                        let show_close = self.tabs.len() > 1 || tab.file_data.is_some();
+
+                        // Calculate tab size
+                        let text_width = ui.fonts(|f| {
+                            f.glyph_width(&egui::FontId::proportional(12.0), 'M')
+                                * title.len() as f32
+                        });
+                        let tab_width = text_width + if show_close { 36.0 } else { 24.0 };
+                        let tab_height = 28.0;
+
+                        // Allocate space and get response (click and drag)
+                        let (rect, response) = ui.allocate_exact_size(
+                            egui::vec2(tab_width, tab_height),
+                            Sense::click_and_drag(),
+                        );
+                        tab_rects.push(rect);
+
+                        let is_hovered = response.hovered() && !is_dragging_any;
+
+                        // Start drag
+                        if response.drag_started() {
+                            self.dragging_tab = Some(i);
                         }
-                    });
 
-                // Force texture regeneration and fit viewport when mode changes
-                // (different modes have different world dimensions)
-                if self.viz_mode != old_mode {
-                    self.texture = None;
-                    self.texture_params = None;
-                    // Reset viewport completely to ensure proper fit
-                    self.viewport = Viewport::default();
-                    self.needs_fit_to_view = true;
-                    self.last_fit_view_size = None;
+                        // Determine if this is a drop target
+                        let is_drop_target =
+                            if let (Some(drag_idx), Some(pos)) = (self.dragging_tab, drag_pos) {
+                                if drag_idx != i {
+                                    let dominated = rect.contains(pos);
+                                    if dominated {
+                                        drop_idx = Some(i);
+                                    }
+                                    dominated
+                                } else {
+                                    false
+                                }
+                            } else {
+                                false
+                            };
+
+                        // Background color
+                        let bg_color = if is_being_dragged {
+                            Color32::from_rgb(55, 55, 65)
+                        } else if is_drop_target {
+                            Color32::from_rgb(50, 60, 70)
+                        } else if is_active {
+                            Color32::from_rgb(45, 45, 52)
+                        } else if is_hovered {
+                            Color32::from_rgb(38, 38, 44)
+                        } else {
+                            Color32::from_rgb(28, 28, 32)
+                        };
+
+                        // Draw tab background
+                        let rounding = egui::Rounding {
+                            nw: 8.0,
+                            ne: 8.0,
+                            sw: 0.0,
+                            se: 0.0,
+                        };
+                        ui.painter().rect_filled(rect, rounding, bg_color);
+
+                        // Drop indicator line
+                        if is_drop_target {
+                            if let Some(drag_idx) = self.dragging_tab {
+                                let indicator_x = if drag_idx < i {
+                                    rect.max.x - 1.0
+                                } else {
+                                    rect.min.x + 1.0
+                                };
+                                ui.painter().rect_filled(
+                                    egui::Rect::from_min_size(
+                                        egui::pos2(indicator_x - 1.5, rect.min.y + 4.0),
+                                        egui::vec2(3.0, rect.height() - 8.0),
+                                    ),
+                                    2.0,
+                                    Color32::from_rgb(100, 160, 220),
+                                );
+                            }
+                        }
+
+                        // Active indicator
+                        if is_active && !is_being_dragged {
+                            ui.painter().rect_filled(
+                                egui::Rect::from_min_size(
+                                    egui::pos2(rect.min.x, rect.max.y - 2.0),
+                                    egui::vec2(rect.width(), 2.0),
+                                ),
+                                0.0,
+                                Color32::from_rgb(70, 130, 180),
+                            );
+                        }
+
+                        // Tab title
+                        let text_color = if is_being_dragged {
+                            Color32::from_rgb(180, 180, 190)
+                        } else if is_active {
+                            Color32::from_rgb(230, 230, 235)
+                        } else if is_hovered {
+                            Color32::from_rgb(200, 200, 205)
+                        } else {
+                            Color32::from_rgb(150, 150, 160)
+                        };
+
+                        ui.painter().text(
+                            egui::pos2(rect.min.x + 10.0, rect.center().y),
+                            egui::Align2::LEFT_CENTER,
+                            &title,
+                            egui::FontId::proportional(12.0),
+                            text_color,
+                        );
+
+                        // Close button
+                        if show_close && !is_being_dragged {
+                            let close_rect = egui::Rect::from_center_size(
+                                egui::pos2(rect.max.x - 14.0, rect.center().y),
+                                egui::vec2(16.0, 16.0),
+                            );
+                            let pointer_pos =
+                                ui.input(|i| i.pointer.hover_pos().unwrap_or_default());
+                            let close_hovered = is_hovered && close_rect.contains(pointer_pos);
+
+                            if close_hovered {
+                                ui.painter().circle_filled(
+                                    close_rect.center(),
+                                    8.0,
+                                    Color32::from_rgb(65, 65, 72),
+                                );
+                            }
+
+                            let close_color = if close_hovered {
+                                Color32::from_rgb(220, 220, 225)
+                            } else if is_hovered || is_active {
+                                Color32::from_rgb(130, 130, 140)
+                            } else {
+                                Color32::TRANSPARENT
+                            };
+
+                            if close_color != Color32::TRANSPARENT {
+                                ui.painter().text(
+                                    close_rect.center(),
+                                    egui::Align2::CENTER_CENTER,
+                                    "×",
+                                    egui::FontId::proportional(14.0),
+                                    close_color,
+                                );
+                            }
+
+                            if response.clicked() && close_hovered {
+                                tab_to_close = Some(i);
+                            } else if response.clicked() && !is_dragging_any {
+                                tab_to_activate = Some(i);
+                            }
+                        } else if response.clicked() && !is_dragging_any {
+                            tab_to_activate = Some(i);
+                        }
+
+                        ui.add_space(2.0);
+                    }
+
+                    // New tab button
+                    ui.add_space(4.0);
+                    let (new_rect, new_response) =
+                        ui.allocate_exact_size(egui::vec2(24.0, 24.0), Sense::click());
+
+                    let new_hovered = new_response.hovered();
+                    if new_hovered {
+                        ui.painter().circle_filled(
+                            new_rect.center(),
+                            11.0,
+                            Color32::from_rgb(45, 45, 52),
+                        );
+                    }
+
+                    ui.painter().text(
+                        new_rect.center(),
+                        egui::Align2::CENTER_CENTER,
+                        "+",
+                        egui::FontId::proportional(18.0),
+                        if new_hovered {
+                            Color32::from_rgb(220, 220, 225)
+                        } else {
+                            Color32::from_rgb(120, 120, 130)
+                        },
+                    );
+
+                    if new_response.clicked() {
+                        self.new_tab();
+                    }
+                });
+
+                // Handle drag release - reorder tabs
+                if self.dragging_tab.is_some() && ui.input(|i| i.pointer.any_released()) {
+                    if let (Some(from), Some(to)) = (self.dragging_tab, drop_idx) {
+                        if from != to {
+                            let tab = self.tabs.remove(from);
+                            let insert_at = if from < to { to } else { to };
+                            self.tabs.insert(insert_at, tab);
+                            // Update active tab index
+                            if self.active_tab == from {
+                                self.active_tab = insert_at;
+                            } else if from < self.active_tab && self.active_tab <= to {
+                                self.active_tab -= 1;
+                            } else if to <= self.active_tab && self.active_tab < from {
+                                self.active_tab += 1;
+                            }
+                        }
+                    }
+                    self.dragging_tab = None;
                 }
 
-                // Show loading indicator when background tasks are running
-                if let Some(ref tasks) = self.background_tasks {
-                    ui.add_space(16.0);
-                    ui.separator();
+                // Handle tab actions
+                if let Some(i) = tab_to_activate {
+                    self.active_tab = i;
+                }
+                if let Some(i) = tab_to_close {
+                    self.close_tab(i);
+                }
+
+                // Toolbar row
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
                     ui.add_space(8.0);
 
-                    // Count pending tasks
-                    let pending = [
-                        tasks.computing_complexity,
-                        tasks.computing_rcmse,
-                        tasks.computing_wavelet,
-                        tasks.computing_wavelet_report,
-                    ]
-                    .iter()
-                    .filter(|&&x| x)
-                    .count();
+                    let has_file = self.active_tab().file_data.is_some();
 
-                    ui.horizontal(|ui| {
-                        ui.spinner();
-                        ui.label(
-                            RichText::new(format!("Computing ({pending} tasks)..."))
-                                .monospace()
-                                .small()
-                                .color(Color32::YELLOW),
+                    // Minimal toolbar buttons
+                    let tool_btn = |ui: &mut egui::Ui, text: &str, enabled: bool| -> bool {
+                        let response = ui.add_enabled(
+                            enabled,
+                            egui::Button::new(RichText::new(text).size(11.0).color(if enabled {
+                                Color32::from_rgb(175, 175, 185)
+                            } else {
+                                Color32::from_rgb(80, 80, 90)
+                            }))
+                            .fill(Color32::from_rgb(40, 40, 46))
+                            .rounding(4.0)
+                            .min_size(egui::vec2(0.0, 22.0)),
                         );
-                    });
+                        response.clicked()
+                    };
 
-                    // Show which mode's data isn't ready yet
-                    if !self.is_mode_data_ready(self.viz_mode) {
-                        ui.label(
-                            RichText::new("(current view pending)")
-                                .monospace()
-                                .small()
-                                .color(Color32::GRAY),
-                        );
+                    if tool_btn(ui, "Reset", has_file) {
+                        self.reset_viewport();
                     }
-                }
+                    if tool_btn(ui, "Open", true) {
+                        if let Some(path) = rfd::FileDialog::new().pick_file() {
+                            let in_new_tab = self.active_tab().file_data.is_some();
+                            self.load_file(path, in_new_tab);
+                        }
+                    }
+                    if tool_btn(ui, "?", true) {
+                        self.show_help = !self.show_help;
+                    }
+
+                    ui.add_space(8.0);
+
+                    // Mode dropdown
+                    ui.label(
+                        RichText::new("Mode")
+                            .size(11.0)
+                            .color(Color32::from_rgb(100, 100, 110)),
+                    );
+                    let old_mode = self.active_tab().viz_mode;
+                    let mut new_mode = old_mode;
+                    egui::ComboBox::from_id_salt("viz_mode")
+                        .selected_text(old_mode.name())
+                        .show_ui(ui, |ui| {
+                            for mode in VisualizationMode::all() {
+                                ui.selectable_value(&mut new_mode, *mode, mode.name());
+                            }
+                        });
+
+                    // Force texture regeneration and fit viewport when mode changes
+                    // (different modes have different world dimensions)
+                    if new_mode != old_mode {
+                        let tab = self.active_tab_mut();
+                        tab.viz_mode = new_mode;
+                        tab.texture = None;
+                        tab.texture_params = None;
+                        // Reset viewport completely to ensure proper fit
+                        tab.viewport = Viewport::default();
+                        tab.needs_fit_to_view = true;
+                        tab.last_fit_view_size = None;
+                    }
+
+                    // Show loading indicator when background tasks are running
+                    if let Some(ref tasks) = self.active_tab().background_tasks {
+                        ui.add_space(12.0);
+
+                        // Count pending tasks
+                        let pending = [
+                            tasks.computing_complexity,
+                            tasks.computing_rcmse,
+                            tasks.computing_wavelet,
+                            tasks.computing_wavelet_report,
+                        ]
+                        .iter()
+                        .filter(|&&x| x)
+                        .count();
+
+                        ui.horizontal(|ui| {
+                            ui.spinner();
+                            ui.label(
+                                RichText::new(format!("{} tasks", pending))
+                                    .size(10.0)
+                                    .color(Color32::from_rgb(180, 160, 100)),
+                            );
+                        });
+                    }
+                });
+                ui.add_space(4.0);
             });
-        });
 
         // Right panel: Data Inspector (responsive width)
         egui::SidePanel::right("inspector")
@@ -1874,7 +2249,7 @@ impl ApeironApp {
         ui.painter()
             .rect_filled(available_rect, 0.0, Color32::from_rgb(30, 30, 30));
 
-        if self.file_data.is_none() {
+        if self.active_tab().file_data.is_none() {
             // Empty state or drop target indicator
             if self.is_drop_target {
                 self.draw_drop_indicator(ui, available_rect);
@@ -1894,8 +2269,9 @@ impl ApeironApp {
         // Also re-fit if view size changed significantly (handles layout settling, window resize)
         // Only fit if view has valid non-zero size
         let view_size = available_rect.size();
-        let should_fit =
-            self.needs_fit_to_view || (self.file_data.is_some() && self.should_refit(view_size));
+        let needs_fit = self.active_tab().needs_fit_to_view;
+        let has_file = self.active_tab().file_data.is_some();
+        let should_fit = needs_fit || (has_file && self.should_refit(view_size));
 
         if should_fit && view_size.x > 100.0 && view_size.y > 100.0 {
             self.fit_to_view(view_size);
@@ -1909,50 +2285,61 @@ impl ApeironApp {
         let mut viewport_changed = false;
 
         if scroll_delta.y != 0.0 && response.hovered() {
+            let tab = self.active_tab_mut();
             let zoom_factor = 1.1f32.powf(scroll_delta.y / 50.0);
-            let old_zoom = self.viewport.zoom;
+            let old_zoom = tab.viewport.zoom;
             let new_zoom = (old_zoom * zoom_factor).clamp(0.1, 100.0);
 
             // Zoom towards cursor
             if let Some(cursor_pos) = response.hover_pos() {
                 let cursor_rel = cursor_pos - available_rect.min;
                 let cursor_world_before =
-                    Vec2::new(cursor_rel.x, cursor_rel.y) / old_zoom + self.viewport.offset;
+                    Vec2::new(cursor_rel.x, cursor_rel.y) / old_zoom + tab.viewport.offset;
                 let cursor_world_after =
-                    Vec2::new(cursor_rel.x, cursor_rel.y) / new_zoom + self.viewport.offset;
-                self.viewport.offset += cursor_world_before - cursor_world_after;
+                    Vec2::new(cursor_rel.x, cursor_rel.y) / new_zoom + tab.viewport.offset;
+                tab.viewport.offset += cursor_world_before - cursor_world_after;
             }
 
-            self.viewport.zoom = new_zoom;
+            tab.viewport.zoom = new_zoom;
             viewport_changed = true;
         }
 
         // Handle pan (drag)
         if response.dragged() {
+            let tab = self.active_tab_mut();
             let delta = response.drag_delta();
-            self.viewport.offset -= Vec2::new(delta.x, delta.y) / self.viewport.zoom;
+            tab.viewport.offset -= Vec2::new(delta.x, delta.y) / tab.viewport.zoom;
             viewport_changed = true;
         }
 
         // Handle hover for inspection
         if let Some(cursor_pos) = response.hover_pos() {
+            let tab = self.active_tab();
             let cursor_rel = cursor_pos - available_rect.min;
             let world_pos =
-                Vec2::new(cursor_rel.x, cursor_rel.y) / self.viewport.zoom + self.viewport.offset;
+                Vec2::new(cursor_rel.x, cursor_rel.y) / tab.viewport.zoom + tab.viewport.offset;
             self.handle_interaction(world_pos);
         }
 
         // Generate/update texture for current viewport
-        // We regenerate when viewport changes or texture is missing
-        if self.texture.is_none() || viewport_changed {
+        // Skip if mode requires data that isn't ready yet (avoid blocking)
+        let current_mode = self.active_tab().viz_mode;
+        let data_ready = self.is_mode_data_ready(current_mode);
+
+        // We regenerate when viewport changes or texture is missing, but only if data is ready
+        if data_ready && (self.active_tab().texture.is_none() || viewport_changed) {
             self.generate_texture(ui.ctx(), available_rect);
         }
 
         // Draw the texture
-        if let (Some(texture), Some(params)) = (&self.texture, &self.texture_params) {
+        let tab = self.active_tab();
+        if let (Some(texture), Some(params)) = (&tab.texture, &tab.texture_params) {
+            let viewport_offset = tab.viewport.offset;
+            let viewport_zoom = tab.viewport.zoom;
+
             // Calculate screen position for the texture's world region
             let world_to_screen = |world: Vec2| -> Pos2 {
-                let screen = (world - self.viewport.offset) * self.viewport.zoom;
+                let screen = (world - viewport_offset) * viewport_zoom;
                 Pos2::new(
                     screen.x + available_rect.min.x,
                     screen.y + available_rect.min.y,
@@ -1975,8 +2362,9 @@ impl ApeironApp {
             }
 
             // Draw hex view region outline (for Hilbert-based modes)
+            let viz_mode = self.active_tab().viz_mode;
             if matches!(
-                self.viz_mode,
+                viz_mode,
                 VisualizationMode::Hilbert
                     | VisualizationMode::KolmogorovComplexity
                     | VisualizationMode::JensenShannonDivergence
@@ -1991,7 +2379,8 @@ impl ApeironApp {
         self.draw_hud(ui, available_rect);
 
         // Draw loading overlay if current mode's data is not ready
-        if !self.is_mode_data_ready(self.viz_mode) {
+        let current_mode = self.active_tab().viz_mode;
+        if !self.is_mode_data_ready(current_mode) {
             self.draw_loading_overlay(ui, available_rect);
         }
     }
@@ -1999,11 +2388,12 @@ impl ApeironApp {
     /// Draw an outline around the hex view's visible region on the Hilbert curve.
     /// Uses cached outline data for performance.
     fn draw_hex_region_outline(&mut self, ui: &mut egui::Ui, view_rect: Rect) {
-        let Some(file) = &self.file_data else {
+        let tab = &self.tabs[self.active_tab];
+        let Some(file) = &tab.file_data else {
             return;
         };
 
-        let (start_offset, end_offset) = self.hex_view.visible_range();
+        let (start_offset, end_offset) = tab.hex_view.visible_range();
         let end_offset = end_offset.min(file.size);
 
         if start_offset >= file.size {
@@ -2011,27 +2401,28 @@ impl ApeironApp {
         }
 
         let dimension = file.dimension;
+        let viewport_offset = tab.viewport.offset;
+        let viewport_zoom = tab.viewport.zoom;
 
         // Update cache if needed
-        if !self
+        let tab = &mut self.tabs[self.active_tab];
+        if !tab
             .hex_view
             .is_cache_valid(start_offset, end_offset, dimension)
         {
-            self.hex_view
+            tab.hex_view
                 .update_outline_cache(start_offset, end_offset, dimension);
         }
 
         // Get cached data
-        let Some(cache) = &self.hex_view.outline_cache else {
+        let Some(cache) = &tab.hex_view.outline_cache else {
             return;
         };
 
         // Convert world coordinates to screen coordinates
         let world_to_screen = |world_x: f32, world_y: f32| -> Pos2 {
-            let screen_x =
-                (world_x - self.viewport.offset.x) * self.viewport.zoom + view_rect.min.x;
-            let screen_y =
-                (world_y - self.viewport.offset.y) * self.viewport.zoom + view_rect.min.y;
+            let screen_x = (world_x - viewport_offset.x) * viewport_zoom + view_rect.min.x;
+            let screen_y = (world_y - viewport_offset.y) * viewport_zoom + view_rect.min.y;
             Pos2::new(screen_x, screen_y)
         };
 
@@ -2087,6 +2478,8 @@ impl ApeironApp {
 
     /// Draw loading overlay when current mode's data is still computing.
     fn draw_loading_overlay(&self, ui: &mut egui::Ui, rect: Rect) {
+        let tab = self.active_tab();
+
         // Semi-transparent dark overlay
         ui.painter()
             .rect_filled(rect, 0.0, Color32::from_rgba_unmultiplied(20, 20, 25, 200));
@@ -2104,7 +2497,7 @@ impl ApeironApp {
         );
 
         // Mode name
-        let mode_name = self.viz_mode.name();
+        let mode_name = tab.viz_mode.name();
         ui.painter().text(
             box_rect.center() - Vec2::new(0.0, 20.0),
             egui::Align2::CENTER_CENTER,
@@ -2129,7 +2522,7 @@ impl ApeironApp {
         );
 
         // Progress hint
-        if let Some(ref tasks) = self.background_tasks {
+        if let Some(ref tasks) = tab.background_tasks {
             let pending = [
                 tasks.computing_complexity,
                 tasks.computing_rcmse,
@@ -2180,7 +2573,8 @@ impl ApeironApp {
 
     /// Draw the HUD overlay with zoom, position, and file size.
     fn draw_hud(&self, ui: &mut egui::Ui, rect: Rect) {
-        let Some(file) = &self.file_data else {
+        let tab = self.active_tab();
+        let Some(file) = &tab.file_data else {
             return;
         };
 
@@ -2196,7 +2590,7 @@ impl ApeironApp {
             Color32::from_rgba_unmultiplied(30, 30, 30, 200),
         );
 
-        let mode_indicator = match self.viz_mode {
+        let mode_indicator = match tab.viz_mode {
             VisualizationMode::Hilbert => "HIL",
             VisualizationMode::SimilarityMatrix => "SIM",
             VisualizationMode::Digraph => "DIG",
@@ -2210,9 +2604,9 @@ impl ApeironApp {
         let text = format!(
             " [{}]  {:.2}x   {:.0}, {:.0}   {}",
             mode_indicator,
-            self.viewport.zoom,
-            self.viewport.offset.x,
-            self.viewport.offset.y,
+            tab.viewport.zoom,
+            tab.viewport.offset.x,
+            tab.viewport.offset.y,
             format_bytes(file.size)
         );
 
@@ -2227,7 +2621,7 @@ impl ApeironApp {
 
     /// Draw the data inspector panel with interactive hex view.
     fn draw_inspector(&mut self, ui: &mut egui::Ui) {
-        if self.file_data.is_none() {
+        if self.active_tab().file_data.is_none() {
             // No file loaded placeholder
             ui.centered_and_justified(|ui| {
                 ui.label(
@@ -2244,10 +2638,12 @@ impl ApeironApp {
             .inner_margin(egui::Margin::symmetric(12.0, 8.0))
             .show(ui, |ui| {
                 // Get file data for hex view
-                let file = self.file_data.as_ref().unwrap();
+                let tab = &self.tabs[self.active_tab];
+                let file = tab.file_data.as_ref().unwrap();
                 let file_size = file.size;
                 let data = Arc::clone(&file.data);
                 let file_type = file.file_type;
+                let selection_offset = tab.selection.offset;
 
                 // Header: File type and size
                 ui.horizontal(|ui| {
@@ -2281,15 +2677,13 @@ impl ApeironApp {
                 } else {
                     4
                 };
-                self.hex_view.bytes_per_row = bytes_per_row;
 
                 let row_height = 18.0;
                 let visible_rows = 15;
                 let hex_view_height = visible_rows as f32 * row_height;
-                self.hex_view.visible_rows = visible_rows;
 
                 // Calculate which rows to display, centered on selection
-                let selection_row = (self.selection.offset as usize) / bytes_per_row;
+                let selection_row = (selection_offset as usize) / bytes_per_row;
                 let half_visible = visible_rows / 2;
                 let total_rows = ((file_size as usize + bytes_per_row - 1) / bytes_per_row).max(1);
 
@@ -2304,8 +2698,13 @@ impl ApeironApp {
 
                 let end_row = (start_row + visible_rows).min(total_rows);
 
-                // Update scroll offset for outline calculation
-                self.hex_view.scroll_offset = (start_row * bytes_per_row) as u64;
+                // Update hex view state
+                {
+                    let tab = &mut self.tabs[self.active_tab];
+                    tab.hex_view.bytes_per_row = bytes_per_row;
+                    tab.hex_view.visible_rows = visible_rows;
+                    tab.hex_view.scroll_offset = (start_row * bytes_per_row) as u64;
+                }
 
                 // Hex View with proper clipping via ScrollArea
                 egui::Frame::none()
@@ -2353,7 +2752,7 @@ impl ApeironApp {
                                         {
                                             let byte_offset = row_offset + i;
                                             let is_cursor_byte =
-                                                byte_offset == self.selection.offset as usize;
+                                                byte_offset == selection_offset as usize;
 
                                             if is_cursor_byte {
                                                 egui::Frame::none().fill(Color32::YELLOW).show(
@@ -2388,7 +2787,7 @@ impl ApeironApp {
                                         {
                                             let byte_offset = row_offset + half_bytes + i;
                                             let is_cursor_byte =
-                                                byte_offset == self.selection.offset as usize;
+                                                byte_offset == selection_offset as usize;
 
                                             if is_cursor_byte {
                                                 egui::Frame::none().fill(Color32::YELLOW).show(
@@ -2428,7 +2827,7 @@ impl ApeironApp {
                                         for (i, &byte) in row_bytes.iter().enumerate() {
                                             let byte_offset = row_offset + i;
                                             let is_cursor_byte =
-                                                byte_offset == self.selection.offset as usize;
+                                                byte_offset == selection_offset as usize;
                                             let ch = if (0x20..=0x7e).contains(&byte) {
                                                 byte as char
                                             } else {
@@ -2461,6 +2860,15 @@ impl ApeironApp {
                 ui.separator();
                 ui.add_space(4.0);
 
+                // Get selection values for metrics display
+                let tab = &self.tabs[self.active_tab];
+                let selection = &tab.selection;
+                let selection_offset = selection.offset;
+                let selection_entropy = selection.entropy;
+                let selection_complexity = selection.kolmogorov_complexity;
+                let selection_ascii = selection.ascii_string.clone();
+                let wavelet_report = tab.wavelet_report.clone();
+
                 // Metrics section below hex view
                 egui::ScrollArea::vertical()
                     .auto_shrink([false, false])
@@ -2470,9 +2878,9 @@ impl ApeironApp {
                             Self::info_row(
                                 ui,
                                 "OFFSET (HEX)",
-                                &format!("0x{:08X}", self.selection.offset),
+                                &format!("0x{:08X}", selection_offset),
                             );
-                            Self::info_row(ui, "OFFSET (DEC)", &self.selection.offset.to_string());
+                            Self::info_row(ui, "OFFSET (DEC)", &selection_offset.to_string());
                         });
 
                         ui.separator();
@@ -2480,7 +2888,7 @@ impl ApeironApp {
                         // Entropy Analysis
                         Self::section(ui, "ENTROPY ANALYSIS", |ui| {
                             let available = ui.available_width();
-                            let entropy = self.selection.entropy;
+                            let entropy = selection_entropy;
                             ui.horizontal(|ui| {
                                 ui.allocate_ui_with_layout(
                                     egui::Vec2::new(available * 0.5, ui.spacing().interact_size.y),
@@ -2517,8 +2925,7 @@ impl ApeironApp {
                             );
                             ui.painter()
                                 .rect_filled(bar_rect, 3.0, Color32::from_gray(50));
-                            let fill_width =
-                                bar_rect.width() * (self.selection.entropy as f32 / 8.0);
+                            let fill_width = bar_rect.width() * (selection_entropy as f32 / 8.0);
                             let fill_rect = Rect::from_min_size(
                                 bar_rect.min,
                                 egui::Vec2::new(fill_width, bar_height),
@@ -2526,17 +2933,17 @@ impl ApeironApp {
                             ui.painter().rect_filled(
                                 fill_rect,
                                 3.0,
-                                Self::entropy_color(self.selection.entropy),
+                                Self::entropy_color(selection_entropy),
                             );
 
                             // Interpretation
-                            let interpretation = if self.selection.entropy < 1.0 {
+                            let interpretation = if selection_entropy < 1.0 {
                                 "Uniform/empty data"
-                            } else if self.selection.entropy < 3.0 {
+                            } else if selection_entropy < 3.0 {
                                 "Low entropy - text/code"
-                            } else if self.selection.entropy < 5.0 {
+                            } else if selection_entropy < 5.0 {
                                 "Medium entropy - mixed"
-                            } else if self.selection.entropy < 7.0 {
+                            } else if selection_entropy < 7.0 {
                                 "High entropy - binary"
                             } else {
                                 "Very high - encrypted/compressed"
@@ -2554,7 +2961,7 @@ impl ApeironApp {
                         // Kolmogorov Complexity
                         Self::section(ui, "KOLMOGOROV COMPLEXITY", |ui| {
                             let available = ui.available_width();
-                            let complexity = self.selection.kolmogorov_complexity;
+                            let complexity = selection_complexity;
                             ui.horizontal(|ui| {
                                 ui.allocate_ui_with_layout(
                                     egui::Vec2::new(available * 0.5, ui.spacing().interact_size.y),
@@ -2591,8 +2998,7 @@ impl ApeironApp {
                             );
                             ui.painter()
                                 .rect_filled(bar_rect, 3.0, Color32::from_gray(50));
-                            let fill_width =
-                                bar_rect.width() * self.selection.kolmogorov_complexity as f32;
+                            let fill_width = bar_rect.width() * selection_complexity as f32;
                             let fill_rect = Rect::from_min_size(
                                 bar_rect.min,
                                 egui::Vec2::new(fill_width, bar_height),
@@ -2600,17 +3006,17 @@ impl ApeironApp {
                             ui.painter().rect_filled(
                                 fill_rect,
                                 3.0,
-                                Self::complexity_color(self.selection.kolmogorov_complexity),
+                                Self::complexity_color(selection_complexity),
                             );
 
                             // Interpretation
-                            let interpretation = if self.selection.kolmogorov_complexity < 0.2 {
+                            let interpretation = if selection_complexity < 0.2 {
                                 "Highly compressible"
-                            } else if self.selection.kolmogorov_complexity < 0.4 {
+                            } else if selection_complexity < 0.4 {
                                 "Simple patterns"
-                            } else if self.selection.kolmogorov_complexity < 0.6 {
+                            } else if selection_complexity < 0.6 {
                                 "Structured data"
-                            } else if self.selection.kolmogorov_complexity < 0.8 {
+                            } else if selection_complexity < 0.8 {
                                 "Complex/compressed"
                             } else {
                                 "Random/encrypted"
@@ -2627,7 +3033,7 @@ impl ApeironApp {
 
                         // SSECS Wavelet Entropy Analysis
                         Self::section(ui, "SSECS (WAVELET ENTROPY)", |ui| {
-                            if let Some(ref report) = self.wavelet_report {
+                            if let Some(ref report) = wavelet_report {
                                 let ssecs = &report.ssecs;
                                 let available = ui.available_width();
 
@@ -2784,7 +3190,7 @@ impl ApeironApp {
                         });
 
                         // String Preview (if ASCII found)
-                        if let Some(ref ascii) = self.selection.ascii_string {
+                        if let Some(ref ascii) = selection_ascii {
                             ui.separator();
                             Self::section(ui, "STRING HINT", |ui| {
                                 egui::Frame::none()

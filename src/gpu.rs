@@ -419,14 +419,37 @@ impl GpuRenderer {
 
         self.queue.submit(std::iter::once(encoder.finish()));
 
-        // Read back the result
+        // Read back the result with timeout to avoid deadlock
         let buffer_slice = output_buffer.slice(..);
         let (tx, rx) = std::sync::mpsc::channel();
         buffer_slice.map_async(wgpu::MapMode::Read, move |result| {
-            tx.send(result).unwrap();
+            let _ = tx.send(result); // Ignore send error if receiver dropped
         });
-        self.device.poll(wgpu::Maintain::Wait);
-        rx.recv().unwrap().unwrap();
+
+        // Poll with timeout - try multiple times with short polls
+        let timeout = std::time::Duration::from_secs(5);
+        let start = std::time::Instant::now();
+        loop {
+            self.device.poll(wgpu::Maintain::Poll);
+            match rx.try_recv() {
+                Ok(Ok(())) => break,
+                Ok(Err(e)) => {
+                    eprintln!("GPU buffer mapping error: {:?}", e);
+                    return vec![0u8; (tex_width * tex_height * 4) as usize];
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => {
+                    if start.elapsed() > timeout {
+                        eprintln!("GPU readback timeout - falling back to empty texture");
+                        return vec![0u8; (tex_width * tex_height * 4) as usize];
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    eprintln!("GPU channel disconnected");
+                    return vec![0u8; (tex_width * tex_height * 4) as usize];
+                }
+            }
+        }
 
         let data = buffer_slice.get_mapped_range();
 
