@@ -1040,9 +1040,10 @@ mod tests {
     fn test_coarse_grain_basic() {
         // Test coarse-graining at scale 2
         let data = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0];
-        let coarse = super::coarse_grain(&data, 2, 1);
+        let mut coarse = vec![0.0; 10];
+        let len = super::coarse_grain_into(&data, 2, 1, &mut coarse);
         // Expected: [(1+2)/2, (3+4)/2, (5+6)/2, (7+8)/2] = [1.5, 3.5, 5.5, 7.5]
-        assert_eq!(coarse.len(), 4);
+        assert_eq!(len, 4);
         assert!((coarse[0] - 1.5).abs() < 0.01);
         assert!((coarse[1] - 3.5).abs() < 0.01);
         assert!((coarse[2] - 5.5).abs() < 0.01);
@@ -1053,9 +1054,10 @@ mod tests {
     fn test_coarse_grain_offset() {
         // Test coarse-graining at scale 2 with offset 2
         let data = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0];
-        let coarse = super::coarse_grain(&data, 2, 2);
+        let mut coarse = vec![0.0; 10];
+        let len = super::coarse_grain_into(&data, 2, 2, &mut coarse);
         // With offset 2: start at index 1, [(2+3)/2, (4+5)/2, (6+7)/2] = [2.5, 4.5, 6.5]
-        assert_eq!(coarse.len(), 3);
+        assert_eq!(len, 3);
         assert!((coarse[0] - 2.5).abs() < 0.01);
         assert!((coarse[1] - 4.5).abs() < 0.01);
         assert!((coarse[2] - 6.5).abs() < 0.01);
