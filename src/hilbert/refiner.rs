@@ -8,6 +8,11 @@
 //!
 //! The main thread can read computed values at any time without blocking,
 //! while the background thread continuously refines the data.
+//!
+//! Optimizations:
+//! - Batch entropy computation using 4-way parallel histograms
+//! - Precomputed log2 lookup table reuse from entropy module
+//! - Aligned histogram buffers for cache efficiency
 
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -15,7 +20,7 @@ use std::thread::{self, JoinHandle};
 
 use memmap2::Mmap;
 
-use crate::analysis::entropy::calculate_entropy;
+use crate::analysis::entropy::{calculate_entropy, calculate_entropy_batch};
 
 /// Window size for entropy calculation (matches ANALYSIS_WINDOW).
 const ENTROPY_WINDOW: usize = 64;
@@ -270,12 +275,13 @@ impl HilbertRefiner {
     }
 
     /// Compute fine entropy values for full precision.
+    /// Optimized with batch entropy computation for better cache utilization.
     fn compute_fine(buffer: &HilbertBuffer, data: &[u8]) {
         let total = buffer.fine_total;
         let interval = FINE_SAMPLE_INTERVAL;
 
-        // Process in batches to allow pause/cancel checks
-        const BATCH_SIZE: usize = 10_000;
+        // Larger batch size for better throughput
+        const BATCH_SIZE: usize = 16_384;
 
         let mut i = 0;
         while i < total {
@@ -293,20 +299,37 @@ impl HilbertRefiner {
                 return;
             }
 
-            // Process a batch
+            // Process a batch using optimized batch entropy
             let batch_end = (i + BATCH_SIZE).min(total);
-            for j in i..batch_end {
-                let offset = j * interval;
-                let end = (offset + ENTROPY_WINDOW).min(data.len());
+            let batch_len = batch_end - i;
 
-                let entropy = if offset < data.len() && end > offset {
-                    calculate_entropy(&data[offset..end]) as f32
-                } else {
-                    0.0
-                };
+            // Collect offsets for batch processing
+            let offsets: Vec<usize> = (i..batch_end)
+                .map(|j| j * interval)
+                .filter(|&offset| offset < data.len())
+                .collect();
 
-                // Store as atomic u32 (f32 bits)
-                buffer.fine_entropy[j].store(entropy.to_bits(), Ordering::Release);
+            if !offsets.is_empty() {
+                // Use batch entropy computation
+                let entropies = calculate_entropy_batch(data, &offsets, ENTROPY_WINDOW);
+
+                // Store results
+                for (idx, entropy) in entropies.into_iter().enumerate() {
+                    let j = i + idx;
+                    if j < batch_end {
+                        buffer.fine_entropy[j].store((entropy as f32).to_bits(), Ordering::Release);
+                    }
+                }
+
+                // Fill any remaining slots (past end of file) with 0
+                for j in (i + offsets.len())..batch_end {
+                    buffer.fine_entropy[j].store(0.0_f32.to_bits(), Ordering::Release);
+                }
+            } else {
+                // All offsets past end of file
+                for j in i..batch_end {
+                    buffer.fine_entropy[j].store(0.0_f32.to_bits(), Ordering::Release);
+                }
             }
 
             // Update progress after batch

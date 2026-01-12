@@ -42,6 +42,11 @@ fn hsv_to_rgb(h: f32, s: f32, v: f32) -> vec3<f32> {
     return rgb + vec3<f32>(m, m, m);
 }
 
+// Precomputed constants
+const COLOR_BACKGROUND: vec4<f32> = vec4<f32>(0.031, 0.031, 0.047, 1.0);
+const INV_512: f32 = 0.001953125; // 1/512
+const HUE_SCALE: f32 = 0.5859375; // 300/512
+
 @compute @workgroup_size(8, 8)
 fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
     let tex_x = global_id.x;
@@ -51,38 +56,43 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
         return;
     }
     
-    // Map texture coordinates to world coordinates
-    let scale_x = (uniforms.world_max_x - uniforms.world_min_x) / f32(uniforms.tex_width);
-    let scale_y = (uniforms.world_max_y - uniforms.world_min_y) / f32(uniforms.tex_height);
-    let world_x = uniforms.world_min_x + f32(tex_x) * scale_x;
-    let world_y = uniforms.world_min_y + f32(tex_y) * scale_y;
+    // Precompute scale factors
+    let inv_tex_width = 1.0 / f32(uniforms.tex_width);
+    let inv_tex_height = 1.0 / f32(uniforms.tex_height);
+    let scale_x = (uniforms.world_max_x - uniforms.world_min_x) * inv_tex_width;
+    let scale_y = (uniforms.world_max_y - uniforms.world_min_y) * inv_tex_height;
+    let world_x = fma(f32(tex_x), scale_x, uniforms.world_min_x);
+    let world_y = fma(f32(tex_y), scale_y, uniforms.world_min_y);
     
     // Digraph uses 256x256 world space
     let dg_x = i32(world_x);
     let dg_y = i32(world_y);
     
-    var color = vec4<f32>(0.031, 0.031, 0.047, 1.0); // Dark background
-    
-    if dg_x >= 0 && dg_x < 256 && dg_y >= 0 && dg_y < 256 {
-        let count = digraph[u32(dg_y * 256 + dg_x)];
-        
-        if count > 0u {
-            // Find max count for normalization (approximate - use file_size as proxy)
-            let max_count = max(uniforms.file_size / 256u, 1u);
-            let sqrt_max = sqrt(f32(max_count));
-            
-            // Use sqrt for better contrast distribution
-            let intensity = pow(sqrt(f32(count)) / sqrt_max, 0.6);
-            
-            // Color by byte values with full spectrum
-            let hue = f32(dg_x + dg_y) / 512.0 * 300.0;
-            let sat = 0.85 - intensity * 0.2;
-            let val = 0.15 + intensity * 0.85;
-            
-            let rgb = hsv_to_rgb(hue, sat, val);
-            color = vec4<f32>(rgb, 1.0);
-        }
+    // Early exit for out-of-bounds
+    if dg_x < 0 || dg_x >= 256 || dg_y < 0 || dg_y >= 256 {
+        textureStore(output_texture, vec2<i32>(i32(tex_x), i32(tex_y)), COLOR_BACKGROUND);
+        return;
     }
     
-    textureStore(output_texture, vec2<i32>(i32(tex_x), i32(tex_y)), color);
+    let count = digraph[u32(dg_y * 256 + dg_x)];
+    
+    if count == 0u {
+        textureStore(output_texture, vec2<i32>(i32(tex_x), i32(tex_y)), COLOR_BACKGROUND);
+        return;
+    }
+    
+    // Precompute normalization factor
+    let max_count = max(uniforms.file_size >> 8u, 1u); // /256 via shift
+    let inv_sqrt_max = 1.0 / sqrt(f32(max_count));
+    
+    // Use sqrt for better contrast distribution
+    let intensity = pow(sqrt(f32(count)) * inv_sqrt_max, 0.6);
+    
+    // Color by byte values with full spectrum - optimized calculation
+    let hue = f32(dg_x + dg_y) * HUE_SCALE;
+    let sat = fma(-0.2, intensity, 0.85);
+    let val = fma(0.85, intensity, 0.15);
+    
+    let rgb = hsv_to_rgb(hue, sat, val);
+    textureStore(output_texture, vec2<i32>(i32(tex_x), i32(tex_y)), vec4<f32>(rgb, 1.0));
 }

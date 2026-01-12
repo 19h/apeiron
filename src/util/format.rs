@@ -49,9 +49,9 @@ pub fn hex_dump(data: &[u8], start_offset: usize) -> String {
         // Address
         let _ = write!(output, "{:08X}  ", start_offset + offset);
 
-        // Hex bytes
+        // Hex bytes (lowercase for traditional hex dump style)
         for (idx, &byte) in chunk.iter().enumerate() {
-            let _ = write!(output, "{byte:02X} ");
+            let _ = write!(output, "{byte:02x} ");
             if idx == 7 {
                 output.push(' ');
             }

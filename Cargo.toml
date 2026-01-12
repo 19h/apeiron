@@ -16,6 +16,8 @@ pollster = "0.4"
 bytemuck = { version = "1.14", features = ["derive"] }
 flate2 = "1.0"
 memmap2 = "0.9"
+# Portable SIMD for high-performance algorithms
+wide = "0.7"
 
 # Use xdg-portal on Linux by default, but allow fallback to gtk3
 [target.'cfg(not(target_os = "linux"))'.dependencies]
