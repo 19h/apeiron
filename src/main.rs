@@ -17,10 +17,10 @@ use eframe::egui::{self, Color32, ColorImage, Pos2, Rect, RichText, Sense, Textu
 use rayon::prelude::*;
 
 use analysis::{
-    calculate_entropy, calculate_kolmogorov_complexity, extract_ascii, format_bytes, hex_dump,
+    calculate_entropy, calculate_kolmogorov_complexity, extract_ascii, format_bytes,
     identify_file_type, ByteAnalysis, KolmogorovAnalysis, ANALYSIS_WINDOW,
 };
-use hilbert::{calculate_dimension, xy2d};
+use hilbert::{calculate_dimension, d2xy, xy2d};
 
 // =============================================================================
 // Application State
@@ -115,6 +115,8 @@ struct NeuroCoreApp {
     viewport: Viewport,
     /// Currently selected/hovered byte information.
     selection: Selection,
+    /// Hex view state.
+    hex_view: HexView,
     /// Cached texture for the entropy visualization.
     texture: Option<TextureHandle>,
     /// Texture generation parameters (to detect when regeneration is needed).
@@ -191,13 +193,125 @@ struct Selection {
     entropy: f64,
     /// Kolmogorov complexity approximation (compression ratio) of the selected window.
     kolmogorov_complexity: f64,
-    /// Hex dump of the selected window.
-    hex_dump: String,
-    /// Extracted ASCII string (if any).
+    /// Extracted ASCII string from the selected window (if any).
     ascii_string: Option<String>,
-    /// Whether cursor is over valid data.
-    #[allow(dead_code)]
-    is_valid: bool,
+}
+
+/// Hex view state for the interactive hex panel.
+struct HexView {
+    /// Starting byte offset of the visible hex view.
+    scroll_offset: u64,
+    /// Number of visible rows in the hex view.
+    visible_rows: usize,
+    /// Bytes per row (typically 16).
+    bytes_per_row: usize,
+    /// Currently hovered row in hex view (for highlighting).
+    hovered_row: Option<usize>,
+    /// Cached outline data for the visible region.
+    outline_cache: Option<OutlineCache>,
+}
+
+/// Cached Hilbert curve outline for the visible hex region.
+struct OutlineCache {
+    /// The range this cache was computed for.
+    start_offset: u64,
+    end_offset: u64,
+    /// Dimension used to compute the cache.
+    dimension: u64,
+    /// Precomputed world coordinates (x, y) for the outline.
+    points: Vec<(f32, f32)>,
+    /// Bounding box in world coordinates.
+    bbox: (f32, f32, f32, f32), // min_x, min_y, max_x, max_y
+}
+
+impl Default for HexView {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl HexView {
+    fn new() -> Self {
+        Self {
+            scroll_offset: 0,
+            visible_rows: 32,
+            bytes_per_row: 16,
+            hovered_row: None,
+            outline_cache: None,
+        }
+    }
+
+    /// Get the byte range currently visible in the hex view.
+    fn visible_range(&self) -> (u64, u64) {
+        let start = self.scroll_offset;
+        let end = start + (self.visible_rows * self.bytes_per_row) as u64;
+        (start, end)
+    }
+
+    /// Scroll to center the given offset in the hex view.
+    fn scroll_to(&mut self, offset: u64, file_size: u64) {
+        let row = offset / self.bytes_per_row as u64;
+        let center_row = self.visible_rows as u64 / 2;
+        let target_row = row.saturating_sub(center_row);
+        let max_row = file_size.saturating_sub(1) / self.bytes_per_row as u64;
+        let max_start_row = max_row.saturating_sub(self.visible_rows as u64 - 1);
+        self.scroll_offset = target_row.min(max_start_row) * self.bytes_per_row as u64;
+    }
+
+    /// Check if the outline cache is valid for the current visible range.
+    fn is_cache_valid(&self, start: u64, end: u64, dimension: u64) -> bool {
+        if let Some(cache) = &self.outline_cache {
+            cache.start_offset == start && cache.end_offset == end && cache.dimension == dimension
+        } else {
+            false
+        }
+    }
+
+    /// Update the outline cache for the given range.
+    fn update_outline_cache(&mut self, start: u64, end: u64, dimension: u64) {
+        // Sample at reasonable intervals - fewer points for performance
+        let range_size = end.saturating_sub(start);
+        let sample_interval = (range_size / 200).max(1) as usize;
+
+        let mut points = Vec::with_capacity(200);
+        let mut min_x = f32::MAX;
+        let mut min_y = f32::MAX;
+        let mut max_x = f32::MIN;
+        let mut max_y = f32::MIN;
+
+        let mut offset = start;
+        while offset < end {
+            let (x, y) = d2xy(dimension, offset);
+            let fx = x as f32 + 0.5;
+            let fy = y as f32 + 0.5;
+            points.push((fx, fy));
+
+            min_x = min_x.min(x as f32);
+            min_y = min_y.min(y as f32);
+            max_x = max_x.max(x as f32 + 1.0);
+            max_y = max_y.max(y as f32 + 1.0);
+
+            offset += sample_interval as u64;
+        }
+
+        // Add final point
+        if end > start {
+            let (x, y) = d2xy(dimension, end.saturating_sub(1));
+            points.push((x as f32 + 0.5, y as f32 + 0.5));
+            min_x = min_x.min(x as f32);
+            min_y = min_y.min(y as f32);
+            max_x = max_x.max(x as f32 + 1.0);
+            max_y = max_y.max(y as f32 + 1.0);
+        }
+
+        self.outline_cache = Some(OutlineCache {
+            start_offset: start,
+            end_offset: end,
+            dimension,
+            points,
+            bbox: (min_x, min_y, max_x, max_y),
+        });
+    }
 }
 
 // =============================================================================
@@ -210,6 +324,7 @@ impl Default for NeuroCoreApp {
             file_data: None,
             viewport: Viewport::default(),
             selection: Selection::default(),
+            hex_view: HexView::new(),
             texture: None,
             texture_params: None,
             viz_mode: VisualizationMode::default(),
@@ -317,8 +432,13 @@ impl NeuroCoreApp {
         complexity_map.get(index).copied().unwrap_or(0.0)
     }
 
-    /// Update the selection based on a byte offset.
+    /// Update the selection based on a byte offset and optionally sync hex view.
     fn update_selection(&mut self, offset: u64) {
+        self.update_selection_with_scroll(offset, true);
+    }
+
+    /// Update the selection, optionally scrolling the hex view.
+    fn update_selection_with_scroll(&mut self, offset: u64, scroll_hex_view: bool) {
         if let Some(file) = &self.file_data {
             if offset < file.size {
                 let start = offset as usize;
@@ -334,10 +454,13 @@ impl NeuroCoreApp {
                     offset,
                     entropy: calculate_entropy(chunk),
                     kolmogorov_complexity: calculate_kolmogorov_complexity(complexity_chunk),
-                    hex_dump: hex_dump(chunk, start),
                     ascii_string: extract_ascii(chunk),
-                    is_valid: true,
                 };
+
+                // Scroll hex view to show the selection
+                if scroll_hex_view {
+                    self.hex_view.scroll_to(offset, file.size);
+                }
             }
         }
     }
@@ -1016,10 +1139,11 @@ impl eframe::App for NeuroCoreApp {
             });
         });
 
-        // Right panel: Data Inspector
+        // Right panel: Data Inspector (responsive width)
         egui::SidePanel::right("inspector")
-            .min_width(300.0)
-            .max_width(500.0)
+            .min_width(280.0)
+            .default_width(280.0)
+            .max_width(700.0)
             .show(ctx, |ui| {
                 self.draw_inspector(ui);
             });
@@ -1143,10 +1267,94 @@ impl NeuroCoreApp {
                     Color32::WHITE,
                 );
             }
+
+            // Draw hex view region outline (only for Hilbert/Kolmogorov modes)
+            if matches!(
+                self.viz_mode,
+                VisualizationMode::Hilbert | VisualizationMode::KolmogorovComplexity
+            ) {
+                self.draw_hex_region_outline(ui, available_rect);
+            }
         }
 
         // Draw HUD overlay
         self.draw_hud(ui, available_rect);
+    }
+
+    /// Draw an outline around the hex view's visible region on the Hilbert curve.
+    /// Uses cached outline data for performance.
+    fn draw_hex_region_outline(&mut self, ui: &mut egui::Ui, view_rect: Rect) {
+        let Some(file) = &self.file_data else {
+            return;
+        };
+
+        let (start_offset, end_offset) = self.hex_view.visible_range();
+        let end_offset = end_offset.min(file.size);
+
+        if start_offset >= file.size {
+            return;
+        }
+
+        let dimension = file.dimension;
+
+        // Update cache if needed
+        if !self
+            .hex_view
+            .is_cache_valid(start_offset, end_offset, dimension)
+        {
+            self.hex_view
+                .update_outline_cache(start_offset, end_offset, dimension);
+        }
+
+        // Get cached data
+        let Some(cache) = &self.hex_view.outline_cache else {
+            return;
+        };
+
+        // Convert world coordinates to screen coordinates
+        let world_to_screen = |world_x: f32, world_y: f32| -> Pos2 {
+            let screen_x =
+                (world_x - self.viewport.offset.x) * self.viewport.zoom + view_rect.min.x;
+            let screen_y =
+                (world_y - self.viewport.offset.y) * self.viewport.zoom + view_rect.min.y;
+            Pos2::new(screen_x, screen_y)
+        };
+
+        // Convert cached world coordinates to screen coordinates
+        let screen_points: Vec<Pos2> = cache
+            .points
+            .iter()
+            .map(|&(x, y)| world_to_screen(x, y))
+            .collect();
+
+        // Draw the outline as a polyline with a glow effect
+        if screen_points.len() >= 2 {
+            // Draw outer glow
+            ui.painter().add(egui::Shape::line(
+                screen_points.clone(),
+                egui::Stroke::new(4.0, Color32::from_rgba_unmultiplied(255, 200, 0, 80)),
+            ));
+            // Draw main line
+            ui.painter().add(egui::Shape::line(
+                screen_points,
+                egui::Stroke::new(2.0, Color32::from_rgb(255, 220, 50)),
+            ));
+        }
+
+        // Draw bounding box from cached data
+        let (min_x, min_y, max_x, max_y) = cache.bbox;
+        if min_x < f32::MAX {
+            let box_min = world_to_screen(min_x, min_y);
+            let box_max = world_to_screen(max_x, max_y);
+            let box_rect = Rect::from_min_max(box_min, box_max);
+
+            // Draw bounding box
+            ui.painter().rect_stroke(
+                box_rect,
+                0.0,
+                egui::Stroke::new(1.5, Color32::from_rgba_unmultiplied(255, 220, 50, 150)),
+            );
+        }
     }
 
     /// Draw the empty state prompt.
@@ -1230,197 +1438,430 @@ impl NeuroCoreApp {
         );
     }
 
-    /// Draw the data inspector panel.
-    fn draw_inspector(&self, ui: &mut egui::Ui) {
-        // Header
-        ui.add_space(8.0);
-        ui.horizontal(|ui| {
-            ui.add_space(8.0);
-            ui.label(
-                RichText::new("DATA INSPECTOR")
-                    .monospace()
-                    .strong()
-                    .size(14.0),
-            );
-        });
-        ui.add_space(8.0);
-        ui.separator();
-
-        egui::ScrollArea::vertical().show(ui, |ui| {
-            ui.add_space(12.0);
-
-            // File Info Section
-            Self::section(ui, "FILE INFO", |ui| {
-                if let Some(file) = &self.file_data {
-                    Self::info_row(ui, "TYPE", file.file_type);
-                    Self::info_row(ui, "SIZE", &format_bytes(file.size));
-                } else {
-                    ui.label(
-                        RichText::new("NO FILE LOADED")
-                            .monospace()
-                            .color(Color32::GRAY),
-                    );
-                }
+    /// Draw the data inspector panel with interactive hex view.
+    fn draw_inspector(&mut self, ui: &mut egui::Ui) {
+        if self.file_data.is_none() {
+            // No file loaded placeholder
+            ui.centered_and_justified(|ui| {
+                ui.label(
+                    RichText::new("Drop a file to inspect")
+                        .monospace()
+                        .color(Color32::DARK_GRAY),
+                );
             });
+            return;
+        }
 
-            ui.separator();
+        // Main content with proper margins
+        egui::Frame::none()
+            .inner_margin(egui::Margin::symmetric(12.0, 8.0))
+            .show(ui, |ui| {
+                // Get file data for hex view
+                let file = self.file_data.as_ref().unwrap();
+                let file_size = file.size;
+                let data = Arc::clone(&file.data);
+                let file_type = file.file_type;
 
-            if self.file_data.is_some() {
-                // Cursor Location Section
-                Self::section(ui, "CURSOR LOCATION", |ui| {
-                    Self::info_row(
-                        ui,
-                        "OFFSET (HEX)",
-                        &format!("0x{:08X}", self.selection.offset),
-                    );
-                    Self::info_row(ui, "OFFSET (DEC)", &self.selection.offset.to_string());
-                });
-
-                ui.separator();
-
-                // Entropy Analysis Section
-                Self::section(ui, "ENTROPY ANALYSIS", |ui| {
-                    ui.horizontal(|ui| {
-                        ui.label(
-                            RichText::new("ENTROPY")
-                                .monospace()
-                                .color(Color32::GRAY)
-                                .small(),
-                        );
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            let entropy_color = Self::entropy_color(self.selection.entropy);
-                            ui.label(
-                                RichText::new(format!("{:.4}", self.selection.entropy))
-                                    .monospace()
-                                    .strong()
-                                    .color(entropy_color),
-                            );
-                        });
-                    });
-
-                    // Entropy bar
-                    let bar_height = 6.0;
-                    let (bar_rect, _) = ui.allocate_exact_size(
-                        Vec2::new(ui.available_width(), bar_height),
-                        Sense::hover(),
-                    );
-
-                    // Background
-                    ui.painter()
-                        .rect_filled(bar_rect, 3.0, Color32::from_gray(50));
-
-                    // Filled portion (entropy ranges 0-8)
-                    let fill_width = bar_rect.width() * (self.selection.entropy as f32 / 8.0);
-                    let fill_rect =
-                        Rect::from_min_size(bar_rect.min, Vec2::new(fill_width, bar_height));
-                    ui.painter().rect_filled(
-                        fill_rect,
-                        3.0,
-                        Self::entropy_color(self.selection.entropy),
-                    );
-                });
-
-                ui.separator();
-
-                // Kolmogorov Complexity Section
-                Self::section(ui, "KOLMOGOROV COMPLEXITY", |ui| {
-                    ui.horizontal(|ui| {
-                        ui.label(
-                            RichText::new("COMPLEXITY")
-                                .monospace()
-                                .color(Color32::GRAY)
-                                .small(),
-                        );
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            let complexity_color =
-                                Self::complexity_color(self.selection.kolmogorov_complexity);
-                            ui.label(
-                                RichText::new(format!(
-                                    "{:.2}%",
-                                    self.selection.kolmogorov_complexity * 100.0
-                                ))
-                                .monospace()
-                                .strong()
-                                .color(complexity_color),
-                            );
-                        });
-                    });
-
-                    // Complexity bar
-                    let bar_height = 6.0;
-                    let (bar_rect, _) = ui.allocate_exact_size(
-                        Vec2::new(ui.available_width(), bar_height),
-                        Sense::hover(),
-                    );
-
-                    // Background
-                    ui.painter()
-                        .rect_filled(bar_rect, 3.0, Color32::from_gray(50));
-
-                    // Filled portion (complexity ranges 0-1)
-                    let fill_width = bar_rect.width() * self.selection.kolmogorov_complexity as f32;
-                    let fill_rect =
-                        Rect::from_min_size(bar_rect.min, Vec2::new(fill_width, bar_height));
-                    ui.painter().rect_filled(
-                        fill_rect,
-                        3.0,
-                        Self::complexity_color(self.selection.kolmogorov_complexity),
-                    );
-
-                    // Label interpretation
-                    let interpretation = if self.selection.kolmogorov_complexity < 0.2 {
-                        "Highly compressible"
-                    } else if self.selection.kolmogorov_complexity < 0.4 {
-                        "Simple patterns"
-                    } else if self.selection.kolmogorov_complexity < 0.6 {
-                        "Structured data"
-                    } else if self.selection.kolmogorov_complexity < 0.8 {
-                        "Complex/compressed"
-                    } else {
-                        "Random/encrypted"
-                    };
+                // Header: File type and size
+                ui.horizontal(|ui| {
                     ui.label(
-                        RichText::new(interpretation)
+                        RichText::new(file_type)
                             .monospace()
-                            .small()
+                            .strong()
+                            .color(Color32::LIGHT_BLUE),
+                    );
+                    ui.label(
+                        RichText::new(format!(" - {}", format_bytes(file_size)))
+                            .monospace()
                             .color(Color32::GRAY),
                     );
                 });
-
+                ui.add_space(4.0);
                 ui.separator();
+                ui.add_space(4.0);
 
-                // Hex Preview Section
-                Self::section(ui, "HEX PREVIEW (64 Bytes)", |ui| {
-                    egui::Frame::none()
-                        .fill(Color32::from_rgba_unmultiplied(0, 0, 0, 150))
-                        .rounding(6.0)
-                        .inner_margin(8.0)
-                        .show(ui, |ui| {
+                // Hex View - dynamically calculate bytes per row based on width
+                let panel_width = ui.available_width();
+                // Calculate bytes_per_row based on available width
+                // Approximate: offset(70) + gap(8) + hex(N*22) + gap(4) + hex(N*22) + gap(8) + ascii(N*8)
+                // Simplified: 90 + N*30, so N = (width - 90) / 30
+                let bytes_per_row = if panel_width >= 500.0 {
+                    16
+                } else if panel_width >= 380.0 {
+                    12
+                } else if panel_width >= 260.0 {
+                    8
+                } else {
+                    4
+                };
+                self.hex_view.bytes_per_row = bytes_per_row;
+
+                let row_height = 18.0;
+                let visible_rows = 15;
+                let hex_view_height = visible_rows as f32 * row_height;
+                self.hex_view.visible_rows = visible_rows;
+
+                // Calculate which rows to display, centered on selection
+                let selection_row = (self.selection.offset as usize) / bytes_per_row;
+                let half_visible = visible_rows / 2;
+                let total_rows = ((file_size as usize + bytes_per_row - 1) / bytes_per_row).max(1);
+
+                // Calculate start row, keeping selection centered
+                let start_row = if selection_row < half_visible {
+                    0
+                } else if selection_row + half_visible >= total_rows {
+                    total_rows.saturating_sub(visible_rows)
+                } else {
+                    selection_row - half_visible
+                };
+
+                let end_row = (start_row + visible_rows).min(total_rows);
+
+                // Update scroll offset for outline calculation
+                self.hex_view.scroll_offset = (start_row * bytes_per_row) as u64;
+
+                // Hex View with proper clipping via ScrollArea
+                egui::Frame::none()
+                    .fill(Color32::from_rgb(15, 15, 20))
+                    .rounding(4.0)
+                    .inner_margin(8.0)
+                    .show(ui, |ui| {
+                        egui::ScrollArea::vertical()
+                            .max_height(hex_view_height)
+                            .auto_shrink([false, false])
+                            .show(ui, |ui| {
+                                let half_bytes = bytes_per_row / 2;
+
+                                // Render only the visible rows
+                                for row_idx in start_row..end_row {
+                                    let row_offset = row_idx * bytes_per_row;
+                                    if row_offset >= file_size as usize {
+                                        break;
+                                    }
+
+                                    let row_end =
+                                        (row_offset + bytes_per_row).min(file_size as usize);
+                                    let row_bytes = &data[row_offset..row_end];
+                                    let is_selected_row = row_idx == selection_row;
+
+                                    ui.horizontal(|ui| {
+                                        // Offset column
+                                        let offset_color = if is_selected_row {
+                                            Color32::YELLOW
+                                        } else {
+                                            Color32::from_rgb(100, 100, 180)
+                                        };
+                                        ui.label(
+                                            RichText::new(format!("{:08x}", row_offset))
+                                                .monospace()
+                                                .size(11.0)
+                                                .color(offset_color),
+                                        );
+
+                                        ui.add_space(6.0);
+
+                                        // Hex bytes - first half
+                                        for (i, &byte) in
+                                            row_bytes.iter().take(half_bytes).enumerate()
+                                        {
+                                            let byte_offset = row_offset + i;
+                                            let is_cursor_byte =
+                                                byte_offset == self.selection.offset as usize;
+
+                                            if is_cursor_byte {
+                                                egui::Frame::none().fill(Color32::YELLOW).show(
+                                                    ui,
+                                                    |ui| {
+                                                        ui.label(
+                                                            RichText::new(format!("{:02x}", byte))
+                                                                .monospace()
+                                                                .size(11.0)
+                                                                .color(Color32::BLACK),
+                                                        );
+                                                    },
+                                                );
+                                            } else {
+                                                ui.label(
+                                                    RichText::new(format!("{:02x}", byte))
+                                                        .monospace()
+                                                        .size(11.0)
+                                                        .color(Self::byte_color(byte)),
+                                                );
+                                            }
+                                        }
+
+                                        ui.add_space(4.0);
+
+                                        // Hex bytes - second half
+                                        for (i, &byte) in row_bytes
+                                            .iter()
+                                            .skip(half_bytes)
+                                            .take(half_bytes)
+                                            .enumerate()
+                                        {
+                                            let byte_offset = row_offset + half_bytes + i;
+                                            let is_cursor_byte =
+                                                byte_offset == self.selection.offset as usize;
+
+                                            if is_cursor_byte {
+                                                egui::Frame::none().fill(Color32::YELLOW).show(
+                                                    ui,
+                                                    |ui| {
+                                                        ui.label(
+                                                            RichText::new(format!("{:02x}", byte))
+                                                                .monospace()
+                                                                .size(11.0)
+                                                                .color(Color32::BLACK),
+                                                        );
+                                                    },
+                                                );
+                                            } else {
+                                                ui.label(
+                                                    RichText::new(format!("{:02x}", byte))
+                                                        .monospace()
+                                                        .size(11.0)
+                                                        .color(Self::byte_color(byte)),
+                                                );
+                                            }
+                                        }
+
+                                        // Pad if row is incomplete
+                                        if row_bytes.len() < bytes_per_row {
+                                            let missing = bytes_per_row - row_bytes.len();
+                                            ui.label(
+                                                RichText::new("   ".repeat(missing))
+                                                    .monospace()
+                                                    .size(11.0),
+                                            );
+                                        }
+
+                                        ui.add_space(8.0);
+
+                                        // ASCII column
+                                        for (i, &byte) in row_bytes.iter().enumerate() {
+                                            let byte_offset = row_offset + i;
+                                            let is_cursor_byte =
+                                                byte_offset == self.selection.offset as usize;
+                                            let ch = if (0x20..=0x7e).contains(&byte) {
+                                                byte as char
+                                            } else {
+                                                '.'
+                                            };
+
+                                            if is_cursor_byte {
+                                                ui.label(
+                                                    RichText::new(ch.to_string())
+                                                        .monospace()
+                                                        .size(11.0)
+                                                        .color(Color32::BLACK)
+                                                        .background_color(Color32::YELLOW),
+                                                );
+                                            } else {
+                                                ui.label(
+                                                    RichText::new(ch.to_string())
+                                                        .monospace()
+                                                        .size(11.0)
+                                                        .color(Color32::from_rgb(80, 200, 80)),
+                                                );
+                                            }
+                                        }
+                                    });
+                                }
+                            });
+                    });
+
+                ui.add_space(8.0);
+                ui.separator();
+                ui.add_space(4.0);
+
+                // Metrics section below hex view
+                egui::ScrollArea::vertical()
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        // Cursor Location
+                        Self::section(ui, "CURSOR LOCATION", |ui| {
+                            Self::info_row(
+                                ui,
+                                "OFFSET (HEX)",
+                                &format!("0x{:08X}", self.selection.offset),
+                            );
+                            Self::info_row(ui, "OFFSET (DEC)", &self.selection.offset.to_string());
+                        });
+
+                        ui.separator();
+
+                        // Entropy Analysis
+                        Self::section(ui, "ENTROPY ANALYSIS", |ui| {
+                            let available = ui.available_width();
+                            let entropy = self.selection.entropy;
+                            ui.horizontal(|ui| {
+                                ui.allocate_ui_with_layout(
+                                    egui::Vec2::new(available * 0.5, ui.spacing().interact_size.y),
+                                    egui::Layout::left_to_right(egui::Align::Center),
+                                    |ui| {
+                                        ui.label(
+                                            RichText::new("ENTROPY")
+                                                .monospace()
+                                                .color(Color32::GRAY)
+                                                .small(),
+                                        );
+                                    },
+                                );
+                                ui.allocate_ui_with_layout(
+                                    egui::Vec2::new(available * 0.5, ui.spacing().interact_size.y),
+                                    egui::Layout::right_to_left(egui::Align::Center),
+                                    |ui| {
+                                        let entropy_color = Self::entropy_color(entropy);
+                                        ui.label(
+                                            RichText::new(format!("{:.4}", entropy))
+                                                .monospace()
+                                                .strong()
+                                                .color(entropy_color),
+                                        );
+                                    },
+                                );
+                            });
+
+                            // Entropy bar
+                            let bar_height = 6.0;
+                            let (bar_rect, _) = ui.allocate_exact_size(
+                                egui::Vec2::new(ui.available_width(), bar_height),
+                                Sense::hover(),
+                            );
+                            ui.painter()
+                                .rect_filled(bar_rect, 3.0, Color32::from_gray(50));
+                            let fill_width =
+                                bar_rect.width() * (self.selection.entropy as f32 / 8.0);
+                            let fill_rect = Rect::from_min_size(
+                                bar_rect.min,
+                                egui::Vec2::new(fill_width, bar_height),
+                            );
+                            ui.painter().rect_filled(
+                                fill_rect,
+                                3.0,
+                                Self::entropy_color(self.selection.entropy),
+                            );
+
+                            // Interpretation
+                            let interpretation = if self.selection.entropy < 1.0 {
+                                "Uniform/empty data"
+                            } else if self.selection.entropy < 3.0 {
+                                "Low entropy - text/code"
+                            } else if self.selection.entropy < 5.0 {
+                                "Medium entropy - mixed"
+                            } else if self.selection.entropy < 7.0 {
+                                "High entropy - binary"
+                            } else {
+                                "Very high - encrypted/compressed"
+                            };
                             ui.label(
-                                RichText::new(&self.selection.hex_dump)
+                                RichText::new(interpretation)
                                     .monospace()
-                                    .size(10.0)
-                                    .color(Color32::from_rgb(100, 255, 100)),
+                                    .small()
+                                    .color(Color32::GRAY),
                             );
                         });
-                });
 
-                // String Preview Section (if available)
-                if let Some(ascii) = &self.selection.ascii_string {
-                    ui.separator();
-                    Self::section(ui, "STRING PREVIEW", |ui| {
-                        ui.label(
-                            RichText::new(ascii)
-                                .monospace()
-                                .size(12.0)
-                                .color(Color32::YELLOW),
-                        );
+                        ui.separator();
+
+                        // Kolmogorov Complexity
+                        Self::section(ui, "KOLMOGOROV COMPLEXITY", |ui| {
+                            let available = ui.available_width();
+                            let complexity = self.selection.kolmogorov_complexity;
+                            ui.horizontal(|ui| {
+                                ui.allocate_ui_with_layout(
+                                    egui::Vec2::new(available * 0.5, ui.spacing().interact_size.y),
+                                    egui::Layout::left_to_right(egui::Align::Center),
+                                    |ui| {
+                                        ui.label(
+                                            RichText::new("COMPLEXITY")
+                                                .monospace()
+                                                .color(Color32::GRAY)
+                                                .small(),
+                                        );
+                                    },
+                                );
+                                ui.allocate_ui_with_layout(
+                                    egui::Vec2::new(available * 0.5, ui.spacing().interact_size.y),
+                                    egui::Layout::right_to_left(egui::Align::Center),
+                                    |ui| {
+                                        let complexity_color = Self::complexity_color(complexity);
+                                        ui.label(
+                                            RichText::new(format!("{:.2}%", complexity * 100.0))
+                                                .monospace()
+                                                .strong()
+                                                .color(complexity_color),
+                                        );
+                                    },
+                                );
+                            });
+
+                            // Complexity bar
+                            let bar_height = 6.0;
+                            let (bar_rect, _) = ui.allocate_exact_size(
+                                egui::Vec2::new(ui.available_width(), bar_height),
+                                Sense::hover(),
+                            );
+                            ui.painter()
+                                .rect_filled(bar_rect, 3.0, Color32::from_gray(50));
+                            let fill_width =
+                                bar_rect.width() * self.selection.kolmogorov_complexity as f32;
+                            let fill_rect = Rect::from_min_size(
+                                bar_rect.min,
+                                egui::Vec2::new(fill_width, bar_height),
+                            );
+                            ui.painter().rect_filled(
+                                fill_rect,
+                                3.0,
+                                Self::complexity_color(self.selection.kolmogorov_complexity),
+                            );
+
+                            // Interpretation
+                            let interpretation = if self.selection.kolmogorov_complexity < 0.2 {
+                                "Highly compressible"
+                            } else if self.selection.kolmogorov_complexity < 0.4 {
+                                "Simple patterns"
+                            } else if self.selection.kolmogorov_complexity < 0.6 {
+                                "Structured data"
+                            } else if self.selection.kolmogorov_complexity < 0.8 {
+                                "Complex/compressed"
+                            } else {
+                                "Random/encrypted"
+                            };
+                            ui.label(
+                                RichText::new(interpretation)
+                                    .monospace()
+                                    .small()
+                                    .color(Color32::GRAY),
+                            );
+                        });
+
+                        // String Preview (if ASCII found)
+                        if let Some(ref ascii) = self.selection.ascii_string {
+                            ui.separator();
+                            Self::section(ui, "STRING HINT", |ui| {
+                                egui::Frame::none()
+                                    .fill(Color32::from_rgba_unmultiplied(0, 0, 0, 100))
+                                    .rounding(4.0)
+                                    .inner_margin(6.0)
+                                    .show(ui, |ui| {
+                                        // Truncate long strings for display
+                                        let display_str = if ascii.len() > 64 {
+                                            format!("{}...", &ascii[..64])
+                                        } else {
+                                            ascii.clone()
+                                        };
+                                        ui.label(
+                                            RichText::new(display_str)
+                                                .monospace()
+                                                .size(11.0)
+                                                .color(Color32::YELLOW),
+                                        );
+                                    });
+                            });
+                        }
                     });
-                }
-            }
-
-            ui.add_space(20.0);
-        });
+            });
     }
 
     /// Draw a section with a title.
@@ -1436,22 +1877,48 @@ impl NeuroCoreApp {
             ui.add_space(8.0);
             content(ui);
         });
-        ui.add_space(12.0);
+        ui.add_space(8.0);
     }
 
     /// Draw an info row with label and value.
     fn info_row(ui: &mut egui::Ui, label: &str, value: &str) {
+        let available = ui.available_width();
         ui.horizontal(|ui| {
-            ui.label(
-                RichText::new(label)
-                    .monospace()
-                    .small()
-                    .color(Color32::GRAY),
+            ui.allocate_ui_with_layout(
+                egui::Vec2::new(available * 0.5, ui.spacing().interact_size.y),
+                egui::Layout::left_to_right(egui::Align::Center),
+                |ui| {
+                    ui.label(
+                        RichText::new(label)
+                            .monospace()
+                            .small()
+                            .color(Color32::GRAY),
+                    );
+                },
             );
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                ui.label(RichText::new(value).monospace());
-            });
+            ui.allocate_ui_with_layout(
+                egui::Vec2::new(available * 0.5, ui.spacing().interact_size.y),
+                egui::Layout::right_to_left(egui::Align::Center),
+                |ui| {
+                    ui.label(RichText::new(value).monospace().color(Color32::WHITE));
+                },
+            );
         });
+    }
+
+    /// Get color for a byte value based on its characteristics.
+    fn byte_color(byte: u8) -> Color32 {
+        if byte == 0 {
+            Color32::from_rgb(60, 60, 80) // Null - dark blue-gray
+        } else if (0x20..=0x7e).contains(&byte) {
+            Color32::from_rgb(180, 180, 220) // Printable ASCII - light
+        } else if byte == 0xff {
+            Color32::from_rgb(255, 100, 100) // 0xFF - red
+        } else if byte > 0x7f {
+            Color32::from_rgb(255, 180, 100) // High bytes - orange
+        } else {
+            Color32::from_rgb(100, 180, 255) // Control chars - blue
+        }
     }
 
     /// Get color for entropy value.

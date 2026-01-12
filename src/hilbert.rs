@@ -80,7 +80,7 @@ pub fn d2xy(n: u64, d: u64) -> (u64, u64) {
 /// The dimension N is chosen such that N*N >= file_size and N is a power of 2.
 pub fn calculate_dimension(file_size: u64) -> u64 {
     if file_size == 0 {
-        return 4096;
+        return 64;
     }
 
     let side = (file_size as f64).sqrt();
@@ -90,8 +90,8 @@ pub fn calculate_dimension(file_size: u64) -> u64 {
         n *= 2;
     }
 
-    // Ensure minimum size for reasonable visualization
-    n.max(4096)
+    // Minimum 64 for very small files, no maximum - scale with file size
+    n.max(64)
 }
 
 #[cfg(test)]

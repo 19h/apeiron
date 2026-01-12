@@ -119,6 +119,7 @@ impl KolmogorovAnalysis {
 /// Format data as a hex dump string.
 ///
 /// Format: `XXXXXXXX  XX XX XX XX XX XX XX XX  XX XX XX XX XX XX XX XX  |................|`
+#[allow(dead_code)]
 pub fn hex_dump(data: &[u8], start_offset: usize) -> String {
     const BYTES_PER_LINE: usize = 16;
 
@@ -226,6 +227,7 @@ pub fn identify_file_type(data: &[u8]) -> &'static str {
 }
 
 /// Extract the first printable ASCII string (length > 4) from data.
+#[allow(dead_code)]
 pub fn extract_ascii(data: &[u8]) -> Option<String> {
     let mut current = String::new();
 
