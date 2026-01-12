@@ -198,84 +198,179 @@ pub struct JSDAnalysis {
 }
 
 // =============================================================================
-// Refined Composite Multi-Scale Entropy (RCMSE)
+// Refined Composite Multi-Scale Entropy (RCMSE) - Optimized Implementation
 // =============================================================================
+
+use rayon::prelude::*;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Default parameters for RCMSE calculation.
 pub const RCMSE_EMBEDDING_DIM: usize = 2; // m parameter
 pub const RCMSE_TOLERANCE_FACTOR: f64 = 0.15; // r = 0.15 * SD
 pub const RCMSE_MAX_SCALE: usize = 20; // Maximum scale factor τ
 
-/// Coarse-grain a time series at scale τ with offset k.
-///
-/// Creates a downsampled series by averaging non-overlapping windows of size τ,
-/// starting at offset k (1 ≤ k ≤ τ).
-///
-/// Formula: y_{k,j}^(τ) = (1/τ) × Σ x_i for i from (j-1)τ+k to jτ+k-1
-fn coarse_grain(data: &[f64], scale: usize, offset: usize) -> Vec<f64> {
+/// Coarse-grain a time series at scale τ with offset k, writing into a pre-allocated buffer.
+/// Returns the number of points written.
+#[inline]
+fn coarse_grain_into(data: &[f64], scale: usize, offset: usize, out: &mut [f64]) -> usize {
     if scale == 0 || data.is_empty() || offset == 0 || offset > scale {
-        return Vec::new();
+        return 0;
     }
 
     let n = data.len();
-    // Number of complete windows we can form
-    // j ranges from 1 to floor((N - k + 1) / τ)
     let num_points = (n.saturating_sub(offset - 1)) / scale;
 
     if num_points == 0 {
-        return Vec::new();
+        return 0;
     }
 
-    (0..num_points)
-        .map(|j| {
-            // Start index: (j-1)*τ + k, but j is 0-indexed so it's j*τ + (k-1)
-            let start = j * scale + (offset - 1);
-            let end = (start + scale).min(n);
-            let sum: f64 = data[start..end].iter().sum();
-            sum / scale as f64
-        })
-        .collect()
+    let inv_scale = 1.0 / scale as f64;
+    let actual_points = num_points.min(out.len());
+
+    for j in 0..actual_points {
+        let start = j * scale + (offset - 1);
+        let end = (start + scale).min(n);
+        let mut sum = 0.0;
+        for i in start..end {
+            sum += data[i];
+        }
+        out[j] = sum * inv_scale;
+    }
+
+    actual_points
 }
 
-/// Count m-dimensional and (m+1)-dimensional matched vector pairs.
+/// Optimized pattern matching using sorted indices and bucket pruning.
+/// This is O(n * k) where k is average matches per point, much better than O(n²) for typical data.
 ///
-/// Two vectors match if their Chebyshev distance (max absolute difference) is ≤ r.
-/// Returns (count_m, count_m_plus_1).
-fn count_pattern_matches(series: &[f64], m: usize, r: f64) -> (u64, u64) {
+/// Key optimizations:
+/// 1. Sort vectors by first element for cache-friendly access and early termination
+/// 2. Only compare vectors within tolerance range (bucket pruning)
+/// 3. Unrolled comparison for m=2 (most common case)
+/// 4. Process in parallel chunks
+#[inline]
+fn count_pattern_matches_optimized(series: &[f64], r: f64) -> (u64, u64) {
     let n = series.len();
-    if n <= m + 1 {
+    const M: usize = 2; // Embedding dimension (hardcoded for optimization)
+
+    if n <= M + 1 {
         return (0, 0);
     }
+
+    let num_templates = n - M;
+    let num_templates_extended = n - M - 1;
+
+    // Create index array sorted by first element of each template vector
+    let mut indices: Vec<usize> = (0..num_templates).collect();
+    indices.sort_unstable_by(|&a, &b| {
+        series[a]
+            .partial_cmp(&series[b])
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+
+    // For small series, use simple O(n²) which has less overhead
+    if num_templates < 32 {
+        return count_pattern_matches_simple(series, r);
+    }
+
+    // Parallel counting with atomic counters
+    let count_m = AtomicU64::new(0);
+    let count_m_plus_1 = AtomicU64::new(0);
+
+    // Process in parallel chunks
+    indices.par_chunks(64).for_each(|chunk| {
+        let mut local_m: u64 = 0;
+        let mut local_m_plus_1: u64 = 0;
+
+        for &i in chunk {
+            let vi0 = series[i];
+            let vi1 = series[i + 1];
+
+            // Binary search to find starting point within tolerance
+            let target_min = vi0 - r;
+            let target_max = vi0 + r;
+
+            // Find range of indices where first element is within [vi0 - r, vi0 + r]
+            let start_idx = indices.partition_point(|&idx| series[idx] < target_min);
+            let end_idx = indices.partition_point(|&idx| series[idx] <= target_max);
+
+            // Compare only with vectors in range
+            for &j in &indices[start_idx..end_idx] {
+                if j <= i {
+                    continue; // Avoid double counting and self-comparison
+                }
+
+                let vj0 = series[j];
+                let vj1 = series[j + 1];
+
+                // Unrolled m=2 Chebyshev distance check
+                let d0 = (vi0 - vj0).abs();
+                let d1 = (vi1 - vj1).abs();
+
+                if d0 <= r && d1 <= r {
+                    local_m += 2; // Count both (i,j) and (j,i)
+
+                    // Check m+1 dimension if both indices are valid
+                    if i < num_templates_extended && j < num_templates_extended {
+                        let d2 = (series[i + 2] - series[j + 2]).abs();
+                        if d2 <= r {
+                            local_m_plus_1 += 2;
+                        }
+                    }
+                }
+            }
+        }
+
+        count_m.fetch_add(local_m, Ordering::Relaxed);
+        count_m_plus_1.fetch_add(local_m_plus_1, Ordering::Relaxed);
+    });
+
+    (
+        count_m.load(Ordering::Relaxed),
+        count_m_plus_1.load(Ordering::Relaxed),
+    )
+}
+
+/// Simple O(n²) pattern matching for small series (less overhead than sorted version).
+#[inline]
+fn count_pattern_matches_simple(series: &[f64], r: f64) -> (u64, u64) {
+    let n = series.len();
+    const M: usize = 2;
+
+    if n <= M + 1 {
+        return (0, 0);
+    }
+
+    let num_templates = n - M;
+    let num_templates_extended = n - M - 1;
 
     let mut count_m: u64 = 0;
     let mut count_m_plus_1: u64 = 0;
 
-    // Compare all pairs of m-dimensional and (m+1)-dimensional vectors
-    let num_templates_m = n - m;
-    let num_templates_m_plus_1 = n - m - 1;
+    for i in 0..num_templates {
+        let vi0 = series[i];
+        let vi1 = series[i + 1];
 
-    // For each template vector starting at i
-    for i in 0..num_templates_m {
-        // Compare with all other vectors starting at j
-        for j in (i + 1)..num_templates_m {
-            // Check m-dimensional match (Chebyshev distance)
-            let mut match_m = true;
-            for k in 0..m {
-                if (series[i + k] - series[j + k]).abs() > r {
-                    match_m = false;
-                    break;
-                }
+        for j in (i + 1)..num_templates {
+            let vj0 = series[j];
+            let vj1 = series[j + 1];
+
+            // Unrolled m=2 check with early exit
+            let d0 = (vi0 - vj0).abs();
+            if d0 > r {
+                continue;
+            }
+            let d1 = (vi1 - vj1).abs();
+            if d1 > r {
+                continue;
             }
 
-            if match_m {
-                // Count both (i,j) and (j,i) but we're only iterating upper triangle
-                count_m += 2;
+            count_m += 2;
 
-                // Check if also matches at m+1 dimension
-                if i < num_templates_m_plus_1 && j < num_templates_m_plus_1 {
-                    if (series[i + m] - series[j + m]).abs() <= r {
-                        count_m_plus_1 += 2;
-                    }
+            if i < num_templates_extended && j < num_templates_extended {
+                let d2 = (series[i + 2] - series[j + 2]).abs();
+                if d2 <= r {
+                    count_m_plus_1 += 2;
                 }
             }
         }
@@ -284,37 +379,51 @@ fn count_pattern_matches(series: &[f64], m: usize, r: f64) -> (u64, u64) {
     (count_m, count_m_plus_1)
 }
 
-/// Calculate standard deviation of a slice.
+/// Calculate standard deviation using Welford's online algorithm (numerically stable).
+#[inline]
 fn std_deviation(data: &[f64]) -> f64 {
     if data.len() < 2 {
         return 0.0;
     }
-    let n = data.len() as f64;
-    let mean: f64 = data.iter().sum::<f64>() / n;
-    let variance: f64 = data.iter().map(|x| (x - mean).powi(2)).sum::<f64>() / (n - 1.0);
-    variance.sqrt()
+
+    let mut mean = 0.0;
+    let mut m2 = 0.0;
+
+    for (i, &x) in data.iter().enumerate() {
+        let delta = x - mean;
+        mean += delta / (i + 1) as f64;
+        let delta2 = x - mean;
+        m2 += delta * delta2;
+    }
+
+    (m2 / (data.len() - 1) as f64).sqrt()
 }
 
-/// Calculate RCMSE for a single scale factor τ.
-///
-/// RCMSE(x, τ, m, r) = -ln(Σ n_{k,τ}^{m+1} / Σ n_{k,τ}^m)
-///
-/// Returns the sample entropy value at scale τ, or None if undefined.
-fn rcmse_at_scale(data: &[f64], scale: usize, m: usize, r: f64) -> Option<f64> {
+/// Calculate RCMSE for a single scale factor τ with optimized coarse-graining.
+/// Pre-allocates buffers and processes all offsets efficiently.
+fn rcmse_at_scale_optimized(
+    data: &[f64],
+    scale: usize,
+    r: f64,
+    buffer: &mut Vec<f64>,
+) -> Option<f64> {
     if scale == 0 {
         return None;
     }
+
+    let max_coarse_len = data.len() / scale + 1;
+    buffer.resize(max_coarse_len, 0.0);
 
     let mut total_m: u64 = 0;
     let mut total_m_plus_1: u64 = 0;
 
     // Process all τ coarse-grained series (offsets 1 to τ)
     for k in 1..=scale {
-        let coarse = coarse_grain(data, scale, k);
-        if coarse.len() <= m + 1 {
+        let len = coarse_grain_into(data, scale, k, buffer);
+        if len <= RCMSE_EMBEDDING_DIM + 1 {
             continue;
         }
-        let (n_m, n_m_plus_1) = count_pattern_matches(&coarse, m, r);
+        let (n_m, n_m_plus_1) = count_pattern_matches_optimized(&buffer[..len], r);
         total_m += n_m;
         total_m_plus_1 += n_m_plus_1;
     }
@@ -414,7 +523,7 @@ impl RCMSEAnalysis {
 /// Calculate RCMSE analysis for a data chunk.
 ///
 /// Computes sample entropy at multiple scales and derives complexity metrics.
-/// This is computationally expensive - use for precomputation, not real-time.
+/// Optimized with parallel scale computation and efficient pattern matching.
 pub fn calculate_rcmse(data: &[u8], max_scale: usize) -> RCMSEAnalysis {
     // Convert bytes to f64 for floating-point operations
     let data_f64: Vec<f64> = data.iter().map(|&b| b as f64).collect();
@@ -437,24 +546,47 @@ pub fn calculate_rcmse(data: &[u8], max_scale: usize) -> RCMSEAnalysis {
         };
     }
 
-    // Calculate entropy at each scale
-    let mut entropy_by_scale = Vec::with_capacity(max_scale);
-    let mut valid_scales = Vec::new();
+    // Determine valid scales
+    let valid_max_scale = (1..=max_scale)
+        .take_while(|&s| data.len() >= min_length_for_scale(s))
+        .last()
+        .unwrap_or(0);
 
-    for scale in 1..=max_scale {
-        if data.len() < min_length_for_scale(scale) {
-            break;
-        }
+    if valid_max_scale < 3 {
+        return RCMSEAnalysis {
+            entropy_by_scale: Vec::new(),
+            slope: 0.0,
+            complexity_index: 0.0,
+            mean_entropy: 0.0,
+            classification: RCMSEClassification::Unknown,
+        };
+    }
 
-        if let Some(entropy) = rcmse_at_scale(&data_f64, scale, RCMSE_EMBEDDING_DIM, r) {
+    // Parallel computation of entropy at each scale
+    let scale_results: Vec<(usize, Option<f64>)> = (1..=valid_max_scale)
+        .into_par_iter()
+        .map(|scale| {
+            // Each thread gets its own buffer
+            let mut buffer = Vec::with_capacity(data_f64.len() / scale + 1);
+            let entropy = rcmse_at_scale_optimized(&data_f64, scale, r, &mut buffer);
+            (scale, entropy)
+        })
+        .collect();
+
+    // Collect valid results
+    let mut entropy_by_scale = Vec::with_capacity(valid_max_scale);
+    let mut valid_scales = Vec::with_capacity(valid_max_scale);
+    let mut last_valid_entropy = None;
+
+    for (scale, entropy_opt) in scale_results {
+        if let Some(entropy) = entropy_opt {
             entropy_by_scale.push(entropy);
             valid_scales.push(scale as f64);
-        } else {
-            // Use previous value or break if none
-            if !entropy_by_scale.is_empty() {
-                entropy_by_scale.push(*entropy_by_scale.last().unwrap());
-                valid_scales.push(scale as f64);
-            }
+            last_valid_entropy = Some(entropy);
+        } else if let Some(prev) = last_valid_entropy {
+            // Use previous value for continuity
+            entropy_by_scale.push(prev);
+            valid_scales.push(scale as f64);
         }
     }
 
