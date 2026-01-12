@@ -53,7 +53,6 @@ pub fn xy2d(n: u64, mut x: u64, mut y: u64) -> u64 {
 ///
 /// # Returns
 /// A tuple of (x, y) coordinates
-#[allow(dead_code)]
 pub fn d2xy(n: u64, d: u64) -> (u64, u64) {
     let mut x = 0u64;
     let mut y = 0u64;
@@ -111,7 +110,7 @@ mod tests {
     #[test]
     fn test_dimension_calculation() {
         assert_eq!(calculate_dimension(0), 64);
-        assert_eq!(calculate_dimension(1000), 64); // sqrt(1000) ≈ 32, rounds up to 64
+        assert_eq!(calculate_dimension(1000), 64); // sqrt(1000) ~ 32, rounds up to 64
         assert_eq!(calculate_dimension(10000), 128); // sqrt(10000) = 100, rounds up to 128
         assert!(calculate_dimension(100_000_000) >= 10000);
     }

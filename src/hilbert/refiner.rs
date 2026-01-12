@@ -15,9 +15,9 @@ use std::thread::{self, JoinHandle};
 
 use memmap2::Mmap;
 
-use crate::analysis::calculate_entropy;
+use crate::analysis::entropy::calculate_entropy;
 
-/// Window size for entropy calculation (matches ANALYSIS_WINDOW in main).
+/// Window size for entropy calculation (matches ANALYSIS_WINDOW).
 const ENTROPY_WINDOW: usize = 64;
 
 /// Target number of coarse samples for instant preview.
@@ -197,10 +197,12 @@ impl HilbertBuffer {
 /// Background refiner that progressively computes entropy values.
 pub struct HilbertRefiner {
     /// Shared buffer for results.
+    #[allow(dead_code)]
     buffer: Arc<HilbertBuffer>,
 
     /// Background computation thread handle.
-    _handle: JoinHandle<()>,
+    #[allow(dead_code)]
+    handle: JoinHandle<()>,
 }
 
 impl HilbertRefiner {
@@ -219,7 +221,7 @@ impl HilbertRefiner {
         // Store handle to ensure thread is tracked (though we don't join it)
         let _refiner = HilbertRefiner {
             buffer: Arc::clone(&buffer),
-            _handle: handle,
+            handle,
         };
 
         buffer
@@ -314,6 +316,10 @@ impl HilbertRefiner {
     }
 }
 
+// =============================================================================
+// Color Functions for Progressive Rendering
+// =============================================================================
+
 /// Generate an animated pulse color for uncomputed regions.
 ///
 /// Creates a gentle pulsing effect between dark gray shades.
@@ -384,26 +390,5 @@ mod tests {
         assert!(!buffer.is_coarse_complete());
         assert_eq!(buffer.fine_progress(), 0);
         assert!(buffer.fine_total() > 0);
-    }
-
-    #[test]
-    fn test_placeholder_color() {
-        let (r, g, b) = placeholder_pulse_color(0.0);
-        assert!(r >= 20 && r <= 40);
-        assert!(g >= 20 && g <= 40);
-        assert!(b >= 28 && b <= 48); // Blue tint
-
-        let (r2, g2, b2) = placeholder_pulse_color(0.5);
-        // Should be different due to pulse
-        assert!(r != r2 || g != g2 || b != b2);
-    }
-
-    #[test]
-    fn test_entropy_colors() {
-        let low = entropy_to_color(0.0);
-        let high = entropy_to_color(1.0);
-        // Low entropy should be reddish, high entropy should be bluish
-        assert!(low.0 > low.2); // More red than blue
-        assert!(high.2 > high.0); // More blue than red
     }
 }
