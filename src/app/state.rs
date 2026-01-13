@@ -2,12 +2,15 @@
 
 use std::path::PathBuf;
 
-use eframe::egui::TextureHandle;
+use eframe::egui::{self, TextureHandle};
 
 use super::types::{
     BackgroundTasks, FileData, HexView, Selection, TextureParams, Viewport, VisualizationMode,
 };
 use crate::gpu::GpuRenderer;
+use crate::util::color::{
+    DATA_WHITE, INTERFACE_GRAY, MUTED_TEXT, PANEL_DARK, TACTICAL_CYAN, VOID_BLACK,
+};
 use crate::wavelet_malware::WaveletMalwareReport;
 
 // =============================================================================
@@ -105,7 +108,49 @@ impl ApeironApp {
     }
 
     /// Create a new application instance with an optional initial file to load.
-    pub fn new_with_file(_cc: &eframe::CreationContext<'_>, initial_file: Option<PathBuf>) -> Self {
+    pub fn new_with_file(cc: &eframe::CreationContext<'_>, initial_file: Option<PathBuf>) -> Self {
+        // Configure MIL-SPEC TECHNO-BRUTALISM visuals
+        let mut visuals = egui::Visuals::dark();
+
+        // Override with MIL-SPEC color palette
+        visuals.panel_fill = PANEL_DARK;
+        visuals.window_fill = PANEL_DARK;
+        visuals.extreme_bg_color = VOID_BLACK;
+        visuals.faint_bg_color = VOID_BLACK;
+        visuals.code_bg_color = VOID_BLACK;
+
+        // Widget styling
+        visuals.widgets.noninteractive.bg_fill = PANEL_DARK;
+        visuals.widgets.noninteractive.fg_stroke = egui::Stroke::new(1.0, MUTED_TEXT);
+        visuals.widgets.noninteractive.bg_stroke = egui::Stroke::new(1.0, INTERFACE_GRAY);
+
+        visuals.widgets.inactive.bg_fill = INTERFACE_GRAY;
+        visuals.widgets.inactive.fg_stroke = egui::Stroke::new(1.0, DATA_WHITE);
+        visuals.widgets.inactive.bg_stroke = egui::Stroke::new(1.0, INTERFACE_GRAY);
+
+        visuals.widgets.hovered.bg_fill = INTERFACE_GRAY;
+        visuals.widgets.hovered.fg_stroke = egui::Stroke::new(1.0, TACTICAL_CYAN);
+        visuals.widgets.hovered.bg_stroke = egui::Stroke::new(1.0, TACTICAL_CYAN);
+
+        visuals.widgets.active.bg_fill = TACTICAL_CYAN;
+        visuals.widgets.active.fg_stroke = egui::Stroke::new(1.0, VOID_BLACK);
+        visuals.widgets.active.bg_stroke = egui::Stroke::new(1.0, TACTICAL_CYAN);
+
+        // Selection and highlighting
+        visuals.selection.bg_fill = TACTICAL_CYAN.gamma_multiply(0.3);
+        visuals.selection.stroke = egui::Stroke::new(1.0, TACTICAL_CYAN);
+
+        // Remove all rounding globally
+        visuals.window_rounding = egui::Rounding::ZERO;
+        visuals.menu_rounding = egui::Rounding::ZERO;
+        visuals.widgets.noninteractive.rounding = egui::Rounding::ZERO;
+        visuals.widgets.inactive.rounding = egui::Rounding::ZERO;
+        visuals.widgets.hovered.rounding = egui::Rounding::ZERO;
+        visuals.widgets.active.rounding = egui::Rounding::ZERO;
+        visuals.widgets.open.rounding = egui::Rounding::ZERO;
+
+        cc.egui_ctx.set_visuals(visuals);
+
         let gpu_renderer = GpuRenderer::new();
         if gpu_renderer.is_some() {
             println!("GPU acceleration enabled");

@@ -2,8 +2,49 @@
 //!
 //! Consolidates all color conversion and mapping functions used throughout
 //! the application, eliminating duplication between modules.
+//!
+//! DESIGN SYSTEM: MIL-SPEC TECHNO-BRUTALISM
+//! Classification: APEIRON-UI-SPEC // REV.03
 
 use eframe::egui::Color32;
+
+// =============================================================================
+// MIL-SPEC COLOR PALETTE
+// =============================================================================
+
+/// Void black - Primary background
+pub const VOID_BLACK: Color32 = Color32::from_rgb(10, 10, 10); // #0A0A0A
+
+/// Panel dark - Secondary panels, toolbars
+pub const PANEL_DARK: Color32 = Color32::from_rgb(26, 26, 26); // #1A1A1A
+
+/// Interface gray - Interactive elements, borders
+pub const INTERFACE_GRAY: Color32 = Color32::from_rgb(45, 45, 45); // #2D2D2D
+
+/// Data white - Primary text, critical data
+pub const DATA_WHITE: Color32 = Color32::from_rgb(229, 229, 229); // #E5E5E5
+
+/// Muted text - Secondary labels, inactive states
+pub const MUTED_TEXT: Color32 = Color32::from_rgb(120, 120, 130); // Subdued
+
+// =============================================================================
+// TACTICAL ACCENT COLORS
+// =============================================================================
+
+/// Tactical cyan - PRIMARY ACCENT (data, surveillance, analysis)
+pub const TACTICAL_CYAN: Color32 = Color32::from_rgb(0, 240, 255); // #00F0FF
+
+/// Alert red - Critical warnings, malware detection
+pub const ALERT_RED: Color32 = Color32::from_rgb(255, 51, 51); // #FF3333
+
+/// Caution amber - Warnings, suspicious indicators
+pub const CAUTION_AMBER: Color32 = Color32::from_rgb(255, 184, 0); // #FFB800
+
+/// Operational green - Systems nominal, clean status
+pub const OPERATIONAL_GREEN: Color32 = Color32::from_rgb(0, 255, 102); // #00FF66
+
+/// Dim cyan - Muted accent for secondary elements
+pub const DIM_CYAN: Color32 = Color32::from_rgb(0, 140, 160); // Subdued cyan
 
 /// Convert HSV color to RGB Color32.
 ///
@@ -66,33 +107,33 @@ pub fn hsv_to_rgb(h: f32, s: f32, v: f32) -> (u8, u8, u8) {
     ((r * 255.0) as u8, (g * 255.0) as u8, (b * 255.0) as u8)
 }
 
-/// Map entropy value (0-8) to a perceptually uniform color.
+/// Map entropy value (0-8) to a MIL-SPEC tactical color.
 ///
-/// Uses a custom colormap optimized for entropy visualization:
-/// - 0-2 (low): Blue tones (structured/padding)
-/// - 2-5 (medium): Green-yellow (code/data)
-/// - 5-7 (high): Orange-red (compressed)
-/// - 7-8 (very high): Red-white (encrypted/random)
+/// Uses cyan-dominant colormap for tactical visualization:
+/// - 0-2 (low): Dark/dim - structured/padding (void to dim cyan)
+/// - 2-5 (medium): Cyan tones - code/data (tactical cyan)
+/// - 5-7 (high): Amber transition - compressed (caution)
+/// - 7-8 (very high): Alert red - encrypted/random (critical)
 pub fn entropy_to_color32(entropy: f64) -> Color32 {
     let t = (entropy / 8.0).clamp(0.0, 1.0);
 
-    // Custom colormap: blue -> cyan -> green -> yellow -> orange -> red -> white
+    // MIL-SPEC colormap: dark -> dim cyan -> tactical cyan -> amber -> alert red
     let (r, g, b) = if t < 0.25 {
-        // Blue to cyan
+        // Void to dim cyan (low entropy - structured)
         let s = t / 0.25;
-        (0.0, s * 0.8, 0.8 + s * 0.2)
+        (0.0, s * 0.55, s * 0.63)
     } else if t < 0.5 {
-        // Cyan to green-yellow
+        // Dim cyan to tactical cyan (medium-low - code/text)
         let s = (t - 0.25) / 0.25;
-        (s * 0.6, 0.8 + s * 0.2, 1.0 - s * 0.8)
+        (0.0, 0.55 + s * 0.39, 0.63 + s * 0.37)
     } else if t < 0.75 {
-        // Yellow to orange-red
+        // Tactical cyan to caution amber (medium-high - compressed)
         let s = (t - 0.5) / 0.25;
-        (0.6 + s * 0.4, 1.0 - s * 0.5, 0.2 - s * 0.2)
+        (s * 1.0, 0.94 - s * 0.22, 1.0 - s * 1.0)
     } else {
-        // Red to bright red/white
+        // Caution amber to alert red (very high - encrypted/random)
         let s = (t - 0.75) / 0.25;
-        (1.0, 0.5 * s, 0.3 * s)
+        (1.0, 0.72 - s * 0.52, s * 0.2)
     };
 
     Color32::from_rgb((r * 255.0) as u8, (g * 255.0) as u8, (b * 255.0) as u8)
@@ -100,133 +141,142 @@ pub fn entropy_to_color32(entropy: f64) -> Color32 {
 
 /// Convert entropy value to RGB color for Hilbert rendering (full precision).
 ///
-/// Used for progressive Hilbert rendering.
+/// MIL-SPEC tactical color mapping for progressive rendering.
 pub fn entropy_to_rgb(entropy: f32) -> (u8, u8, u8) {
-    // Same color mapping as the main visualization
-    let h = entropy * 0.7; // Hue: 0 (red/low entropy) to 0.7 (blue/high entropy)
-    let s = 0.85;
-    let v = 0.3 + entropy * 0.6; // Brighter for higher entropy
+    let t = entropy.clamp(0.0, 1.0);
 
-    hsv_to_rgb(h * 360.0, s, v)
+    // MIL-SPEC: dark -> cyan -> amber -> red
+    if t < 0.33 {
+        let s = t / 0.33;
+        (0, (s * 200.0) as u8, (s * 220.0) as u8)
+    } else if t < 0.66 {
+        let s = (t - 0.33) / 0.33;
+        (
+            (s * 255.0) as u8,
+            (200.0 + s * 40.0) as u8,
+            (220.0 - s * 220.0) as u8,
+        )
+    } else {
+        let s = (t - 0.66) / 0.34;
+        (255, (240.0 - s * 190.0) as u8, (s * 51.0) as u8)
+    }
 }
 
 /// Convert entropy value to RGB color (coarse/preview quality).
-/// Slightly desaturated to indicate lower precision.
+/// Slightly dimmer to indicate lower precision.
 pub fn entropy_to_rgb_preview(entropy: f32) -> (u8, u8, u8) {
-    let h = entropy * 0.7;
-    let s = 0.6; // Less saturated
-    let v = 0.25 + entropy * 0.5; // Slightly dimmer
-
-    hsv_to_rgb(h * 360.0, s, v)
+    let (r, g, b) = entropy_to_rgb(entropy);
+    // Dim by 30% for preview
+    (
+        (r as f32 * 0.7) as u8,
+        (g as f32 * 0.7) as u8,
+        (b as f32 * 0.7) as u8,
+    )
 }
 
 /// Generate an animated pulse color for uncomputed regions.
 ///
-/// Creates a gentle pulsing effect between dark gray shades.
+/// Creates a tactical cyan pulse effect for "scanning" indication.
 pub fn placeholder_pulse_color(time_seconds: f64) -> (u8, u8, u8) {
-    // Gentle pulse: 0.5 Hz oscillation
+    // Tactical pulse: 0.5 Hz oscillation
     let pulse = ((time_seconds * std::f64::consts::PI).sin() * 0.5 + 0.5) as f32;
-    let base: f32 = 25.0;
-    let range: f32 = 12.0;
+    let base: f32 = 15.0;
+    let range: f32 = 20.0;
     let v = (base + pulse * range) as u8;
-    // Slight blue tint to indicate "working"
-    (v, v, v.saturating_add(8))
+    // Tactical cyan tint to indicate "scanning"
+    (v / 4, v, (v as f32 * 1.1).min(255.0) as u8)
 }
 
 /// Map similarity value (0-1) to color for recurrence plots.
-/// Uses "inferno" colormap style for better perceptual uniformity.
+/// MIL-SPEC tactical scheme: void -> cyan gradient -> white
 ///
-/// - 0 (dissimilar): Black/dark purple
-/// - 0.5 (moderate): Red/orange
-/// - 1.0 (identical): Bright yellow/white
-/// - Diagonal elements get special highlighting
+/// - 0 (dissimilar): Void black
+/// - 0.5 (moderate): Dim cyan
+/// - 1.0 (identical): Bright tactical cyan/white
+/// - Diagonal elements get bright cyan highlighting
 pub fn similarity_to_color32(similarity: f64, is_diagonal: bool) -> Color32 {
     // Apply gamma curve to enhance contrast in the mid-range
-    let t = similarity.clamp(0.0, 1.0).powf(0.4); // Gamma < 1 brightens dark areas
+    let t = similarity.clamp(0.0, 1.0).powf(0.5);
 
     if is_diagonal {
-        // Diagonal elements (self-comparison) - bright cyan/white
-        return Color32::from_rgb((180.0 + t * 75.0) as u8, (220.0 + t * 35.0) as u8, 255);
+        // Diagonal elements (self-comparison) - bright tactical cyan
+        return TACTICAL_CYAN;
     }
 
-    // Inferno-inspired colormap: black -> purple -> red -> orange -> yellow -> white
-    let (r, g, b) = if t < 0.2 {
-        // Black to dark purple
-        let s = t / 0.2;
-        (s * 0.25, 0.0, s * 0.35)
-    } else if t < 0.4 {
-        // Dark purple to red-purple
-        let s = (t - 0.2) / 0.2;
-        (0.25 + s * 0.45, 0.0, 0.35 + s * 0.1)
+    // MIL-SPEC: void black -> dim cyan -> tactical cyan -> bright white
+    let (r, g, b) = if t < 0.3 {
+        // Void to dim cyan
+        let s = t / 0.3;
+        (0.0, s * 0.35, s * 0.4)
     } else if t < 0.6 {
-        // Red-purple to orange-red
-        let s = (t - 0.4) / 0.2;
-        (0.7 + s * 0.25, s * 0.25, 0.45 - s * 0.35)
-    } else if t < 0.8 {
-        // Orange-red to orange-yellow
-        let s = (t - 0.6) / 0.2;
-        (0.95 + s * 0.05, 0.25 + s * 0.45, 0.1 + s * 0.1)
+        // Dim cyan to tactical cyan
+        let s = (t - 0.3) / 0.3;
+        (0.0, 0.35 + s * 0.59, 0.4 + s * 0.6)
+    } else if t < 0.85 {
+        // Tactical cyan to bright cyan-white
+        let s = (t - 0.6) / 0.25;
+        (s * 0.5, 0.94, 1.0)
     } else {
-        // Orange-yellow to bright yellow-white
-        let s = (t - 0.8) / 0.2;
-        (1.0, 0.7 + s * 0.3, 0.2 + s * 0.7)
+        // Bright to white
+        let s = (t - 0.85) / 0.15;
+        (0.5 + s * 0.5, 0.94 + s * 0.06, 1.0)
     };
 
     Color32::from_rgb((r * 255.0) as u8, (g * 255.0) as u8, (b * 255.0) as u8)
 }
 
 /// Get color for a byte value based on its characteristics.
-/// Used for hex view highlighting.
+/// MIL-SPEC high-contrast scheme for hex view.
 pub fn byte_color(byte: u8) -> Color32 {
     if byte == 0 {
-        Color32::from_rgb(60, 60, 80) // Null - dark blue-gray
+        Color32::from_rgb(60, 70, 80) // Null - dim interface gray
     } else if (0x20..=0x7e).contains(&byte) {
-        Color32::from_rgb(180, 180, 220) // Printable ASCII - light
+        DATA_WHITE // Printable ASCII - data white
     } else if byte == 0xff {
-        Color32::from_rgb(255, 100, 100) // 0xFF - red
+        ALERT_RED // 0xFF - alert red
     } else if byte > 0x7f {
-        Color32::from_rgb(255, 180, 100) // High bytes - orange
+        CAUTION_AMBER // High bytes - caution amber
     } else {
-        Color32::from_rgb(100, 180, 255) // Control chars - blue
+        DIM_CYAN // Control chars - dim cyan
     }
 }
 
 /// Get color for entropy value in the inspector panel.
+/// Uses MIL-SPEC status colors.
 pub fn entropy_indicator_color(entropy: f64) -> Color32 {
     if entropy > 7.0 {
-        Color32::from_rgb(255, 80, 80) // Red
-    } else if entropy > 4.0 {
-        Color32::from_rgb(80, 255, 80) // Green
+        ALERT_RED // Critical - encrypted/random
+    } else if entropy > 5.0 {
+        CAUTION_AMBER // Warning - compressed
+    } else if entropy > 3.0 {
+        TACTICAL_CYAN // Nominal - code/data
     } else {
-        Color32::from_rgb(80, 150, 255) // Blue
+        OPERATIONAL_GREEN // Clean - structured
     }
 }
 
 /// Get color for Kolmogorov complexity value (0-1).
-/// Uses viridis-inspired colormap.
+/// MIL-SPEC tactical gradient: green -> cyan -> amber -> red
 pub fn complexity_color(complexity: f64) -> Color32 {
     let t = complexity.clamp(0.0, 1.0);
 
-    // Viridis-inspired colormap matching the visualization
-    let (r, g, b) = if t < 0.2 {
-        // Deep purple
-        (0.25 + t * 0.25, 0.0 + t * 0.75, 0.5 + t * 1.0)
-    } else if t < 0.4 {
-        // Blue to teal
-        let s = (t - 0.2) / 0.2;
-        (0.3 - s * 0.15, 0.15 + s * 0.4, 0.7 - s * 0.1)
-    } else if t < 0.6 {
-        // Teal to green-yellow
-        let s = (t - 0.4) / 0.2;
-        (0.15 + s * 0.6, 0.55 + s * 0.25, 0.6 - s * 0.4)
-    } else if t < 0.8 {
-        // Yellow to orange
-        let s = (t - 0.6) / 0.2;
-        (0.75 + s * 0.25, 0.8 - s * 0.3, 0.2 - s * 0.1)
+    // MIL-SPEC: operational green -> dim cyan -> tactical cyan -> amber -> alert red
+    let (r, g, b) = if t < 0.25 {
+        // Operational green to dim cyan (simple/compressible)
+        let s = t / 0.25;
+        (0.0, 1.0 - s * 0.45, 0.4 + s * 0.23)
+    } else if t < 0.5 {
+        // Dim cyan to tactical cyan (moderate complexity)
+        let s = (t - 0.25) / 0.25;
+        (0.0, 0.55 + s * 0.39, 0.63 + s * 0.37)
+    } else if t < 0.75 {
+        // Tactical cyan to caution amber (complex)
+        let s = (t - 0.5) / 0.25;
+        (s * 1.0, 0.94 - s * 0.22, 1.0 - s * 1.0)
     } else {
-        // Orange to hot pink/red
-        let s = (t - 0.8) / 0.2;
-        (1.0, 0.5 - s * 0.3, 0.1 + s * 0.4)
+        // Caution amber to alert red (random/encrypted)
+        let s = (t - 0.75) / 0.25;
+        (1.0, 0.72 - s * 0.52, s * 0.2)
     };
 
     Color32::from_rgb((r * 255.0) as u8, (g * 255.0) as u8, (b * 255.0) as u8)
@@ -261,17 +311,20 @@ mod tests {
     fn test_entropy_colors() {
         let low = entropy_to_rgb(0.0);
         let high = entropy_to_rgb(1.0);
-        // Low entropy should be reddish, high entropy should be bluish
-        assert!(low.0 > low.2); // More red than blue
-        assert!(high.2 > high.0); // More blue than red
+        // MIL-SPEC color scheme:
+        // Low entropy (0.0) starts at black/dark
+        // High entropy (1.0) is alert red/amber
+        assert_eq!(low, (0, 0, 0)); // Low entropy starts dark
+        assert_eq!(high.0, 255); // High entropy has full red (alert)
     }
 
     #[test]
     fn test_placeholder_color() {
         let (r, g, b) = placeholder_pulse_color(0.0);
-        assert!(r >= 20 && r <= 40);
-        assert!(g >= 20 && g <= 40);
-        assert!(b >= 28 && b <= 48); // Blue tint
+        // Tactical cyan scheme: (v/4, v, v*1.1)
+        // At time 0.0: pulse = sin(0)*0.5 + 0.5 = 0.5, v = 15 + 0.5*20 = 25
+        assert!(g >= 15 && g <= 40); // Green is the primary channel
+        assert!(b > g); // Cyan tint means blue >= green
 
         let (r2, g2, b2) = placeholder_pulse_color(0.5);
         // Should be different due to pulse

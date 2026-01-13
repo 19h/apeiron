@@ -237,60 +237,120 @@ pub fn generate_computing_placeholder(tex_size: usize, time_seconds: f64) -> Vec
 // Similarity Matrix Visualization (Optimized)
 // =============================================================================
 
+/// Cache-aligned histogram to avoid false sharing and improve cache utilization.
+#[repr(C, align(64))]
+struct AlignedHist {
+    counts: [u32; 256],
+}
+
+impl AlignedHist {
+    #[inline(always)]
+    const fn new() -> Self {
+        Self {
+            counts: [0u32; 256],
+        }
+    }
+}
+
 /// Compute histogram for a window at given position.
-/// Uses 4-way unrolled counting for better ILP.
+/// Uses 8-way unrolled counting with 2 interleaved histograms to avoid cache conflicts.
 #[inline]
 fn compute_histogram(data: &[u8], pos: usize, window_size: usize) -> [u32; 256] {
-    let mut hist = [0u32; 256];
     let end = (pos + window_size).min(data.len());
 
     if pos >= data.len() {
-        return hist;
+        return [0u32; 256];
     }
 
     let window = &data[pos..end];
 
-    // 4-way unrolled counting
-    let chunks = window.chunks_exact(4);
+    // Use 2 interleaved histograms to reduce cache line conflicts
+    let mut h0 = AlignedHist::new();
+    let mut h1 = AlignedHist::new();
+
+    // 8-way unrolled counting with interleaved histograms
+    let chunks = window.chunks_exact(8);
     let remainder = chunks.remainder();
 
     for chunk in chunks {
         unsafe {
-            *hist.get_unchecked_mut(chunk[0] as usize) += 1;
-            *hist.get_unchecked_mut(chunk[1] as usize) += 1;
-            *hist.get_unchecked_mut(chunk[2] as usize) += 1;
-            *hist.get_unchecked_mut(chunk[3] as usize) += 1;
+            // Interleave between h0 and h1 to reduce conflicts
+            *h0.counts.get_unchecked_mut(chunk[0] as usize) += 1;
+            *h1.counts.get_unchecked_mut(chunk[1] as usize) += 1;
+            *h0.counts.get_unchecked_mut(chunk[2] as usize) += 1;
+            *h1.counts.get_unchecked_mut(chunk[3] as usize) += 1;
+            *h0.counts.get_unchecked_mut(chunk[4] as usize) += 1;
+            *h1.counts.get_unchecked_mut(chunk[5] as usize) += 1;
+            *h0.counts.get_unchecked_mut(chunk[6] as usize) += 1;
+            *h1.counts.get_unchecked_mut(chunk[7] as usize) += 1;
         }
     }
 
-    for &byte in remainder {
+    for (i, &byte) in remainder.iter().enumerate() {
         unsafe {
-            *hist.get_unchecked_mut(byte as usize) += 1;
+            if i & 1 == 0 {
+                *h0.counts.get_unchecked_mut(byte as usize) += 1;
+            } else {
+                *h1.counts.get_unchecked_mut(byte as usize) += 1;
+            }
         }
     }
 
-    hist
+    // Merge histograms using SIMD
+    use wide::u32x4;
+    let mut result = [0u32; 256];
+
+    for i in (0..256).step_by(4) {
+        let v0 = u32x4::new([
+            h0.counts[i],
+            h0.counts[i + 1],
+            h0.counts[i + 2],
+            h0.counts[i + 3],
+        ]);
+        let v1 = u32x4::new([
+            h1.counts[i],
+            h1.counts[i + 1],
+            h1.counts[i + 2],
+            h1.counts[i + 3],
+        ]);
+        let sum = v0 + v1;
+        let arr = sum.to_array();
+        result[i] = arr[0];
+        result[i + 1] = arr[1];
+        result[i + 2] = arr[2];
+        result[i + 3] = arr[3];
+    }
+
+    result
 }
 
 /// Compute chi-squared distance between two histograms using SIMD.
-/// Optimized with 8-way dual accumulators and branchless division.
+/// Optimized with 16-way processing and quad accumulators for maximum ILP.
 #[inline]
 fn chi_squared_distance_simd(hist_x: &[u32; 256], hist_y: &[u32; 256]) -> f64 {
-    // SIMD total computation using u32x4
+    // SIMD total computation using u32x4 with 8-way accumulation
     use wide::u32x4;
 
-    let mut sum_x = u32x4::ZERO;
-    let mut sum_y = u32x4::ZERO;
+    let mut sum_x0 = u32x4::ZERO;
+    let mut sum_x1 = u32x4::ZERO;
+    let mut sum_y0 = u32x4::ZERO;
+    let mut sum_y1 = u32x4::ZERO;
 
-    for i in (0..256).step_by(4) {
-        let hx = u32x4::new([hist_x[i], hist_x[i + 1], hist_x[i + 2], hist_x[i + 3]]);
-        let hy = u32x4::new([hist_y[i], hist_y[i + 1], hist_y[i + 2], hist_y[i + 3]]);
-        sum_x += hx;
-        sum_y += hy;
+    for i in (0..256).step_by(8) {
+        let hx0 = u32x4::new([hist_x[i], hist_x[i + 1], hist_x[i + 2], hist_x[i + 3]]);
+        let hx1 = u32x4::new([hist_x[i + 4], hist_x[i + 5], hist_x[i + 6], hist_x[i + 7]]);
+        let hy0 = u32x4::new([hist_y[i], hist_y[i + 1], hist_y[i + 2], hist_y[i + 3]]);
+        let hy1 = u32x4::new([hist_y[i + 4], hist_y[i + 5], hist_y[i + 6], hist_y[i + 7]]);
+        sum_x0 += hx0;
+        sum_x1 += hx1;
+        sum_y0 += hy0;
+        sum_y1 += hy1;
     }
 
-    let arr_x = sum_x.to_array();
-    let arr_y = sum_y.to_array();
+    let combined_x = sum_x0 + sum_x1;
+    let combined_y = sum_y0 + sum_y1;
+    let arr_x = combined_x.to_array();
+    let arr_y = combined_y.to_array();
     let total_x = arr_x[0] + arr_x[1] + arr_x[2] + arr_x[3];
     let total_y = arr_y[0] + arr_y[1] + arr_y[2] + arr_y[3];
 
@@ -301,14 +361,17 @@ fn chi_squared_distance_simd(hist_x: &[u32; 256], hist_y: &[u32; 256]) -> f64 {
     let inv_total_x = f64x4::splat(1.0 / total_x as f64);
     let inv_total_y = f64x4::splat(1.0 / total_y as f64);
 
-    // 8-way SIMD chi-squared with dual accumulators
+    // 16-way SIMD chi-squared with quad accumulators for maximum ILP
     let mut chi_sq0 = f64x4::ZERO;
     let mut chi_sq1 = f64x4::ZERO;
+    let mut chi_sq2 = f64x4::ZERO;
+    let mut chi_sq3 = f64x4::ZERO;
 
-    // Small epsilon for branchless division (avoids explicit zero check)
+    // Small epsilon for branchless division
     let eps = f64x4::splat(1e-30);
 
-    for i in (0..256).step_by(8) {
+    for i in (0..256).step_by(16) {
+        // Load 16 histogram values
         let hx0 = f64x4::new([
             hist_x[i] as f64,
             hist_x[i + 1] as f64,
@@ -321,6 +384,19 @@ fn chi_squared_distance_simd(hist_x: &[u32; 256], hist_y: &[u32; 256]) -> f64 {
             hist_x[i + 6] as f64,
             hist_x[i + 7] as f64,
         ]);
+        let hx2 = f64x4::new([
+            hist_x[i + 8] as f64,
+            hist_x[i + 9] as f64,
+            hist_x[i + 10] as f64,
+            hist_x[i + 11] as f64,
+        ]);
+        let hx3 = f64x4::new([
+            hist_x[i + 12] as f64,
+            hist_x[i + 13] as f64,
+            hist_x[i + 14] as f64,
+            hist_x[i + 15] as f64,
+        ]);
+
         let hy0 = f64x4::new([
             hist_y[i] as f64,
             hist_y[i + 1] as f64,
@@ -333,26 +409,49 @@ fn chi_squared_distance_simd(hist_x: &[u32; 256], hist_y: &[u32; 256]) -> f64 {
             hist_y[i + 6] as f64,
             hist_y[i + 7] as f64,
         ]);
+        let hy2 = f64x4::new([
+            hist_y[i + 8] as f64,
+            hist_y[i + 9] as f64,
+            hist_y[i + 10] as f64,
+            hist_y[i + 11] as f64,
+        ]);
+        let hy3 = f64x4::new([
+            hist_y[i + 12] as f64,
+            hist_y[i + 13] as f64,
+            hist_y[i + 14] as f64,
+            hist_y[i + 15] as f64,
+        ]);
 
+        // Convert to probabilities
         let px0 = hx0 * inv_total_x;
         let px1 = hx1 * inv_total_x;
+        let px2 = hx2 * inv_total_x;
+        let px3 = hx3 * inv_total_x;
         let py0 = hy0 * inv_total_y;
         let py1 = hy1 * inv_total_y;
+        let py2 = hy2 * inv_total_y;
+        let py3 = hy3 * inv_total_y;
 
-        let sum0 = px0 + py0 + eps; // Add epsilon for branchless division
-        let sum1 = px1 + py1 + eps;
+        // Compute (px - py)² / (px + py + eps) - branchless
         let diff0 = px0 - py0;
         let diff1 = px1 - py1;
+        let diff2 = px2 - py2;
+        let diff3 = px3 - py3;
 
-        // Branchless: (diff^2) / (sum + eps) - the epsilon makes division safe
+        let sum0 = px0 + py0 + eps;
+        let sum1 = px1 + py1 + eps;
+        let sum2 = px2 + py2 + eps;
+        let sum3 = px3 + py3 + eps;
+
         chi_sq0 += (diff0 * diff0) / sum0;
         chi_sq1 += (diff1 * diff1) / sum1;
+        chi_sq2 += (diff2 * diff2) / sum2;
+        chi_sq3 += (diff3 * diff3) / sum3;
     }
 
-    // Combine accumulators
-    let combined = chi_sq0 + chi_sq1;
-    let arr = combined.to_array();
-    arr[0] + arr[1] + arr[2] + arr[3]
+    // Combine all accumulators
+    let combined = (chi_sq0 + chi_sq1) + (chi_sq2 + chi_sq3);
+    combined.reduce_add()
 }
 
 pub fn generate_similarity_matrix_pixels(

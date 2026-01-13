@@ -30,7 +30,6 @@ pub const WAVELET_SAMPLE_INTERVAL: usize = 64;
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum VisualizationMode {
     /// Hilbert curve with entropy-based coloring (default).
-    #[default]
     Hilbert,
     /// Structural similarity matrix (recurrence plot) - reveals repeating patterns.
     SimilarityMatrix,
@@ -41,6 +40,7 @@ pub enum VisualizationMode {
     /// Kolmogorov complexity approximation - shows algorithmic complexity via compression.
     KolmogorovComplexity,
     /// Jensen-Shannon divergence - shows distribution anomalies vs file baseline.
+    #[default]
     JensenShannonDivergence,
     /// Refined Composite Multi-Scale Entropy - reveals complexity across time scales.
     MultiScaleEntropy,

@@ -124,39 +124,48 @@ pub fn haar_wavelet_transform(signal: &[f64]) -> Vec<Vec<f64>> {
     coefficients
 }
 
-/// Thread-local scratch buffer for Haar transform to avoid repeated allocations.
-/// Uses UnsafeCell to avoid RefCell borrow checking overhead.
-thread_local! {
-    static HAAR_SCRATCH: std::cell::UnsafeCell<Vec<f64>> = std::cell::UnsafeCell::new(Vec::with_capacity(4096));
-}
-
-/// SIMD-accelerated Haar wavelet step.
+/// SIMD-accelerated Haar wavelet step with minimal copying.
+/// Uses stack-allocated temp buffer for small sizes, thread-local for large.
 /// Processes 4 pairs at a time using f64x4.
-/// Only copies `len` elements (not the full array) and uses UnsafeCell for zero overhead.
 #[inline]
 fn haar_step_simd(data: &mut [f64], len: usize, half: usize) {
-    // Use thread-local scratch buffer with UnsafeCell (no borrow checking overhead)
-    // SAFETY: We're single-threaded within this function, no reentrancy
+    // For small inputs, use stack-allocated buffer (no heap allocation)
+    if len <= 64 {
+        haar_step_simd_small(data, len, half);
+        return;
+    }
+
+    // For larger inputs, process in-place using a two-phase approach:
+    // Phase 1: Compute details (can be done in-place in reverse order)
+    // Phase 2: Compute averages (overwrites original data)
+
+    // We need to copy the input first because both averages and details read from original
+    // Use thread-local buffer sized appropriately
+    thread_local! {
+        static HAAR_SCRATCH: std::cell::UnsafeCell<Vec<f64>> = const { std::cell::UnsafeCell::new(Vec::new()) };
+    }
+
     HAAR_SCRATCH.with(|scratch| {
         let scratch = unsafe { &mut *scratch.get() };
-        scratch.clear();
 
-        // Only reserve and copy what we need
-        if scratch.capacity() < len {
-            scratch.reserve(len - scratch.capacity());
+        // Resize if needed (only allocates once per thread for max size seen)
+        if scratch.len() < len {
+            scratch.resize(len, 0.0);
         }
-        scratch.extend_from_slice(&data[..len]);
 
-        // Process 4 pairs at a time with dual accumulators for better pipelining
+        // Copy input data (required because we read pairs that overlap with output)
+        scratch[..len].copy_from_slice(&data[..len]);
+
+        // Process 4 pairs at a time with SIMD
         let simd_pairs = half / 4;
         let scalar_start = simd_pairs * 4;
 
-        // SIMD processing with explicit prefetch-friendly access pattern
+        // SIMD processing - load from scratch, write to data
         for i in 0..simd_pairs {
             let base = i * 4;
             let idx0 = 2 * base;
 
-            // Load 4 consecutive pairs - adjacent memory for better cache usage
+            // Load 4 consecutive pairs using gather-like pattern
             let left = f64x4::new([
                 scratch[idx0],
                 scratch[idx0 + 2],
@@ -170,14 +179,14 @@ fn haar_step_simd(data: &mut [f64], len: usize, half: usize) {
                 scratch[idx0 + 7],
             ]);
 
-            // SIMD computation
+            // SIMD Haar transform
             let averages = (left + right) * INV_SQRT2_X4;
             let details = (left - right) * INV_SQRT2_X4;
 
             let avg_arr = averages.to_array();
             let det_arr = details.to_array();
 
-            // Write results directly - bounds already checked by loop
+            // Write results - averages go to first half, details to second half
             unsafe {
                 *data.get_unchecked_mut(base) = avg_arr[0];
                 *data.get_unchecked_mut(base + 1) = avg_arr[1];
@@ -199,6 +208,52 @@ fn haar_step_simd(data: &mut [f64], len: usize, half: usize) {
             data[half + i] = (left - right) * INV_SQRT2;
         }
     });
+}
+
+/// Stack-allocated Haar step for small inputs (no heap allocation).
+#[inline]
+fn haar_step_simd_small(data: &mut [f64], len: usize, half: usize) {
+    // Stack buffer for small inputs (64 f64s = 512 bytes)
+    let mut temp = [0.0f64; 64];
+    temp[..len].copy_from_slice(&data[..len]);
+
+    let simd_pairs = half / 4;
+    let scalar_start = simd_pairs * 4;
+
+    for i in 0..simd_pairs {
+        let base = i * 4;
+        let idx0 = 2 * base;
+
+        let left = f64x4::new([temp[idx0], temp[idx0 + 2], temp[idx0 + 4], temp[idx0 + 6]]);
+        let right = f64x4::new([
+            temp[idx0 + 1],
+            temp[idx0 + 3],
+            temp[idx0 + 5],
+            temp[idx0 + 7],
+        ]);
+
+        let averages = (left + right) * INV_SQRT2_X4;
+        let details = (left - right) * INV_SQRT2_X4;
+
+        let avg_arr = averages.to_array();
+        let det_arr = details.to_array();
+
+        data[base] = avg_arr[0];
+        data[base + 1] = avg_arr[1];
+        data[base + 2] = avg_arr[2];
+        data[base + 3] = avg_arr[3];
+        data[half + base] = det_arr[0];
+        data[half + base + 1] = det_arr[1];
+        data[half + base + 2] = det_arr[2];
+        data[half + base + 3] = det_arr[3];
+    }
+
+    for i in scalar_start..half {
+        let left = temp[2 * i];
+        let right = temp[2 * i + 1];
+        data[i] = (left + right) * INV_SQRT2;
+        data[half + i] = (left - right) * INV_SQRT2;
+    }
 }
 
 /// Small fixed buffer for scalar Haar steps (max 8 averages).

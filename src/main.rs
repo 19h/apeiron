@@ -1,7 +1,9 @@
-//! Apeiron - Binary file entropy and complexity visualizer using Hilbert curves.
+//! APEIRON - BINARY ANALYSIS SYSTEM
 //!
-//! Apeiron - GPU-accelerated binary entropy visualizer using Hilbert curves
-//! through entropy-based color mapping on a Hilbert curve layout.
+//! GPU-accelerated binary entropy visualizer using Hilbert curves.
+//! MIL-SPEC TECHNO-BRUTALISM INTERFACE // REV.03
+//!
+//! Classification: APEIRON-SYS // UNRESTRICTED
 
 #![warn(clippy::all, clippy::pedantic)]
 #![allow(clippy::cast_possible_truncation, clippy::cast_precision_loss)]
@@ -36,6 +38,10 @@ use app::{
     WAVELET_SAMPLE_INTERVAL,
 };
 use hilbert::{calculate_dimension, xy2d, HilbertBuffer, HilbertRefiner, PROGRESSIVE_THRESHOLD};
+use util::color::{
+    ALERT_RED, CAUTION_AMBER, DATA_WHITE, DIM_CYAN, INTERFACE_GRAY, MUTED_TEXT, OPERATIONAL_GREEN,
+    PANEL_DARK, TACTICAL_CYAN, VOID_BLACK,
+};
 use util::format_bytes;
 use wavelet_malware as wm;
 
@@ -1208,9 +1214,9 @@ impl eframe::App for ApeironApp {
 
         // Note: Texture generation is now done in draw_visualization with viewport info
 
-        // Top toolbar with tabs
+        // Top toolbar with tabs - MIL-SPEC PANEL
         egui::TopBottomPanel::top("toolbar")
-            .frame(egui::Frame::none().fill(Color32::from_rgb(28, 28, 32)))
+            .frame(egui::Frame::none().fill(PANEL_DARK))
             .show(ctx, |ui| {
                 let mut tab_to_close: Option<usize> = None;
                 let mut tab_to_activate: Option<usize> = None;
@@ -1280,29 +1286,23 @@ impl eframe::App for ApeironApp {
                                 false
                             };
 
-                        // Background color
+                        // MIL-SPEC tab background colors
                         let bg_color = if is_being_dragged {
-                            Color32::from_rgb(55, 55, 65)
+                            INTERFACE_GRAY
                         } else if is_drop_target {
-                            Color32::from_rgb(50, 60, 70)
+                            DIM_CYAN.gamma_multiply(0.3) // Tactical cyan tint
                         } else if is_active {
-                            Color32::from_rgb(45, 45, 52)
+                            INTERFACE_GRAY
                         } else if is_hovered {
-                            Color32::from_rgb(38, 38, 44)
+                            INTERFACE_GRAY.gamma_multiply(0.6)
                         } else {
-                            Color32::from_rgb(28, 28, 32)
+                            PANEL_DARK
                         };
 
-                        // Draw tab background
-                        let rounding = egui::Rounding {
-                            nw: 8.0,
-                            ne: 8.0,
-                            sw: 0.0,
-                            se: 0.0,
-                        };
-                        ui.painter().rect_filled(rect, rounding, bg_color);
+                        // Draw tab background - ZERO rounding (MIL-SPEC sharp corners)
+                        ui.painter().rect_filled(rect, 0.0, bg_color);
 
-                        // Drop indicator line
+                        // Drop indicator line - TACTICAL CYAN
                         if is_drop_target {
                             if let Some(drag_idx) = self.dragging_tab {
                                 let indicator_x = if drag_idx < i {
@@ -1315,13 +1315,13 @@ impl eframe::App for ApeironApp {
                                         egui::pos2(indicator_x - 1.5, rect.min.y + 4.0),
                                         egui::vec2(3.0, rect.height() - 8.0),
                                     ),
-                                    2.0,
-                                    Color32::from_rgb(100, 160, 220),
+                                    0.0,
+                                    TACTICAL_CYAN,
                                 );
                             }
                         }
 
-                        // Active indicator
+                        // Active indicator - TACTICAL CYAN underline
                         if is_active && !is_being_dragged {
                             ui.painter().rect_filled(
                                 egui::Rect::from_min_size(
@@ -1329,19 +1329,19 @@ impl eframe::App for ApeironApp {
                                     egui::vec2(rect.width(), 2.0),
                                 ),
                                 0.0,
-                                Color32::from_rgb(70, 130, 180),
+                                TACTICAL_CYAN,
                             );
                         }
 
-                        // Tab title
+                        // Tab title - MIL-SPEC text colors
                         let text_color = if is_being_dragged {
-                            Color32::from_rgb(180, 180, 190)
+                            MUTED_TEXT
                         } else if is_active {
-                            Color32::from_rgb(230, 230, 235)
+                            DATA_WHITE
                         } else if is_hovered {
-                            Color32::from_rgb(200, 200, 205)
+                            DATA_WHITE.gamma_multiply(0.8)
                         } else {
-                            Color32::from_rgb(150, 150, 160)
+                            MUTED_TEXT
                         };
 
                         ui.painter().text(
@@ -1352,7 +1352,7 @@ impl eframe::App for ApeironApp {
                             text_color,
                         );
 
-                        // Close button
+                        // Close button - MIL-SPEC
                         if show_close && !is_being_dragged {
                             let close_rect = egui::Rect::from_center_size(
                                 egui::pos2(rect.max.x - 14.0, rect.center().y),
@@ -1363,17 +1363,17 @@ impl eframe::App for ApeironApp {
                             let close_hovered = is_hovered && close_rect.contains(pointer_pos);
 
                             if close_hovered {
-                                ui.painter().circle_filled(
-                                    close_rect.center(),
-                                    8.0,
-                                    Color32::from_rgb(65, 65, 72),
+                                ui.painter().rect_filled(
+                                    close_rect,
+                                    2.0,
+                                    ALERT_RED.gamma_multiply(0.3),
                                 );
                             }
 
                             let close_color = if close_hovered {
-                                Color32::from_rgb(220, 220, 225)
+                                ALERT_RED
                             } else if is_hovered || is_active {
-                                Color32::from_rgb(130, 130, 140)
+                                MUTED_TEXT
                             } else {
                                 Color32::TRANSPARENT
                             };
@@ -1400,18 +1400,14 @@ impl eframe::App for ApeironApp {
                         ui.add_space(2.0);
                     }
 
-                    // New tab button
+                    // New tab button - MIL-SPEC
                     ui.add_space(4.0);
                     let (new_rect, new_response) =
                         ui.allocate_exact_size(egui::vec2(24.0, 24.0), Sense::click());
 
                     let new_hovered = new_response.hovered();
                     if new_hovered {
-                        ui.painter().circle_filled(
-                            new_rect.center(),
-                            11.0,
-                            Color32::from_rgb(45, 45, 52),
-                        );
+                        ui.painter().rect_filled(new_rect, 2.0, INTERFACE_GRAY);
                     }
 
                     ui.painter().text(
@@ -1420,9 +1416,9 @@ impl eframe::App for ApeironApp {
                         "+",
                         egui::FontId::proportional(18.0),
                         if new_hovered {
-                            Color32::from_rgb(220, 220, 225)
+                            TACTICAL_CYAN
                         } else {
-                            Color32::from_rgb(120, 120, 130)
+                            MUTED_TEXT
                         },
                     );
 
@@ -1459,33 +1455,35 @@ impl eframe::App for ApeironApp {
                     self.close_tab(i);
                 }
 
-                // Toolbar row
+                // Toolbar row - MIL-SPEC CONTROLS
                 ui.add_space(4.0);
                 ui.horizontal(|ui| {
                     ui.add_space(8.0);
 
                     let has_file = self.active_tab().file_data.is_some();
 
-                    // Minimal toolbar buttons
+                    // MIL-SPEC toolbar buttons - ZERO rounding
                     let tool_btn = |ui: &mut egui::Ui, text: &str, enabled: bool| -> bool {
                         let response = ui.add_enabled(
                             enabled,
-                            egui::Button::new(RichText::new(text).size(11.0).color(if enabled {
-                                Color32::from_rgb(175, 175, 185)
-                            } else {
-                                Color32::from_rgb(80, 80, 90)
-                            }))
-                            .fill(Color32::from_rgb(40, 40, 46))
-                            .rounding(4.0)
+                            egui::Button::new(RichText::new(text.to_uppercase()).size(10.0).color(
+                                if enabled {
+                                    DATA_WHITE
+                                } else {
+                                    MUTED_TEXT.gamma_multiply(0.5) // Disabled state
+                                },
+                            ))
+                            .fill(INTERFACE_GRAY)
+                            .rounding(0.0)
                             .min_size(egui::vec2(0.0, 22.0)),
                         );
                         response.clicked()
                     };
 
-                    if tool_btn(ui, "Reset", has_file) {
+                    if tool_btn(ui, "RESET", has_file) {
                         self.reset_viewport();
                     }
-                    if tool_btn(ui, "Open", true) {
+                    if tool_btn(ui, "OPEN", true) {
                         if let Some(path) = rfd::FileDialog::new().pick_file() {
                             let in_new_tab = self.active_tab().file_data.is_some();
                             self.load_file(path, in_new_tab);
@@ -1497,12 +1495,8 @@ impl eframe::App for ApeironApp {
 
                     ui.add_space(8.0);
 
-                    // Mode dropdown
-                    ui.label(
-                        RichText::new("Mode")
-                            .size(11.0)
-                            .color(Color32::from_rgb(100, 100, 110)),
-                    );
+                    // Mode dropdown - MIL-SPEC label
+                    ui.label(RichText::new("MODE:").size(10.0).color(MUTED_TEXT));
                     let old_mode = self.active_tab().viz_mode;
                     let mut new_mode = old_mode;
                     egui::ComboBox::from_id_salt("viz_mode")
@@ -1577,9 +1571,9 @@ impl eframe::App for ApeironApp {
                                     }
                                     if tasks.computing_wavelet_report {
                                         ui.label(
-                                            RichText::new("Report...")
+                                            RichText::new("[ANALYZING]")
                                                 .size(9.0)
-                                                .color(Color32::from_rgb(150, 150, 180)),
+                                                .color(TACTICAL_CYAN),
                                         );
                                     }
                                 }
@@ -1588,18 +1582,14 @@ impl eframe::App for ApeironApp {
                     }
                 });
                 ui.add_space(4.0);
+
+                // MIL-SPEC registration marks for toolbar
+                let toolbar_rect = ui.max_rect();
+                Self::draw_corner_marks_static(ui, toolbar_rect, DIM_CYAN.gamma_multiply(0.5));
             });
 
-        // Right panel: Data Inspector (responsive width)
-        egui::SidePanel::right("inspector")
-            .min_width(280.0)
-            .default_width(280.0)
-            .max_width(700.0)
-            .show(ctx, |ui| {
-                self.draw_inspector(ui);
-            });
-
-        // Central panel: Visualization
+        // Central panel: Visualization (inspector floats on top)
+        // Note: Inspector is now drawn inside draw_visualization as floating panel
         egui::CentralPanel::default().show(ctx, |ui| {
             self.draw_visualization(ui);
         });
@@ -1621,9 +1611,8 @@ impl ApeironApp {
     fn draw_visualization(&mut self, ui: &mut egui::Ui) {
         let available_rect = ui.available_rect_before_wrap();
 
-        // Background
-        ui.painter()
-            .rect_filled(available_rect, 0.0, Color32::from_rgb(30, 30, 30));
+        // MIL-SPEC VOID BLACK background
+        ui.painter().rect_filled(available_rect, 0.0, VOID_BLACK);
 
         if self.active_tab().file_data.is_none() {
             // Empty state or drop target indicator
@@ -1770,11 +1759,61 @@ impl ApeironApp {
         // Draw HUD overlay
         self.draw_hud(ui, available_rect);
 
+        // Draw floating inspector panel on the right
+        self.draw_floating_inspector(ui, available_rect);
+
+        // Draw MIL-SPEC corner registration marks on visualization panel
+        self.draw_corner_marks(ui, available_rect, DIM_CYAN);
+
         // Draw loading overlay if current mode's data is not ready
         let current_mode = self.active_tab().viz_mode;
         if !self.is_mode_data_ready(current_mode) {
             self.draw_loading_overlay(ui, available_rect);
         }
+    }
+
+    /// Draw the floating inspector panel - MIL-SPEC FLOATING OVERLAY
+    fn draw_floating_inspector(&mut self, ui: &mut egui::Ui, view_rect: Rect) {
+        // Only show inspector when file is loaded
+        if self.active_tab().file_data.is_none() {
+            return;
+        }
+
+        // Calculate inspector panel rect - floating on right side with padding
+        let inspector_width = 300.0;
+        let padding = 12.0;
+        let inspector_rect = Rect::from_min_size(
+            Pos2::new(
+                view_rect.max.x - inspector_width - padding,
+                view_rect.min.y + padding,
+            ),
+            Vec2::new(inspector_width, view_rect.height() - padding * 2.0 - 50.0), // Leave room for HUD
+        );
+
+        // Semi-transparent background - MIL-SPEC panel
+        ui.painter()
+            .rect_filled(inspector_rect, 0.0, PANEL_DARK.gamma_multiply(0.92));
+
+        // Border stroke
+        ui.painter()
+            .rect_stroke(inspector_rect, 0.0, egui::Stroke::new(1.0, INTERFACE_GRAY));
+
+        // Corner registration marks
+        Self::draw_corner_marks_static(ui, inspector_rect, DIM_CYAN.gamma_multiply(0.5));
+
+        // Create a child UI for the inspector content with proper clipping
+        let content_rect = inspector_rect.shrink(8.0);
+        let mut child_ui = ui.child_ui(
+            content_rect,
+            egui::Layout::top_down(egui::Align::LEFT),
+            None,
+        );
+
+        // Set clip rect to prevent content bleeding outside panel
+        child_ui.set_clip_rect(content_rect);
+
+        // Draw inspector content
+        self.draw_inspector_content(&mut child_ui);
     }
 
     /// Draw an outline around the hex view's visible region on the Hilbert curve.
@@ -1825,17 +1864,17 @@ impl ApeironApp {
             .map(|&(x, y)| world_to_screen(x, y))
             .collect();
 
-        // Draw the outline as a polyline with a glow effect
+        // Draw the outline as a polyline with TACTICAL CYAN glow
         if screen_points.len() >= 2 {
             // Draw outer glow
             ui.painter().add(egui::Shape::line(
                 screen_points.clone(),
-                egui::Stroke::new(4.0, Color32::from_rgba_unmultiplied(255, 200, 0, 80)),
+                egui::Stroke::new(4.0, TACTICAL_CYAN.gamma_multiply(0.3)),
             ));
             // Draw main line
             ui.painter().add(egui::Shape::line(
                 screen_points,
-                egui::Stroke::new(2.0, Color32::from_rgb(255, 220, 50)),
+                egui::Stroke::new(2.0, TACTICAL_CYAN),
             ));
         }
 
@@ -1846,71 +1885,228 @@ impl ApeironApp {
             let box_max = world_to_screen(max_x, max_y);
             let box_rect = Rect::from_min_max(box_min, box_max);
 
-            // Draw bounding box
+            // Draw bounding box - TACTICAL CYAN
             ui.painter().rect_stroke(
                 box_rect,
                 0.0,
-                egui::Stroke::new(1.5, Color32::from_rgba_unmultiplied(255, 220, 50, 150)),
+                egui::Stroke::new(1.5, TACTICAL_CYAN.gamma_multiply(0.6)),
             );
         }
     }
 
-    /// Draw the empty state prompt.
+    /// Draw the empty state prompt - MIL-SPEC STANDBY
     fn draw_empty_state(&self, ui: &mut egui::Ui, rect: Rect) {
         let center = rect.center();
 
+        // Draw corner registration marks
+        self.draw_corner_marks(ui, rect, DIM_CYAN);
+
         ui.painter().text(
-            center - Vec2::new(0.0, 20.0),
+            center - Vec2::new(0.0, 30.0),
             egui::Align2::CENTER_CENTER,
-            "Drag & Drop a file to begin analyzing",
-            egui::FontId::monospace(16.0),
-            Color32::GRAY,
+            "[ AWAITING TARGET ]",
+            egui::FontId::monospace(14.0),
+            MUTED_TEXT,
+        );
+        ui.painter().text(
+            center,
+            egui::Align2::CENTER_CENTER,
+            "DROP BINARY FILE TO ANALYZE",
+            egui::FontId::monospace(12.0),
+            DIM_CYAN,
+        );
+        ui.painter().text(
+            center + Vec2::new(0.0, 24.0),
+            egui::Align2::CENTER_CENTER,
+            "STATUS: [STANDBY]",
+            egui::FontId::monospace(10.0),
+            MUTED_TEXT,
         );
     }
 
-    /// Draw loading overlay when current mode's data is still computing.
+    /// Draw corner registration marks for MIL-SPEC aesthetic (static version for use in closures)
+    fn draw_corner_marks_static(ui: &mut egui::Ui, rect: Rect, color: Color32) {
+        let mark_size = 12.0;
+        let stroke = egui::Stroke::new(1.0, color);
+
+        // Top-left
+        ui.painter().line_segment(
+            [
+                rect.min + Vec2::new(4.0, 4.0),
+                rect.min + Vec2::new(4.0 + mark_size, 4.0),
+            ],
+            stroke,
+        );
+        ui.painter().line_segment(
+            [
+                rect.min + Vec2::new(4.0, 4.0),
+                rect.min + Vec2::new(4.0, 4.0 + mark_size),
+            ],
+            stroke,
+        );
+
+        // Top-right
+        ui.painter().line_segment(
+            [
+                Pos2::new(rect.max.x - 4.0, rect.min.y + 4.0),
+                Pos2::new(rect.max.x - 4.0 - mark_size, rect.min.y + 4.0),
+            ],
+            stroke,
+        );
+        ui.painter().line_segment(
+            [
+                Pos2::new(rect.max.x - 4.0, rect.min.y + 4.0),
+                Pos2::new(rect.max.x - 4.0, rect.min.y + 4.0 + mark_size),
+            ],
+            stroke,
+        );
+
+        // Bottom-left
+        ui.painter().line_segment(
+            [
+                Pos2::new(rect.min.x + 4.0, rect.max.y - 4.0),
+                Pos2::new(rect.min.x + 4.0 + mark_size, rect.max.y - 4.0),
+            ],
+            stroke,
+        );
+        ui.painter().line_segment(
+            [
+                Pos2::new(rect.min.x + 4.0, rect.max.y - 4.0),
+                Pos2::new(rect.min.x + 4.0, rect.max.y - 4.0 - mark_size),
+            ],
+            stroke,
+        );
+
+        // Bottom-right
+        ui.painter().line_segment(
+            [
+                Pos2::new(rect.max.x - 4.0, rect.max.y - 4.0),
+                Pos2::new(rect.max.x - 4.0 - mark_size, rect.max.y - 4.0),
+            ],
+            stroke,
+        );
+        ui.painter().line_segment(
+            [
+                Pos2::new(rect.max.x - 4.0, rect.max.y - 4.0),
+                Pos2::new(rect.max.x - 4.0, rect.max.y - 4.0 - mark_size),
+            ],
+            stroke,
+        );
+    }
+
+    /// Draw corner registration marks for MIL-SPEC aesthetic
+    fn draw_corner_marks(&self, ui: &mut egui::Ui, rect: Rect, color: Color32) {
+        let mark_size = 20.0;
+        let stroke = egui::Stroke::new(1.5, color);
+
+        // Top-left ◢
+        ui.painter().line_segment(
+            [
+                rect.min + Vec2::new(8.0, 8.0),
+                rect.min + Vec2::new(8.0 + mark_size, 8.0),
+            ],
+            stroke,
+        );
+        ui.painter().line_segment(
+            [
+                rect.min + Vec2::new(8.0, 8.0),
+                rect.min + Vec2::new(8.0, 8.0 + mark_size),
+            ],
+            stroke,
+        );
+
+        // Top-right ◣
+        ui.painter().line_segment(
+            [
+                Pos2::new(rect.max.x - 8.0, rect.min.y + 8.0),
+                Pos2::new(rect.max.x - 8.0 - mark_size, rect.min.y + 8.0),
+            ],
+            stroke,
+        );
+        ui.painter().line_segment(
+            [
+                Pos2::new(rect.max.x - 8.0, rect.min.y + 8.0),
+                Pos2::new(rect.max.x - 8.0, rect.min.y + 8.0 + mark_size),
+            ],
+            stroke,
+        );
+
+        // Bottom-left
+        ui.painter().line_segment(
+            [
+                Pos2::new(rect.min.x + 8.0, rect.max.y - 8.0),
+                Pos2::new(rect.min.x + 8.0 + mark_size, rect.max.y - 8.0),
+            ],
+            stroke,
+        );
+        ui.painter().line_segment(
+            [
+                Pos2::new(rect.min.x + 8.0, rect.max.y - 8.0),
+                Pos2::new(rect.min.x + 8.0, rect.max.y - 8.0 - mark_size),
+            ],
+            stroke,
+        );
+
+        // Bottom-right
+        ui.painter().line_segment(
+            [
+                Pos2::new(rect.max.x - 8.0, rect.max.y - 8.0),
+                Pos2::new(rect.max.x - 8.0 - mark_size, rect.max.y - 8.0),
+            ],
+            stroke,
+        );
+        ui.painter().line_segment(
+            [
+                Pos2::new(rect.max.x - 8.0, rect.max.y - 8.0),
+                Pos2::new(rect.max.x - 8.0, rect.max.y - 8.0 - mark_size),
+            ],
+            stroke,
+        );
+    }
+
+    /// Draw loading overlay when current mode's data is still computing - MIL-SPEC
     fn draw_loading_overlay(&self, ui: &mut egui::Ui, rect: Rect) {
         let tab = self.active_tab();
 
-        // Semi-transparent dark overlay
+        // Semi-transparent dark overlay using MIL-SPEC void black
         ui.painter()
-            .rect_filled(rect, 0.0, Color32::from_rgba_unmultiplied(20, 20, 25, 200));
+            .rect_filled(rect, 0.0, VOID_BLACK.gamma_multiply(0.85));
 
-        // Loading message box
-        let box_size = Vec2::new(280.0, 100.0);
+        // Draw corner marks
+        self.draw_corner_marks(ui, rect, TACTICAL_CYAN.gamma_multiply(0.5));
+
+        // Loading message box - MIL-SPEC panel
+        let box_size = Vec2::new(300.0, 110.0);
         let box_rect = Rect::from_center_size(rect.center(), box_size);
 
+        ui.painter().rect_filled(box_rect, 0.0, PANEL_DARK);
         ui.painter()
-            .rect_filled(box_rect, 12.0, Color32::from_rgb(35, 35, 45));
-        ui.painter().rect_stroke(
-            box_rect,
-            12.0,
-            egui::Stroke::new(2.0, Color32::from_rgb(80, 120, 200)),
-        );
+            .rect_stroke(box_rect, 0.0, egui::Stroke::new(2.0, TACTICAL_CYAN));
 
-        // Mode name
-        let mode_name = tab.viz_mode.name();
+        // Mode name - MIL-SPEC format
+        let mode_name = tab.viz_mode.name().to_uppercase();
         ui.painter().text(
-            box_rect.center() - Vec2::new(0.0, 20.0),
+            box_rect.center() - Vec2::new(0.0, 28.0),
             egui::Align2::CENTER_CENTER,
-            format!("Computing {}", mode_name),
-            egui::FontId::monospace(14.0),
-            Color32::WHITE,
+            format!("[ COMPUTING {} ]", mode_name),
+            egui::FontId::monospace(12.0),
+            DATA_WHITE,
         );
 
-        // Animated dots (based on time)
-        let dots = match (ui.ctx().input(|i| i.time) * 3.0) as i32 % 4 {
-            0 => "",
-            1 => ".",
-            2 => "..",
-            _ => "...",
+        // Status indicator
+        let time = ui.ctx().input(|i| i.time);
+        let scan_char = match (time * 8.0) as i32 % 4 {
+            0 => "▓▓▓░░░░░",
+            1 => "░▓▓▓░░░░",
+            2 => "░░▓▓▓░░░",
+            _ => "░░░▓▓▓░░",
         };
         ui.painter().text(
-            box_rect.center() + Vec2::new(0.0, 5.0),
+            box_rect.center() - Vec2::new(0.0, 8.0),
             egui::Align2::CENTER_CENTER,
-            format!("Please wait{}", dots),
+            scan_char,
             egui::FontId::monospace(12.0),
-            Color32::GRAY,
+            TACTICAL_CYAN,
         );
 
         // Progress hint with percentages
@@ -1918,81 +2114,168 @@ impl ApeironApp {
             // Get the progress for the current mode's relevant task
             let (task_name, progress) = match tab.viz_mode {
                 VisualizationMode::KolmogorovComplexity => {
-                    ("Complexity", tasks.complexity_progress)
+                    ("COMPLEXITY", tasks.complexity_progress)
                 }
                 VisualizationMode::MultiScaleEntropy => ("RCMSE", tasks.rcmse_progress),
-                VisualizationMode::WaveletEntropy => ("Wavelet", tasks.wavelet_progress),
-                _ => ("Analysis", 0.0),
+                VisualizationMode::WaveletEntropy => ("WAVELET", tasks.wavelet_progress),
+                _ => ("ANALYSIS", 0.0),
             };
 
             let pct = (progress * 100.0) as u32;
             ui.painter().text(
-                box_rect.center() + Vec2::new(0.0, 28.0),
+                box_rect.center() + Vec2::new(0.0, 14.0),
                 egui::Align2::CENTER_CENTER,
-                format!("{}: {}%", task_name, pct),
-                egui::FontId::monospace(12.0),
-                Color32::from_rgb(180, 160, 100),
+                format!("{}: {:03}%", task_name, pct),
+                egui::FontId::monospace(11.0),
+                CAUTION_AMBER,
             );
 
-            // Progress bar
-            let bar_width = 200.0;
-            let bar_height = 6.0;
+            // Progress bar - MIL-SPEC style
+            let bar_width = 220.0;
+            let bar_height = 4.0;
             let bar_rect = Rect::from_center_size(
-                box_rect.center() + Vec2::new(0.0, 50.0),
+                box_rect.center() + Vec2::new(0.0, 36.0),
                 Vec2::new(bar_width, bar_height),
             );
 
             // Background
-            ui.painter()
-                .rect_filled(bar_rect, 3.0, Color32::from_rgb(50, 50, 60));
+            ui.painter().rect_filled(bar_rect, 0.0, INTERFACE_GRAY);
 
             // Progress fill
             let fill_width = bar_width * progress;
             let fill_rect = Rect::from_min_size(bar_rect.min, Vec2::new(fill_width, bar_height));
-            ui.painter()
-                .rect_filled(fill_rect, 3.0, Color32::from_rgb(80, 120, 200));
+            ui.painter().rect_filled(fill_rect, 0.0, TACTICAL_CYAN);
         }
     }
 
-    /// Draw a compact progress indicator for a background task.
+    /// Draw a compact progress indicator for a background task - MIL-SPEC
     fn draw_task_progress(&self, ui: &mut egui::Ui, name: &str, progress: f32) {
         let pct = (progress * 100.0) as u32;
         ui.label(
-            RichText::new(format!("{}: {}%", name, pct))
+            RichText::new(format!("{}: {:03}%", name.to_uppercase(), pct))
                 .size(9.0)
                 .color(if progress >= 1.0 {
-                    Color32::from_rgb(100, 200, 100)
+                    OPERATIONAL_GREEN
                 } else {
-                    Color32::from_rgb(180, 160, 100)
+                    CAUTION_AMBER
                 }),
         );
     }
 
-    /// Draw the drop target indicator.
+    /// Draw the drop target indicator - MIL-SPEC TARGET ACQUISITION
     fn draw_drop_indicator(&self, ui: &mut egui::Ui, rect: Rect) {
-        // Darken background
-        ui.painter()
-            .rect_filled(rect, 0.0, Color32::from_rgba_unmultiplied(0, 0, 0, 150));
+        // Request continuous repainting for pulse animation
+        ui.ctx().request_repaint();
 
-        // Dashed border rectangle
-        let inner_rect = Rect::from_center_size(rect.center(), Vec2::new(300.0, 200.0));
+        // Calculate pulse intensity based on time (0.5 Hz oscillation)
+        let time = ui.input(|i| i.time);
+        let pulse = ((time * std::f64::consts::PI).sin() * 0.5 + 0.5) as f32;
+        let pulse_color = TACTICAL_CYAN.gamma_multiply(0.5 + pulse * 0.5);
+
+        // Darken background with tactical overlay
+        ui.painter()
+            .rect_filled(rect, 0.0, VOID_BLACK.gamma_multiply(0.85));
+
+        // Tactical grid pattern
+        let grid_spacing = 40.0;
+        let grid_color = INTERFACE_GRAY.gamma_multiply(0.4);
+        let grid_stroke = egui::Stroke::new(0.5, grid_color);
+
+        // Vertical grid lines
+        let mut x = rect.left() + grid_spacing;
+        while x < rect.right() {
+            ui.painter().line_segment(
+                [egui::pos2(x, rect.top()), egui::pos2(x, rect.bottom())],
+                grid_stroke,
+            );
+            x += grid_spacing;
+        }
+
+        // Horizontal grid lines
+        let mut y = rect.top() + grid_spacing;
+        while y < rect.bottom() {
+            ui.painter().line_segment(
+                [egui::pos2(rect.left(), y), egui::pos2(rect.right(), y)],
+                grid_stroke,
+            );
+            y += grid_spacing;
+        }
+
+        // Pulsing outer border
         ui.painter().rect_stroke(
-            inner_rect,
-            16.0,
-            egui::Stroke::new(4.0, Color32::from_rgb(100, 150, 255)),
+            rect.shrink(2.0),
+            0.0,
+            egui::Stroke::new(2.0 + pulse, pulse_color),
         );
 
-        // Text
+        // Draw corner marks with pulse
+        self.draw_corner_marks(ui, rect, pulse_color);
+
+        // Target acquisition box
+        let inner_rect = Rect::from_center_size(rect.center(), Vec2::new(320.0, 180.0));
+        ui.painter()
+            .rect_stroke(inner_rect, 0.0, egui::Stroke::new(2.0 + pulse, pulse_color));
+
+        // Inner glow line
+        let glow_rect = inner_rect.shrink(4.0);
+        ui.painter().rect_stroke(
+            glow_rect,
+            0.0,
+            egui::Stroke::new(1.0, TACTICAL_CYAN.gamma_multiply(0.3)),
+        );
+
+        // Crosshair markers at corners of target box
+        let corner_size = 12.0;
+        let corners = [
+            inner_rect.left_top(),
+            inner_rect.right_top(),
+            inner_rect.left_bottom(),
+            inner_rect.right_bottom(),
+        ];
+        for corner in corners {
+            let is_left = corner.x == inner_rect.left();
+            let is_top = corner.y == inner_rect.top();
+            let dx = if is_left { corner_size } else { -corner_size };
+            let dy = if is_top { corner_size } else { -corner_size };
+            ui.painter().line_segment(
+                [corner, egui::pos2(corner.x + dx, corner.y)],
+                egui::Stroke::new(2.0, pulse_color),
+            );
+            ui.painter().line_segment(
+                [corner, egui::pos2(corner.x, corner.y + dy)],
+                egui::Stroke::new(2.0, pulse_color),
+            );
+        }
+
+        // Header text
+        ui.painter().text(
+            rect.center() - Vec2::new(0.0, 50.0),
+            egui::Align2::CENTER_CENTER,
+            "[ TARGET ACQUISITION ]",
+            egui::FontId::monospace(11.0),
+            MUTED_TEXT,
+        );
+
+        // Main text with pulse
         ui.painter().text(
             rect.center(),
             egui::Align2::CENTER_CENTER,
             "DROP BINARY FILE",
-            egui::FontId::monospace(24.0),
-            Color32::WHITE,
+            egui::FontId::monospace(20.0),
+            pulse_color,
+        );
+
+        // Status text
+        ui.painter().text(
+            rect.center() + Vec2::new(0.0, 40.0),
+            egui::Align2::CENTER_CENTER,
+            "STATUS: [AWAITING TARGET]",
+            egui::FontId::monospace(10.0),
+            OPERATIONAL_GREEN.gamma_multiply(0.5 + pulse * 0.5),
         );
     }
 
-    /// Draw the HUD overlay with zoom, position, and file size.
+    /// Draw the HUD overlay with zoom, position, and file size - MIL-SPEC FORMAT
     fn draw_hud(&self, ui: &mut egui::Ui, rect: Rect) {
         let tab = self.active_tab();
         let Some(file) = &tab.file_data else {
@@ -2000,16 +2283,15 @@ impl ApeironApp {
         };
 
         let hud_rect = Rect::from_min_size(
-            rect.min + Vec2::new(16.0, rect.height() - 50.0),
-            Vec2::new(380.0, 34.0),
+            rect.min + Vec2::new(12.0, rect.height() - 46.0),
+            Vec2::new(420.0, 34.0),
         );
 
-        // Semi-transparent background
-        ui.painter().rect_filled(
-            hud_rect,
-            8.0,
-            Color32::from_rgba_unmultiplied(30, 30, 30, 200),
-        );
+        // MIL-SPEC panel background
+        ui.painter()
+            .rect_filled(hud_rect, 2.0, PANEL_DARK.gamma_multiply(0.9));
+        ui.painter()
+            .rect_stroke(hud_rect, 2.0, egui::Stroke::new(1.0, INTERFACE_GRAY));
 
         let mode_indicator = match tab.viz_mode {
             VisualizationMode::Hilbert => "HIL",
@@ -2022,8 +2304,9 @@ impl ApeironApp {
             VisualizationMode::WaveletEntropy => "WAV",
         };
 
+        // MIL-SPEC coordinate format
         let text = format!(
-            " [{}]  {:.2}x   {:.0}, {:.0}   {}",
+            "◢ [{}] | ZOOM: {:.2}x | POS: {:.0},{:.0} | SIZE: {} | [ACTIVE]",
             mode_indicator,
             tab.viewport.zoom,
             tab.viewport.offset.x,
@@ -2035,28 +2318,20 @@ impl ApeironApp {
             hud_rect.center(),
             egui::Align2::CENTER_CENTER,
             text,
-            egui::FontId::monospace(12.0),
-            Color32::LIGHT_GRAY,
+            egui::FontId::monospace(10.0),
+            TACTICAL_CYAN,
         );
     }
 
-    /// Draw the data inspector panel with interactive hex view.
-    fn draw_inspector(&mut self, ui: &mut egui::Ui) {
+    /// Draw the inspector content (for use in floating panel) - MIL-SPEC
+    fn draw_inspector_content(&mut self, ui: &mut egui::Ui) {
         if self.active_tab().file_data.is_none() {
-            // No file loaded placeholder
-            ui.centered_and_justified(|ui| {
-                ui.label(
-                    RichText::new("Drop a file to inspect")
-                        .monospace()
-                        .color(Color32::DARK_GRAY),
-                );
-            });
             return;
         }
 
-        // Main content with proper margins
-        egui::Frame::none()
-            .inner_margin(egui::Margin::symmetric(12.0, 8.0))
+        // Wrap in ScrollArea for scrollable content
+        egui::ScrollArea::vertical()
+            .auto_shrink([false, false])
             .show(ui, |ui| {
                 // Get file data for hex view
                 let tab = &self.tabs[self.active_tab];
@@ -2066,18 +2341,18 @@ impl ApeironApp {
                 let file_type = file.file_type;
                 let selection_offset = tab.selection.offset;
 
-                // Header: File type and size
+                // Header: File type and size - MIL-SPEC format
                 ui.horizontal(|ui| {
                     ui.label(
-                        RichText::new(file_type)
+                        RichText::new(format!("[ {} ]", file_type.to_uppercase()))
                             .monospace()
                             .strong()
-                            .color(Color32::LIGHT_BLUE),
+                            .color(TACTICAL_CYAN),
                     );
                     ui.label(
-                        RichText::new(format!(" - {}", format_bytes(file_size)))
+                        RichText::new(format!("// {}", format_bytes(file_size)))
                             .monospace()
-                            .color(Color32::GRAY),
+                            .color(MUTED_TEXT),
                     );
                 });
                 ui.add_space(4.0);
@@ -2087,16 +2362,16 @@ impl ApeironApp {
                 // Hex View - dynamically calculate bytes per row based on width
                 let panel_width = ui.available_width();
                 // Calculate bytes_per_row based on available width
-                // Approximate: offset(70) + gap(8) + hex(N*22) + gap(4) + hex(N*22) + gap(8) + ascii(N*8)
-                // Simplified: 90 + N*30, so N = (width - 90) / 30
+                // Approximate: offset(70) + gap(6) + hex bytes + gap(4) + ascii
+                // For floating panel (~280px), use 8 bytes max
                 let bytes_per_row = if panel_width >= 500.0 {
                     16
-                } else if panel_width >= 380.0 {
+                } else if panel_width >= 400.0 {
                     12
-                } else if panel_width >= 260.0 {
+                } else if panel_width >= 320.0 {
                     8
                 } else {
-                    4
+                    4 // Narrow floating panel
                 };
 
                 let row_height = 18.0;
@@ -2127,10 +2402,11 @@ impl ApeironApp {
                     tab.hex_view.scroll_offset = (start_row * bytes_per_row) as u64;
                 }
 
-                // Hex View with proper clipping via ScrollArea
+                // Hex View with proper clipping via ScrollArea - MIL-SPEC
                 egui::Frame::none()
-                    .fill(Color32::from_rgb(15, 15, 20))
-                    .rounding(4.0)
+                    .fill(VOID_BLACK)
+                    .rounding(0.0)
+                    .stroke(egui::Stroke::new(1.0, INTERFACE_GRAY))
                     .inner_margin(8.0)
                     .show(ui, |ui| {
                         egui::ScrollArea::vertical()
@@ -2152,14 +2428,14 @@ impl ApeironApp {
                                     let is_selected_row = row_idx == selection_row;
 
                                     ui.horizontal(|ui| {
-                                        // Offset column
+                                        // Offset column - MIL-SPEC
                                         let offset_color = if is_selected_row {
-                                            Color32::YELLOW
+                                            TACTICAL_CYAN
                                         } else {
-                                            Color32::from_rgb(100, 100, 180)
+                                            DIM_CYAN
                                         };
                                         ui.label(
-                                            RichText::new(format!("{:08x}", row_offset))
+                                            RichText::new(format!("{:08X}", row_offset))
                                                 .monospace()
                                                 .size(11.0)
                                                 .color(offset_color),
@@ -2167,7 +2443,7 @@ impl ApeironApp {
 
                                         ui.add_space(6.0);
 
-                                        // Hex bytes - first half
+                                        // Hex bytes - first half - MIL-SPEC
                                         for (i, &byte) in
                                             row_bytes.iter().take(half_bytes).enumerate()
                                         {
@@ -2176,20 +2452,20 @@ impl ApeironApp {
                                                 byte_offset == selection_offset as usize;
 
                                             if is_cursor_byte {
-                                                egui::Frame::none().fill(Color32::YELLOW).show(
+                                                egui::Frame::none().fill(TACTICAL_CYAN).show(
                                                     ui,
                                                     |ui| {
                                                         ui.label(
-                                                            RichText::new(format!("{:02x}", byte))
+                                                            RichText::new(format!("{:02X}", byte))
                                                                 .monospace()
                                                                 .size(11.0)
-                                                                .color(Color32::BLACK),
+                                                                .color(VOID_BLACK),
                                                         );
                                                     },
                                                 );
                                             } else {
                                                 ui.label(
-                                                    RichText::new(format!("{:02x}", byte))
+                                                    RichText::new(format!("{:02X}", byte))
                                                         .monospace()
                                                         .size(11.0)
                                                         .color(Self::byte_color(byte)),
@@ -2199,7 +2475,7 @@ impl ApeironApp {
 
                                         ui.add_space(4.0);
 
-                                        // Hex bytes - second half
+                                        // Hex bytes - second half - MIL-SPEC
                                         for (i, &byte) in row_bytes
                                             .iter()
                                             .skip(half_bytes)
@@ -2211,20 +2487,20 @@ impl ApeironApp {
                                                 byte_offset == selection_offset as usize;
 
                                             if is_cursor_byte {
-                                                egui::Frame::none().fill(Color32::YELLOW).show(
+                                                egui::Frame::none().fill(TACTICAL_CYAN).show(
                                                     ui,
                                                     |ui| {
                                                         ui.label(
-                                                            RichText::new(format!("{:02x}", byte))
+                                                            RichText::new(format!("{:02X}", byte))
                                                                 .monospace()
                                                                 .size(11.0)
-                                                                .color(Color32::BLACK),
+                                                                .color(VOID_BLACK),
                                                         );
                                                     },
                                                 );
                                             } else {
                                                 ui.label(
-                                                    RichText::new(format!("{:02x}", byte))
+                                                    RichText::new(format!("{:02X}", byte))
                                                         .monospace()
                                                         .size(11.0)
                                                         .color(Self::byte_color(byte)),
@@ -2244,7 +2520,7 @@ impl ApeironApp {
 
                                         ui.add_space(8.0);
 
-                                        // ASCII column
+                                        // ASCII column - MIL-SPEC
                                         for (i, &byte) in row_bytes.iter().enumerate() {
                                             let byte_offset = row_offset + i;
                                             let is_cursor_byte =
@@ -2260,15 +2536,17 @@ impl ApeironApp {
                                                     RichText::new(ch.to_string())
                                                         .monospace()
                                                         .size(11.0)
-                                                        .color(Color32::BLACK)
-                                                        .background_color(Color32::YELLOW),
+                                                        .color(VOID_BLACK)
+                                                        .background_color(TACTICAL_CYAN),
                                                 );
                                             } else {
                                                 ui.label(
                                                     RichText::new(ch.to_string())
                                                         .monospace()
                                                         .size(11.0)
-                                                        .color(Color32::from_rgb(80, 200, 80)),
+                                                        .color(
+                                                            OPERATIONAL_GREEN.gamma_multiply(0.7),
+                                                        ),
                                                 );
                                             }
                                         }
@@ -2318,7 +2596,7 @@ impl ApeironApp {
                                         ui.label(
                                             RichText::new("ENTROPY")
                                                 .monospace()
-                                                .color(Color32::GRAY)
+                                                .color(MUTED_TEXT)
                                                 .small(),
                                         );
                                     },
@@ -2338,14 +2616,13 @@ impl ApeironApp {
                                 );
                             });
 
-                            // Entropy bar
+                            // Entropy bar - MIL-SPEC
                             let bar_height = 6.0;
                             let (bar_rect, _) = ui.allocate_exact_size(
                                 egui::Vec2::new(ui.available_width(), bar_height),
                                 Sense::hover(),
                             );
-                            ui.painter()
-                                .rect_filled(bar_rect, 3.0, Color32::from_gray(50));
+                            ui.painter().rect_filled(bar_rect, 0.0, INTERFACE_GRAY);
                             let fill_width = bar_rect.width() * (selection_entropy as f32 / 8.0);
                             let fill_rect = Rect::from_min_size(
                                 bar_rect.min,
@@ -2353,27 +2630,27 @@ impl ApeironApp {
                             );
                             ui.painter().rect_filled(
                                 fill_rect,
-                                3.0,
+                                0.0,
                                 Self::entropy_color(selection_entropy),
                             );
 
-                            // Interpretation
+                            // Interpretation - MIL-SPEC classification
                             let interpretation = if selection_entropy < 1.0 {
-                                "Uniform/empty data"
+                                "CLASS: UNIFORM/EMPTY"
                             } else if selection_entropy < 3.0 {
-                                "Low entropy - text/code"
+                                "CLASS: STRUCTURED (TEXT/CODE)"
                             } else if selection_entropy < 5.0 {
-                                "Medium entropy - mixed"
+                                "CLASS: MIXED DATA"
                             } else if selection_entropy < 7.0 {
-                                "High entropy - binary"
+                                "CLASS: HIGH ENTROPY (BINARY)"
                             } else {
-                                "Very high - encrypted/compressed"
+                                "CLASS: ENCRYPTED/COMPRESSED"
                             };
                             ui.label(
                                 RichText::new(interpretation)
                                     .monospace()
                                     .small()
-                                    .color(Color32::GRAY),
+                                    .color(MUTED_TEXT),
                             );
                         });
 
@@ -2391,7 +2668,7 @@ impl ApeironApp {
                                         ui.label(
                                             RichText::new("COMPLEXITY")
                                                 .monospace()
-                                                .color(Color32::GRAY)
+                                                .color(MUTED_TEXT)
                                                 .small(),
                                         );
                                     },
@@ -2411,14 +2688,13 @@ impl ApeironApp {
                                 );
                             });
 
-                            // Complexity bar
+                            // Complexity bar - MIL-SPEC
                             let bar_height = 6.0;
                             let (bar_rect, _) = ui.allocate_exact_size(
                                 egui::Vec2::new(ui.available_width(), bar_height),
                                 Sense::hover(),
                             );
-                            ui.painter()
-                                .rect_filled(bar_rect, 3.0, Color32::from_gray(50));
+                            ui.painter().rect_filled(bar_rect, 0.0, INTERFACE_GRAY);
                             let fill_width = bar_rect.width() * selection_complexity as f32;
                             let fill_rect = Rect::from_min_size(
                                 bar_rect.min,
@@ -2426,27 +2702,27 @@ impl ApeironApp {
                             );
                             ui.painter().rect_filled(
                                 fill_rect,
-                                3.0,
+                                0.0,
                                 Self::complexity_color(selection_complexity),
                             );
 
-                            // Interpretation
+                            // Interpretation - MIL-SPEC classification
                             let interpretation = if selection_complexity < 0.2 {
-                                "Highly compressible"
+                                "CLASS: HIGHLY COMPRESSIBLE"
                             } else if selection_complexity < 0.4 {
-                                "Simple patterns"
+                                "CLASS: SIMPLE PATTERNS"
                             } else if selection_complexity < 0.6 {
-                                "Structured data"
+                                "CLASS: STRUCTURED DATA"
                             } else if selection_complexity < 0.8 {
-                                "Complex/compressed"
+                                "CLASS: COMPLEX/COMPRESSED"
                             } else {
-                                "Random/encrypted"
+                                "CLASS: RANDOM/ENCRYPTED"
                             };
                             ui.label(
                                 RichText::new(interpretation)
                                     .monospace()
                                     .small()
-                                    .color(Color32::GRAY),
+                                    .color(MUTED_TEXT),
                             );
                         });
 
@@ -2468,9 +2744,9 @@ impl ApeironApp {
                                         egui::Layout::left_to_right(egui::Align::Center),
                                         |ui| {
                                             ui.label(
-                                                RichText::new("MALWARE PROB")
+                                                RichText::new("THREAT PROB")
                                                     .monospace()
-                                                    .color(Color32::GRAY)
+                                                    .color(MUTED_TEXT)
                                                     .small(),
                                             );
                                         },
@@ -2482,17 +2758,18 @@ impl ApeironApp {
                                         ),
                                         egui::Layout::right_to_left(egui::Align::Center),
                                         |ui| {
+                                            // MIL-SPEC status colors
                                             let prob_color = match ssecs.classification {
                                                 wm::MalwareClassification::Clean => {
-                                                    Color32::from_rgb(100, 200, 100)
+                                                    OPERATIONAL_GREEN
                                                 }
                                                 wm::MalwareClassification::Suspicious => {
-                                                    Color32::from_rgb(255, 200, 50)
+                                                    CAUTION_AMBER
                                                 }
                                                 wm::MalwareClassification::LikelyMalware => {
-                                                    Color32::from_rgb(255, 80, 80)
+                                                    ALERT_RED
                                                 }
-                                                wm::MalwareClassification::Unknown => Color32::GRAY,
+                                                wm::MalwareClassification::Unknown => MUTED_TEXT,
                                             };
                                             ui.label(
                                                 RichText::new(format!(
@@ -2507,50 +2784,48 @@ impl ApeironApp {
                                     );
                                 });
 
-                                // Malware probability bar
+                                // Malware probability bar - MIL-SPEC
                                 let bar_height = 6.0;
                                 let (bar_rect, _) = ui.allocate_exact_size(
                                     egui::Vec2::new(ui.available_width(), bar_height),
                                     Sense::hover(),
                                 );
-                                ui.painter()
-                                    .rect_filled(bar_rect, 3.0, Color32::from_gray(50));
+                                ui.painter().rect_filled(bar_rect, 0.0, INTERFACE_GRAY);
                                 let fill_width =
                                     bar_rect.width() * ssecs.probability_malware as f32;
                                 let fill_rect = Rect::from_min_size(
                                     bar_rect.min,
                                     egui::Vec2::new(fill_width, bar_height),
                                 );
-                                ui.painter().rect_filled(
-                                    fill_rect,
-                                    3.0,
-                                    match ssecs.classification {
-                                        wm::MalwareClassification::Clean => {
-                                            Color32::from_rgb(50, 150, 50)
-                                        }
-                                        wm::MalwareClassification::Suspicious => {
-                                            Color32::from_rgb(200, 150, 50)
-                                        }
-                                        wm::MalwareClassification::LikelyMalware => {
-                                            Color32::from_rgb(200, 50, 50)
-                                        }
-                                        wm::MalwareClassification::Unknown => Color32::GRAY,
-                                    },
-                                );
-
-                                // Classification label
-                                let classification_text = format!("{:?}", ssecs.classification);
-                                let classification_color = match ssecs.classification {
+                                // MIL-SPEC status colors for bar fill
+                                let bar_color = match ssecs.classification {
                                     wm::MalwareClassification::Clean => {
-                                        Color32::from_rgb(100, 200, 100)
+                                        OPERATIONAL_GREEN.gamma_multiply(0.8)
                                     }
                                     wm::MalwareClassification::Suspicious => {
-                                        Color32::from_rgb(255, 200, 100)
+                                        CAUTION_AMBER.gamma_multiply(0.8)
                                     }
                                     wm::MalwareClassification::LikelyMalware => {
-                                        Color32::from_rgb(255, 100, 100)
+                                        ALERT_RED.gamma_multiply(0.8)
                                     }
-                                    wm::MalwareClassification::Unknown => Color32::GRAY,
+                                    wm::MalwareClassification::Unknown => MUTED_TEXT,
+                                };
+                                ui.painter().rect_filled(fill_rect, 0.0, bar_color);
+
+                                // Classification label - MIL-SPEC format
+                                let classification_text = match ssecs.classification {
+                                    wm::MalwareClassification::Clean => "STATUS: CLEAN",
+                                    wm::MalwareClassification::Suspicious => "STATUS: SUSPICIOUS",
+                                    wm::MalwareClassification::LikelyMalware => {
+                                        "STATUS: THREAT DETECTED"
+                                    }
+                                    wm::MalwareClassification::Unknown => "STATUS: UNKNOWN",
+                                };
+                                let classification_color = match ssecs.classification {
+                                    wm::MalwareClassification::Clean => OPERATIONAL_GREEN,
+                                    wm::MalwareClassification::Suspicious => CAUTION_AMBER,
+                                    wm::MalwareClassification::LikelyMalware => ALERT_RED,
+                                    wm::MalwareClassification::Unknown => MUTED_TEXT,
                                 };
                                 ui.label(
                                     RichText::new(classification_text)
@@ -2559,34 +2834,34 @@ impl ApeironApp {
                                         .color(classification_color),
                                 );
 
-                                // Energy ratios
+                                // Energy ratios - MIL-SPEC
                                 ui.add_space(4.0);
                                 ui.label(
-                                    RichText::new("Energy Distribution")
+                                    RichText::new("ENERGY DISTRIBUTION")
                                         .monospace()
                                         .small()
-                                        .color(Color32::GRAY),
+                                        .color(MUTED_TEXT),
                                 );
 
                                 ui.horizontal(|ui| {
                                     ui.label(
                                         RichText::new(format!(
-                                            "Coarse: {:.1}%",
+                                            "COARSE: {:.1}%",
                                             ssecs.coarse_energy_ratio * 100.0
                                         ))
                                         .monospace()
                                         .small()
-                                        .color(Color32::LIGHT_RED),
+                                        .color(ALERT_RED.gamma_multiply(0.8)),
                                     );
                                     ui.add_space(8.0);
                                     ui.label(
                                         RichText::new(format!(
-                                            "Fine: {:.1}%",
+                                            "FINE: {:.1}%",
                                             ssecs.fine_energy_ratio * 100.0
                                         ))
                                         .monospace()
                                         .small()
-                                        .color(Color32::LIGHT_BLUE),
+                                        .color(TACTICAL_CYAN.gamma_multiply(0.8)),
                                     );
                                 });
 
@@ -2594,29 +2869,30 @@ impl ApeironApp {
                                 ui.add_space(4.0);
                                 ui.label(
                                     RichText::new(format!(
-                                        "Levels: {}, Chunks: {}",
+                                        "LEVELS: {} // CHUNKS: {}",
                                         report.num_wavelet_levels, report.num_entropy_chunks
                                     ))
                                     .monospace()
                                     .small()
-                                    .color(Color32::GRAY),
+                                    .color(MUTED_TEXT),
                                 );
                             } else {
                                 ui.label(
-                                    RichText::new("Analyzing...")
+                                    RichText::new("[ANALYZING...]")
                                         .monospace()
-                                        .color(Color32::GRAY),
+                                        .color(TACTICAL_CYAN),
                                 );
                             }
                         });
 
-                        // String Preview (if ASCII found)
+                        // String Preview (if ASCII found) - MIL-SPEC
                         if let Some(ref ascii) = selection_ascii {
                             ui.separator();
-                            Self::section(ui, "STRING HINT", |ui| {
+                            Self::section(ui, "STRING EXTRACTION", |ui| {
                                 egui::Frame::none()
-                                    .fill(Color32::from_rgba_unmultiplied(0, 0, 0, 100))
-                                    .rounding(4.0)
+                                    .fill(VOID_BLACK)
+                                    .stroke(egui::Stroke::new(1.0, INTERFACE_GRAY))
+                                    .rounding(0.0)
                                     .inner_margin(6.0)
                                     .show(ui, |ui| {
                                         // Truncate long strings for display
@@ -2629,7 +2905,7 @@ impl ApeironApp {
                                             RichText::new(display_str)
                                                 .monospace()
                                                 .size(11.0)
-                                                .color(Color32::YELLOW),
+                                                .color(CAUTION_AMBER),
                                         );
                                     });
                             });
@@ -2638,23 +2914,61 @@ impl ApeironApp {
             });
     }
 
-    /// Draw a section with a title.
+    /// Draw a section with a title - MIL-SPEC bracketed header with box drawing.
     fn section(ui: &mut egui::Ui, title: &str, content: impl FnOnce(&mut egui::Ui)) {
         ui.vertical(|ui| {
-            ui.label(
-                RichText::new(title)
-                    .monospace()
-                    .small()
-                    .strong()
-                    .color(Color32::GRAY),
+            // MIL-SPEC section header with box drawing characters
+            ui.horizontal(|ui| {
+                ui.label(
+                    RichText::new("╔═══")
+                        .monospace()
+                        .size(10.0)
+                        .color(INTERFACE_GRAY),
+                );
+                ui.label(
+                    RichText::new(format!("[ {} ]", title))
+                        .monospace()
+                        .size(10.0)
+                        .strong()
+                        .color(TACTICAL_CYAN),
+                );
+                // Fill remaining width with box chars
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.label(
+                        RichText::new("═══╗")
+                            .monospace()
+                            .size(10.0)
+                            .color(INTERFACE_GRAY),
+                    );
+                });
+            });
+            ui.add_space(2.0);
+            // Double-line separator
+            let rect = ui.available_rect_before_wrap();
+            ui.painter().line_segment(
+                [
+                    egui::pos2(rect.left(), rect.top()),
+                    egui::pos2(rect.right(), rect.top()),
+                ],
+                egui::Stroke::new(1.5, DIM_CYAN),
             );
-            ui.add_space(8.0);
+            ui.add_space(6.0);
             content(ui);
+            // Bottom separator
+            ui.add_space(4.0);
+            let rect = ui.available_rect_before_wrap();
+            ui.painter().line_segment(
+                [
+                    egui::pos2(rect.left(), rect.top()),
+                    egui::pos2(rect.right(), rect.top()),
+                ],
+                egui::Stroke::new(1.0, INTERFACE_GRAY),
+            );
         });
         ui.add_space(8.0);
     }
 
-    /// Draw an info row with label and value.
+    /// Draw an info row with label and value - MIL-SPEC dotted format.
     fn info_row(ui: &mut egui::Ui, label: &str, value: &str) {
         let available = ui.available_width();
         ui.horizontal(|ui| {
@@ -2665,8 +2979,8 @@ impl ApeironApp {
                     ui.label(
                         RichText::new(label)
                             .monospace()
-                            .small()
-                            .color(Color32::GRAY),
+                            .size(10.0)
+                            .color(MUTED_TEXT),
                     );
                 },
             );
@@ -2674,241 +2988,315 @@ impl ApeironApp {
                 egui::Vec2::new(available * 0.5, ui.spacing().interact_size.y),
                 egui::Layout::right_to_left(egui::Align::Center),
                 |ui| {
-                    ui.label(RichText::new(value).monospace().color(Color32::WHITE));
+                    ui.label(
+                        RichText::new(value)
+                            .monospace()
+                            .size(11.0)
+                            .color(DATA_WHITE),
+                    );
                 },
             );
         });
     }
 
-    /// Get color for a byte value based on its characteristics.
+    /// Get color for a byte value based on its characteristics - MIL-SPEC.
     fn byte_color(byte: u8) -> Color32 {
         if byte == 0 {
-            Color32::from_rgb(60, 60, 80) // Null - dark blue-gray
+            Color32::from_rgb(60, 70, 80) // Null - dim interface gray
         } else if (0x20..=0x7e).contains(&byte) {
-            Color32::from_rgb(180, 180, 220) // Printable ASCII - light
+            DATA_WHITE // Printable ASCII - data white
         } else if byte == 0xff {
-            Color32::from_rgb(255, 100, 100) // 0xFF - red
+            ALERT_RED // 0xFF - alert red
         } else if byte > 0x7f {
-            Color32::from_rgb(255, 180, 100) // High bytes - orange
+            CAUTION_AMBER // High bytes - caution amber
         } else {
-            Color32::from_rgb(100, 180, 255) // Control chars - blue
+            DIM_CYAN // Control chars - dim cyan
         }
     }
 
-    /// Get color for entropy value.
+    /// Get color for entropy value - MIL-SPEC status colors.
     fn entropy_color(entropy: f64) -> Color32 {
         if entropy > 7.0 {
-            Color32::from_rgb(255, 80, 80) // Red
-        } else if entropy > 4.0 {
-            Color32::from_rgb(80, 255, 80) // Green
+            ALERT_RED // Critical - encrypted/random
+        } else if entropy > 5.0 {
+            CAUTION_AMBER // Warning - compressed
+        } else if entropy > 3.0 {
+            TACTICAL_CYAN // Nominal - code/data
         } else {
-            Color32::from_rgb(80, 150, 255) // Blue
+            OPERATIONAL_GREEN // Clean - structured
         }
     }
 
-    /// Get color for Kolmogorov complexity value (0-1).
+    /// Get color for Kolmogorov complexity value (0-1) - MIL-SPEC tactical gradient.
     fn complexity_color(complexity: f64) -> Color32 {
         let t = complexity.clamp(0.0, 1.0);
 
-        // Viridis-inspired colormap matching the visualization
-        let (r, g, b) = if t < 0.2 {
-            // Deep purple
-            (0.25 + t * 0.25, 0.0 + t * 0.75, 0.5 + t * 1.0)
-        } else if t < 0.4 {
-            // Blue to teal
-            let s = (t - 0.2) / 0.2;
-            (0.3 - s * 0.15, 0.15 + s * 0.4, 0.7 - s * 0.1)
-        } else if t < 0.6 {
-            // Teal to green-yellow
-            let s = (t - 0.4) / 0.2;
-            (0.15 + s * 0.6, 0.55 + s * 0.25, 0.6 - s * 0.4)
-        } else if t < 0.8 {
-            // Yellow to orange
-            let s = (t - 0.6) / 0.2;
-            (0.75 + s * 0.25, 0.8 - s * 0.3, 0.2 - s * 0.1)
+        // MIL-SPEC: operational green -> dim cyan -> tactical cyan -> amber -> alert red
+        let (r, g, b) = if t < 0.25 {
+            // Operational green to dim cyan (simple/compressible)
+            let s = t / 0.25;
+            (0.0, 1.0 - s * 0.45, 0.4 + s * 0.23)
+        } else if t < 0.5 {
+            // Dim cyan to tactical cyan (moderate complexity)
+            let s = (t - 0.25) / 0.25;
+            (0.0, 0.55 + s * 0.39, 0.63 + s * 0.37)
+        } else if t < 0.75 {
+            // Tactical cyan to caution amber (complex)
+            let s = (t - 0.5) / 0.25;
+            (s * 1.0, 0.94 - s * 0.22, 1.0 - s * 1.0)
         } else {
-            // Orange to hot pink/red
-            let s = (t - 0.8) / 0.2;
-            (1.0, 0.5 - s * 0.3, 0.1 + s * 0.4)
+            // Caution amber to alert red (random/encrypted)
+            let s = (t - 0.75) / 0.25;
+            (1.0, 0.72 - s * 0.52, s * 0.2)
         };
 
         Color32::from_rgb((r * 255.0) as u8, (g * 255.0) as u8, (b * 255.0) as u8)
     }
 
-    /// Draw the help popup content.
+    /// Draw the help popup content - MIL-SPEC document styling.
     fn draw_help(&mut self, ui: &mut egui::Ui) {
-        ui.set_min_width(320.0);
+        ui.set_min_width(380.0);
 
-        ui.vertical(|ui| {
-            ui.heading("Controls");
-            ui.add_space(8.0);
+        egui::Frame::none()
+            .fill(PANEL_DARK)
+            .inner_margin(16.0)
+            .show(ui, |ui| {
+                // Classification header
+                ui.horizontal(|ui| {
+                    ui.label(
+                        RichText::new("◢")
+                            .monospace()
+                            .size(10.0)
+                            .color(TACTICAL_CYAN),
+                    );
+                    ui.label(
+                        RichText::new("APEIRON // OPERATIONS MANUAL")
+                            .monospace()
+                            .size(11.0)
+                            .strong()
+                            .color(DATA_WHITE),
+                    );
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui.label(
+                            RichText::new("◣")
+                                .monospace()
+                                .size(10.0)
+                                .color(TACTICAL_CYAN),
+                        );
+                    });
+                });
+                ui.label(
+                    RichText::new("CLASSIFICATION: UNCLASSIFIED // REV.03")
+                        .monospace()
+                        .size(9.0)
+                        .color(MUTED_TEXT),
+                );
+                ui.add_space(12.0);
 
-            Self::control_row(ui, "Scroll", "Zoom in/out");
-            Self::control_row(ui, "Drag", "Pan view");
-            Self::control_row(ui, "Hover", "Inspect bytes");
+                // Separator
+                let rect = ui.available_rect_before_wrap();
+                ui.painter().line_segment(
+                    [
+                        egui::pos2(rect.left(), rect.top()),
+                        egui::pos2(rect.right(), rect.top()),
+                    ],
+                    egui::Stroke::new(1.0, INTERFACE_GRAY),
+                );
+                ui.add_space(12.0);
 
-            ui.add_space(16.0);
-            ui.separator();
-            ui.add_space(8.0);
+                // CONTROLS SECTION
+                ui.label(
+                    RichText::new("[ CONTROLS ]")
+                        .monospace()
+                        .size(10.0)
+                        .strong()
+                        .color(TACTICAL_CYAN),
+                );
+                ui.add_space(6.0);
 
-            ui.heading("Visualization Modes");
-            ui.add_space(8.0);
+                Self::control_row(ui, "SCROLL", "Zoom in/out");
+                Self::control_row(ui, "DRAG", "Pan view");
+                Self::control_row(ui, "HOVER", "Inspect bytes");
 
-            ui.label(
-                RichText::new("Hilbert Curve [HIL]")
-                    .strong()
-                    .monospace()
-                    .color(Color32::LIGHT_BLUE),
-            );
-            ui.label(RichText::new("  Space-filling curve mapping.").small());
-            ui.label(
-                RichText::new("  Preserves locality - nearby bytes are nearby pixels.").small(),
-            );
-            ui.label(RichText::new("  Color = entropy/data type.").small());
-            ui.add_space(8.0);
+                ui.add_space(12.0);
 
-            ui.label(
-                RichText::new("Similarity Matrix [SIM]")
-                    .strong()
-                    .monospace()
-                    .color(Color32::LIGHT_YELLOW),
-            );
-            ui.label(RichText::new("  Recurrence plot from nonlinear dynamics.").small());
-            ui.label(
-                RichText::new("  Pixel (x,y) = similarity between positions x and y.").small(),
-            );
-            ui.label(RichText::new("  Diagonal lines = repeating patterns.").small());
-            ui.add_space(8.0);
+                // VISUALIZATION MODES SECTION
+                ui.label(
+                    RichText::new("[ VISUALIZATION MODES ]")
+                        .monospace()
+                        .size(10.0)
+                        .strong()
+                        .color(TACTICAL_CYAN),
+                );
+                ui.add_space(6.0);
 
-            ui.label(
-                RichText::new("Byte Digraph [DIG]")
-                    .strong()
-                    .monospace()
-                    .color(Color32::LIGHT_GREEN),
-            );
-            ui.label(RichText::new("  256x256 byte transition frequencies.").small());
-            ui.label(RichText::new("  X = source byte, Y = following byte.").small());
-            ui.label(RichText::new("  Bright = frequent transition.").small());
-            ui.add_space(8.0);
+                // Mode entries with tactical styling
+                Self::mode_entry(
+                    ui,
+                    "HIL",
+                    "HILBERT CURVE",
+                    "Space-filling locality-preserving map",
+                );
+                Self::mode_entry(
+                    ui,
+                    "SIM",
+                    "SIMILARITY MATRIX",
+                    "Recurrence plot - diagonal = patterns",
+                );
+                Self::mode_entry(ui, "DIG", "BYTE DIGRAPH", "256x256 transition frequencies");
+                Self::mode_entry(
+                    ui,
+                    "BPS",
+                    "BYTE PHASE SPACE",
+                    "Trajectory through byte space",
+                );
+                Self::mode_entry(
+                    ui,
+                    "KOL",
+                    "KOLMOGOROV",
+                    "Algorithmic complexity via compression",
+                );
+                Self::mode_entry(ui, "JSD", "JS DIVERGENCE", "Distribution anomaly detection");
+                Self::mode_entry(
+                    ui,
+                    "MSE",
+                    "MULTI-SCALE ENTROPY",
+                    "RCMSE complexity analysis",
+                );
+                Self::mode_entry(
+                    ui,
+                    "WAV",
+                    "WAVELET ENTROPY",
+                    "SSECS malware pattern detection",
+                );
 
-            ui.label(
-                RichText::new("Kolmogorov Complexity [KOL]")
-                    .strong()
-                    .monospace()
-                    .color(Color32::from_rgb(255, 200, 100)),
-            );
-            ui.label(RichText::new("  Algorithmic complexity via compression.").small());
-            ui.label(RichText::new("  Approximates shortest program length.").small());
-            ui.label(RichText::new("  Low = simple/repetitive, High = random.").small());
-            ui.add_space(8.0);
+                ui.add_space(12.0);
 
-            ui.label(
-                RichText::new("JS Divergence [JSD]")
-                    .strong()
-                    .monospace()
-                    .color(Color32::from_rgb(255, 100, 150)),
-            );
-            ui.label(RichText::new("  Jensen-Shannon divergence from file average.").small());
-            ui.label(RichText::new("  Measures distribution anomalies.").small());
-            ui.label(RichText::new("  Low = normal, High = unusual byte dist.").small());
-            ui.add_space(8.0);
+                // ENTROPY LEGEND SECTION
+                ui.label(
+                    RichText::new("[ ENTROPY SCALE ]")
+                        .monospace()
+                        .size(10.0)
+                        .strong()
+                        .color(TACTICAL_CYAN),
+                );
+                ui.add_space(6.0);
 
-            ui.label(
-                RichText::new("Multi-Scale Entropy [MSE]")
-                    .strong()
-                    .monospace()
-                    .color(Color32::from_rgb(100, 200, 180)),
-            );
-            ui.label(RichText::new("  RCMSE - complexity across time scales.").small());
-            ui.label(RichText::new("  Distinguishes random vs structured data.").small());
-            ui.label(RichText::new("  Purple = random, Green = structured.").small());
-            ui.add_space(8.0);
+                Self::legend_row(ui, DIM_CYAN, "0-2 BITS: STRUCTURED/PADDING");
+                Self::legend_row(ui, TACTICAL_CYAN, "2-5 BITS: CODE/TEXT DATA");
+                Self::legend_row(ui, CAUTION_AMBER, "5-7 BITS: COMPRESSED");
+                Self::legend_row(ui, ALERT_RED, "7-8 BITS: ENCRYPTED/RANDOM");
 
-            ui.label(
-                RichText::new("Wavelet Entropy [WAV]")
-                    .strong()
-                    .monospace()
-                    .color(Color32::from_rgb(255, 150, 100)),
-            );
-            ui.label(RichText::new("  SSECS - Haar wavelet decomposition.").small());
-            ui.label(RichText::new("  Detects malware-like entropy patterns.").small());
-            ui.label(RichText::new("  Blue = normal, Red = suspicious.").small());
+                ui.add_space(12.0);
 
-            ui.add_space(8.0);
-            ui.separator();
-            ui.add_space(8.0);
+                // COMPLEXITY LEGEND SECTION
+                ui.label(
+                    RichText::new("[ COMPLEXITY SCALE ]")
+                        .monospace()
+                        .size(10.0)
+                        .strong()
+                        .color(TACTICAL_CYAN),
+                );
+                ui.add_space(6.0);
 
-            ui.heading("Entropy Color Scale");
-            ui.add_space(4.0);
+                Self::legend_row(ui, OPERATIONAL_GREEN, "LOW: HIGHLY COMPRESSIBLE");
+                Self::legend_row(ui, DIM_CYAN, "MED-LOW: SIMPLE PATTERNS");
+                Self::legend_row(ui, TACTICAL_CYAN, "MEDIUM: STRUCTURED DATA");
+                Self::legend_row(ui, CAUTION_AMBER, "HIGH: COMPLEX/COMPRESSED");
+                Self::legend_row(ui, ALERT_RED, "CRITICAL: RANDOM/ENCRYPTED");
 
-            Self::legend_row(ui, Color32::from_rgb(0, 0, 200), "Low (0-2): Padding/Nulls");
-            Self::legend_row(
-                ui,
-                Color32::from_rgb(0, 200, 200),
-                "Med-Low (2-4): ASCII/Text",
-            );
-            Self::legend_row(
-                ui,
-                Color32::from_rgb(150, 230, 50),
-                "Medium (4-6): Code/Data",
-            );
-            Self::legend_row(ui, Color32::from_rgb(255, 150, 0), "High (6-7): Compressed");
-            Self::legend_row(
-                ui,
-                Color32::from_rgb(255, 50, 50),
-                "Very High (7-8): Encrypted",
-            );
+                ui.add_space(16.0);
 
-            ui.add_space(8.0);
-            ui.separator();
-            ui.add_space(8.0);
+                // Close button with tactical styling
+                ui.horizontal(|ui| {
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        let close_btn = ui.add(
+                            egui::Button::new(
+                                RichText::new("[ DISMISS ]")
+                                    .monospace()
+                                    .size(10.0)
+                                    .color(DATA_WHITE),
+                            )
+                            .fill(INTERFACE_GRAY)
+                            .rounding(0.0),
+                        );
+                        if close_btn.clicked() {
+                            self.show_help = false;
+                        }
+                    });
+                });
 
-            ui.heading("Kolmogorov Color Scale");
-            ui.add_space(4.0);
+                // Footer classification
+                ui.add_space(8.0);
+                ui.label(
+                    RichText::new("◤ DOC.REV.03 // APEIRON-BINARY-ANALYSIS ◥")
+                        .monospace()
+                        .size(8.0)
+                        .color(MUTED_TEXT),
+                );
 
-            Self::legend_row(
-                ui,
-                Color32::from_rgb(64, 0, 128),
-                "Very Low: Highly compressible",
-            );
-            Self::legend_row(ui, Color32::from_rgb(38, 140, 153), "Low: Simple patterns");
-            Self::legend_row(
-                ui,
-                Color32::from_rgb(191, 204, 51),
-                "Medium: Structured data",
-            );
-            Self::legend_row(
-                ui,
-                Color32::from_rgb(255, 128, 26),
-                "High: Compressed/complex",
-            );
-            Self::legend_row(
-                ui,
-                Color32::from_rgb(255, 51, 128),
-                "Very High: Random/encrypted",
-            );
-        });
-
-        ui.add_space(8.0);
-        if ui.button("Close").clicked() {
-            self.show_help = false;
-        }
+                // MIL-SPEC registration marks for help dialog
+                let help_rect = ui.max_rect();
+                Self::draw_corner_marks_static(ui, help_rect, DIM_CYAN.gamma_multiply(0.5));
+            });
     }
 
-    /// Draw a control hint row.
+    /// Draw a mode entry for help - MIL-SPEC format.
+    fn mode_entry(ui: &mut egui::Ui, code: &str, name: &str, desc: &str) {
+        ui.horizontal(|ui| {
+            ui.label(
+                RichText::new(format!("[{}]", code))
+                    .monospace()
+                    .size(10.0)
+                    .color(TACTICAL_CYAN),
+            );
+            ui.label(
+                RichText::new(name)
+                    .monospace()
+                    .size(10.0)
+                    .strong()
+                    .color(DATA_WHITE),
+            );
+        });
+        ui.label(
+            RichText::new(format!("    {}", desc))
+                .monospace()
+                .size(9.0)
+                .color(MUTED_TEXT),
+        );
+        ui.add_space(4.0);
+    }
+
+    /// Draw a control hint row - MIL-SPEC format.
     fn control_row(ui: &mut egui::Ui, action: &str, description: &str) {
         ui.horizontal(|ui| {
-            ui.label(RichText::new(action).strong().monospace());
-            ui.label(RichText::new(description).monospace());
+            ui.label(
+                RichText::new(action)
+                    .monospace()
+                    .size(10.0)
+                    .strong()
+                    .color(DATA_WHITE),
+            );
+            ui.label(
+                RichText::new(format!("... {}", description))
+                    .monospace()
+                    .size(10.0)
+                    .color(MUTED_TEXT),
+            );
         });
     }
 
-    /// Draw a color legend row.
+    /// Draw a color legend row - MIL-SPEC tactical format.
     fn legend_row(ui: &mut egui::Ui, color: Color32, label: &str) {
         ui.horizontal(|ui| {
             let (rect, _) = ui.allocate_exact_size(Vec2::new(12.0, 12.0), Sense::hover());
-            ui.painter().circle_filled(rect.center(), 5.0, color);
-            ui.label(RichText::new(label).monospace().small());
+            // Square indicator instead of circle for tactical look
+            ui.painter().rect_filled(
+                egui::Rect::from_center_size(rect.center(), egui::Vec2::splat(8.0)),
+                1.0,
+                color,
+            );
+            ui.label(RichText::new(label).monospace().size(9.0).color(DATA_WHITE));
         });
     }
 }

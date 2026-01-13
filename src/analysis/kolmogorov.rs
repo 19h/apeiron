@@ -26,36 +26,97 @@ thread_local! {
 }
 
 /// Fast check if data is likely incompressible (high entropy).
-/// Uses byte frequency variance as a proxy - random data has roughly equal byte frequencies.
+/// Uses SIMD byte frequency counting - random data has roughly equal byte frequencies.
 /// Returns true if data appears random/encrypted (complexity will be ~1.0).
 #[inline]
 fn is_likely_incompressible(data: &[u8]) -> bool {
+    use wide::u32x4;
+
     // Only use fast path for larger data where savings matter
     if data.len() < 256 {
         return false;
     }
 
     // Sample first 256 bytes to check distribution
-    let sample = &data[..256.min(data.len())];
+    let sample = &data[..256];
 
-    // Count unique bytes - truly random data uses most/all byte values
-    let mut seen = [false; 256];
-    let mut unique_count = 0u32;
+    // Count unique bytes and high bytes using SIMD-friendly approach
+    let mut seen = [0u8; 256]; // 0 = not seen, 1 = seen
     let mut high_byte_count = 0u32;
 
-    for &b in sample {
-        if !seen[b as usize] {
-            seen[b as usize] = true;
-            unique_count += 1;
+    // Process 8 bytes at a time
+    let chunks = sample.chunks_exact(8);
+    let remainder = chunks.remainder();
+
+    for chunk in chunks {
+        // Mark bytes as seen and count high bytes
+        // Use bit manipulation for high byte detection: byte & 0x80 != 0
+        unsafe {
+            *seen.get_unchecked_mut(chunk[0] as usize) = 1;
+            *seen.get_unchecked_mut(chunk[1] as usize) = 1;
+            *seen.get_unchecked_mut(chunk[2] as usize) = 1;
+            *seen.get_unchecked_mut(chunk[3] as usize) = 1;
+            *seen.get_unchecked_mut(chunk[4] as usize) = 1;
+            *seen.get_unchecked_mut(chunk[5] as usize) = 1;
+            *seen.get_unchecked_mut(chunk[6] as usize) = 1;
+            *seen.get_unchecked_mut(chunk[7] as usize) = 1;
         }
-        if b >= 128 {
-            high_byte_count += 1;
-        }
+
+        // Count high bytes using bit manipulation: (byte >> 7) is 1 for high bytes
+        high_byte_count += (chunk[0] >> 7) as u32
+            + (chunk[1] >> 7) as u32
+            + (chunk[2] >> 7) as u32
+            + (chunk[3] >> 7) as u32
+            + (chunk[4] >> 7) as u32
+            + (chunk[5] >> 7) as u32
+            + (chunk[6] >> 7) as u32
+            + (chunk[7] >> 7) as u32;
+    }
+
+    for &b in remainder {
+        seen[b as usize] = 1;
+        high_byte_count += (b >> 7) as u32;
+    }
+
+    // Count unique bytes using SIMD horizontal sum
+    let mut unique_count = 0u32;
+
+    // Sum the seen array using SIMD (256 bytes = 64 u32x4 operations)
+    for i in (0..256).step_by(16) {
+        // Load 16 bytes, convert to u32, sum
+        let v0 = u32x4::new([
+            seen[i] as u32,
+            seen[i + 1] as u32,
+            seen[i + 2] as u32,
+            seen[i + 3] as u32,
+        ]);
+        let v1 = u32x4::new([
+            seen[i + 4] as u32,
+            seen[i + 5] as u32,
+            seen[i + 6] as u32,
+            seen[i + 7] as u32,
+        ]);
+        let v2 = u32x4::new([
+            seen[i + 8] as u32,
+            seen[i + 9] as u32,
+            seen[i + 10] as u32,
+            seen[i + 11] as u32,
+        ]);
+        let v3 = u32x4::new([
+            seen[i + 12] as u32,
+            seen[i + 13] as u32,
+            seen[i + 14] as u32,
+            seen[i + 15] as u32,
+        ]);
+
+        let sum = v0 + v1 + v2 + v3;
+        let arr = sum.to_array();
+        unique_count += arr[0] + arr[1] + arr[2] + arr[3];
     }
 
     // Random/encrypted data typically has:
     // - High unique byte count (>200 for 256 samples)
-    // - Roughly 50% high bytes
+    // - Roughly 50% high bytes (100-156 for 256 samples)
     unique_count >= 200 && high_byte_count >= 100 && high_byte_count <= 156
 }
 

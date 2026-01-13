@@ -5,7 +5,7 @@
 //!
 //! Optimizations:
 //! - True SIMD f64x4 for 256-element distribution operations
-//! - True SIMD polynomial ln() approximation using IEEE 754 bit manipulation
+//! - Accurate ln() with SIMD structure for instruction-level parallelism
 //! - Fused mixture + KL computation to reduce memory passes
 //! - Dual accumulators for better instruction-level parallelism
 //! - Branchless zero-masking for non-positive inputs
@@ -17,18 +17,17 @@ use wide::f64x4;
 const EPSILON: f64 = 1e-10;
 const EPSILON_X4: f64x4 = f64x4::new([EPSILON, EPSILON, EPSILON, EPSILON]);
 const HALF_X4: f64x4 = f64x4::new([0.5, 0.5, 0.5, 0.5]);
-const ZERO_X4: f64x4 = f64x4::new([0.0, 0.0, 0.0, 0.0]);
 
-/// Accurate SIMD natural log using scalar ln() for numerical correctness.
+/// Accurate SIMD natural log using scalar ln() for full double precision.
 /// Uses SIMD structure for instruction-level parallelism while maintaining
-/// full double precision accuracy required for JSD computation.
+/// accuracy required for JSD computation (must be exactly 0 for identical distributions).
 ///
 /// Performance: The SIMD structure allows 4 independent ln() calls to pipeline,
 /// and the conditional checks are branch-predicted well since values are usually > 0.
 #[inline(always)]
 fn fast_ln_f64x4(x: f64x4) -> f64x4 {
     let arr = x.to_array();
-    // Use accurate ln() but structure as SIMD for ILP
+    // Use accurate ln() - critical for JSD precision
     f64x4::new([
         if arr[0] > 0.0 { arr[0].ln() } else { 0.0 },
         if arr[1] > 0.0 { arr[1].ln() } else { 0.0 },
