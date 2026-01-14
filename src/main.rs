@@ -154,7 +154,7 @@ impl ApeironApp {
         let (tx, rx) = mpsc::channel();
         let data_for_report = Arc::clone(&data);
         thread::spawn(move || {
-            let report = wm::analyze_file_for_malware(&data_for_report);
+            let report = wm::analyze_file_for_wavelet(&data_for_report);
             let _ = tx.send(BackgroundTask::WaveletReport(report));
         });
 
@@ -261,9 +261,8 @@ impl ApeironApp {
                         }
                         BackgroundTask::WaveletReport(report) => {
                             println!(
-                                "Wavelet analysis ready: SSECS={:.3}, Malware Prob={:.1}%",
-                                report.ssecs.ssecs_score,
-                                report.ssecs.probability_malware * 100.0
+                                "Wavelet analysis ready: {} levels, {} chunks",
+                                report.num_wavelet_levels, report.num_entropy_chunks
                             );
                             tab.wavelet_report = Some(report);
                             tasks.computing_wavelet_report = false;
@@ -2728,145 +2727,10 @@ impl ApeironApp {
 
                         ui.separator();
 
-                        // SSECS Wavelet Entropy Analysis
-                        Self::section(ui, "SSECS (WAVELET ENTROPY)", |ui| {
+                        // Wavelet Entropy Analysis
+                        Self::section(ui, "WAVELET ENTROPY", |ui| {
                             if let Some(ref report) = wavelet_report {
-                                let ssecs = &report.ssecs;
-                                let available = ui.available_width();
-
-                                // Malware probability
-                                ui.horizontal(|ui| {
-                                    ui.allocate_ui_with_layout(
-                                        egui::Vec2::new(
-                                            available * 0.5,
-                                            ui.spacing().interact_size.y,
-                                        ),
-                                        egui::Layout::left_to_right(egui::Align::Center),
-                                        |ui| {
-                                            ui.label(
-                                                RichText::new("THREAT PROB")
-                                                    .monospace()
-                                                    .color(MUTED_TEXT)
-                                                    .small(),
-                                            );
-                                        },
-                                    );
-                                    ui.allocate_ui_with_layout(
-                                        egui::Vec2::new(
-                                            available * 0.5,
-                                            ui.spacing().interact_size.y,
-                                        ),
-                                        egui::Layout::right_to_left(egui::Align::Center),
-                                        |ui| {
-                                            // MIL-SPEC status colors
-                                            let prob_color = match ssecs.classification {
-                                                wm::MalwareClassification::Clean => {
-                                                    OPERATIONAL_GREEN
-                                                }
-                                                wm::MalwareClassification::Suspicious => {
-                                                    CAUTION_AMBER
-                                                }
-                                                wm::MalwareClassification::LikelyMalware => {
-                                                    ALERT_RED
-                                                }
-                                                wm::MalwareClassification::Unknown => MUTED_TEXT,
-                                            };
-                                            ui.label(
-                                                RichText::new(format!(
-                                                    "{:.1}%",
-                                                    ssecs.probability_malware * 100.0
-                                                ))
-                                                .monospace()
-                                                .strong()
-                                                .color(prob_color),
-                                            );
-                                        },
-                                    );
-                                });
-
-                                // Malware probability bar - MIL-SPEC
-                                let bar_height = 6.0;
-                                let (bar_rect, _) = ui.allocate_exact_size(
-                                    egui::Vec2::new(ui.available_width(), bar_height),
-                                    Sense::hover(),
-                                );
-                                ui.painter().rect_filled(bar_rect, 0.0, INTERFACE_GRAY);
-                                let fill_width =
-                                    bar_rect.width() * ssecs.probability_malware as f32;
-                                let fill_rect = Rect::from_min_size(
-                                    bar_rect.min,
-                                    egui::Vec2::new(fill_width, bar_height),
-                                );
-                                // MIL-SPEC status colors for bar fill
-                                let bar_color = match ssecs.classification {
-                                    wm::MalwareClassification::Clean => {
-                                        OPERATIONAL_GREEN.gamma_multiply(0.8)
-                                    }
-                                    wm::MalwareClassification::Suspicious => {
-                                        CAUTION_AMBER.gamma_multiply(0.8)
-                                    }
-                                    wm::MalwareClassification::LikelyMalware => {
-                                        ALERT_RED.gamma_multiply(0.8)
-                                    }
-                                    wm::MalwareClassification::Unknown => MUTED_TEXT,
-                                };
-                                ui.painter().rect_filled(fill_rect, 0.0, bar_color);
-
-                                // Classification label - MIL-SPEC format
-                                let classification_text = match ssecs.classification {
-                                    wm::MalwareClassification::Clean => "STATUS: CLEAN",
-                                    wm::MalwareClassification::Suspicious => "STATUS: SUSPICIOUS",
-                                    wm::MalwareClassification::LikelyMalware => {
-                                        "STATUS: THREAT DETECTED"
-                                    }
-                                    wm::MalwareClassification::Unknown => "STATUS: UNKNOWN",
-                                };
-                                let classification_color = match ssecs.classification {
-                                    wm::MalwareClassification::Clean => OPERATIONAL_GREEN,
-                                    wm::MalwareClassification::Suspicious => CAUTION_AMBER,
-                                    wm::MalwareClassification::LikelyMalware => ALERT_RED,
-                                    wm::MalwareClassification::Unknown => MUTED_TEXT,
-                                };
-                                ui.label(
-                                    RichText::new(classification_text)
-                                        .monospace()
-                                        .strong()
-                                        .color(classification_color),
-                                );
-
-                                // Energy ratios - MIL-SPEC
-                                ui.add_space(4.0);
-                                ui.label(
-                                    RichText::new("ENERGY DISTRIBUTION")
-                                        .monospace()
-                                        .small()
-                                        .color(MUTED_TEXT),
-                                );
-
-                                ui.horizontal(|ui| {
-                                    ui.label(
-                                        RichText::new(format!(
-                                            "COARSE: {:.1}%",
-                                            ssecs.coarse_energy_ratio * 100.0
-                                        ))
-                                        .monospace()
-                                        .small()
-                                        .color(ALERT_RED.gamma_multiply(0.8)),
-                                    );
-                                    ui.add_space(8.0);
-                                    ui.label(
-                                        RichText::new(format!(
-                                            "FINE: {:.1}%",
-                                            ssecs.fine_energy_ratio * 100.0
-                                        ))
-                                        .monospace()
-                                        .small()
-                                        .color(TACTICAL_CYAN.gamma_multiply(0.8)),
-                                    );
-                                });
-
-                                // Wavelet levels
-                                ui.add_space(4.0);
+                                // Wavelet decomposition info
                                 ui.label(
                                     RichText::new(format!(
                                         "LEVELS: {} // CHUNKS: {}",
@@ -2876,6 +2740,51 @@ impl ApeironApp {
                                     .small()
                                     .color(MUTED_TEXT),
                                 );
+
+                                // Energy distribution across scales
+                                ui.add_space(4.0);
+                                ui.label(
+                                    RichText::new("ENERGY DISTRIBUTION")
+                                        .monospace()
+                                        .small()
+                                        .color(MUTED_TEXT),
+                                );
+
+                                // Show energy at different scales
+                                let energy_spectrum = &report.energy_spectrum;
+                                if !energy_spectrum.is_empty() {
+                                    let total: f64 = energy_spectrum.iter().sum();
+                                    if total > 0.0 {
+                                        // Coarse scales (low freq) vs fine scales (high freq)
+                                        let mid = energy_spectrum.len() / 2;
+                                        let coarse: f64 = energy_spectrum[..mid].iter().sum();
+                                        let fine: f64 = energy_spectrum[mid..].iter().sum();
+                                        let coarse_ratio = coarse / total;
+                                        let fine_ratio = fine / total;
+
+                                        ui.horizontal(|ui| {
+                                            ui.label(
+                                                RichText::new(format!(
+                                                    "LOW FREQ: {:.1}%",
+                                                    coarse_ratio * 100.0
+                                                ))
+                                                .monospace()
+                                                .small()
+                                                .color(ALERT_RED.gamma_multiply(0.8)),
+                                            );
+                                            ui.add_space(8.0);
+                                            ui.label(
+                                                RichText::new(format!(
+                                                    "HIGH FREQ: {:.1}%",
+                                                    fine_ratio * 100.0
+                                                ))
+                                                .monospace()
+                                                .small()
+                                                .color(TACTICAL_CYAN.gamma_multiply(0.8)),
+                                            );
+                                        });
+                                    }
+                                }
                             } else {
                                 ui.label(
                                     RichText::new("[ANALYZING...]")
@@ -3167,7 +3076,7 @@ impl ApeironApp {
                     ui,
                     "WAV",
                     "WAVELET ENTROPY",
-                    "SSECS malware pattern detection",
+                    "Frequency-scale entropy decomposition",
                 );
 
                 ui.add_space(12.0);

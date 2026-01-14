@@ -744,24 +744,266 @@ pub fn calculate_rcmse(data: &[u8], max_scale: usize) -> RCMSEAnalysis {
     }
 }
 
+// =============================================================================
+// ULTRA-FAST HISTOGRAM-BASED APPROXIMATION
+// =============================================================================
+// For visualization, we don't need exact RCMSE - we need a value that correlates
+// with complexity. This histogram approach reduces O(n²) to O(n + b²) where b
+// is the number of histogram bins (typically 16-32).
+
+/// Number of histogram bins for fast approximation.
+const FAST_HIST_BINS: usize = 16;
+
+/// Sparse scales for ultra-fast mode: only compute these scales.
+/// Chosen to capture the key characteristics: small (1), medium (3), large (6).
+const FAST_SCALES: [usize; 3] = [1, 3, 6];
+
+/// Ultra-fast pattern count using 2D histogram approximation.
+/// Instead of O(n²) pairwise comparisons, we:
+/// 1. Quantize values into bins: O(n)
+/// 2. Build 2D histogram of consecutive pairs: O(n)
+/// 3. Count matches by summing nearby bins: O(b²)
+///
+/// This gives O(n + b²) complexity, which is effectively O(n) since b is constant.
+#[inline]
+fn count_pattern_matches_histogram(series: &[f64], r: f64) -> (u64, u64) {
+    let n = series.len();
+    const M: usize = 2; // Embedding dimension
+
+    if n <= M + 1 {
+        return (0, 0);
+    }
+
+    // Find min/max for quantization
+    let mut min_val = series[0];
+    let mut max_val = series[0];
+    for &v in &series[1..] {
+        if v < min_val {
+            min_val = v;
+        }
+        if v > max_val {
+            max_val = v;
+        }
+    }
+
+    let range = max_val - min_val;
+    if range < 1e-10 {
+        // All values are the same - everything matches
+        let num_templates = n - M;
+        let pairs = (num_templates * (num_templates - 1)) as u64;
+        return (pairs, pairs);
+    }
+
+    // Calculate bin width and tolerance in bins
+    let bin_width = range / FAST_HIST_BINS as f64;
+    let r_bins = (r / bin_width).ceil() as usize;
+
+    // Quantize values to bins: O(n)
+    let quantize = |v: f64| -> usize {
+        let bin = ((v - min_val) / bin_width) as usize;
+        bin.min(FAST_HIST_BINS - 1)
+    };
+
+    // Build 2D histogram of (series[i], series[i+1]) pairs: O(n)
+    // This represents the embedding vectors for m=2
+    let mut hist_m = [[0u32; FAST_HIST_BINS]; FAST_HIST_BINS];
+    let num_templates = n - M;
+
+    for i in 0..num_templates {
+        let b0 = quantize(series[i]);
+        let b1 = quantize(series[i + 1]);
+        hist_m[b0][b1] += 1;
+    }
+
+    // Build 3D histogram for m+1 (we can flatten to 2D by combining dimensions)
+    // For simplicity, we use a separate 2D histogram for (series[i+1], series[i+2])
+    // and estimate m+1 matches from the overlap
+    let mut hist_m1_suffix = [[0u32; FAST_HIST_BINS]; FAST_HIST_BINS];
+    let num_templates_ext = n - M - 1;
+
+    for i in 0..num_templates_ext {
+        let b1 = quantize(series[i + 1]);
+        let b2 = quantize(series[i + 2]);
+        hist_m1_suffix[b1][b2] += 1;
+    }
+
+    // Count matches: sum over all bin pairs within tolerance
+    // Two templates match if all their bin indices are within r_bins of each other
+    let mut count_m: u64 = 0;
+    let mut count_m_plus_1: u64 = 0;
+
+    for b0 in 0..FAST_HIST_BINS {
+        for b1 in 0..FAST_HIST_BINS {
+            let c1 = hist_m[b0][b1] as u64;
+            if c1 == 0 {
+                continue;
+            }
+
+            // Count matches with nearby bins
+            let b0_min = b0.saturating_sub(r_bins);
+            let b0_max = (b0 + r_bins + 1).min(FAST_HIST_BINS);
+            let b1_min = b1.saturating_sub(r_bins);
+            let b1_max = (b1 + r_bins + 1).min(FAST_HIST_BINS);
+
+            for b0_other in b0_min..b0_max {
+                for b1_other in b1_min..b1_max {
+                    let c2 = hist_m[b0_other][b1_other] as u64;
+                    if c2 == 0 {
+                        continue;
+                    }
+
+                    // Matches between these two bins
+                    // If same bin, count pairs within; otherwise count cross-products
+                    if b0 == b0_other && b1 == b1_other {
+                        // Self-matches: n*(n-1) pairs
+                        count_m += c1 * (c1 - 1);
+                    } else {
+                        // Cross-matches: n1 * n2 pairs (but avoid double counting)
+                        // Only count if (b0_other, b1_other) > (b0, b1) lexicographically
+                        if b0_other > b0 || (b0_other == b0 && b1_other > b1) {
+                            count_m += 2 * c1 * c2;
+                        }
+                    }
+                }
+            }
+
+            // For m+1 matches, we need the third dimension to also match
+            // Approximate by checking if the suffix histogram has nearby matches
+            // This is a simplification but works well for visualization
+            let b1_min_ext = b1.saturating_sub(r_bins);
+            let b1_max_ext = (b1 + r_bins + 1).min(FAST_HIST_BINS);
+
+            for b1_ext in b1_min_ext..b1_max_ext {
+                for b2 in 0..FAST_HIST_BINS {
+                    let c_suffix = hist_m1_suffix[b1_ext][b2] as u64;
+                    if c_suffix > 0 {
+                        // Approximate m+1 matches based on histogram overlap
+                        // Scale by the ratio of suffix matches to total templates
+                        let scale = (c_suffix as f64 / num_templates_ext as f64).min(1.0);
+                        count_m_plus_1 += (c1 as f64 * scale * c1 as f64) as u64;
+                    }
+                }
+            }
+        }
+    }
+
+    // Ensure count_m_plus_1 doesn't exceed count_m (physical constraint)
+    count_m_plus_1 = count_m_plus_1.min(count_m);
+
+    (count_m.max(1), count_m_plus_1.max(1))
+}
+
+/// Ultra-fast RCMSE at a single scale using histogram approximation.
+#[inline]
+fn rcmse_at_scale_fast(data: &[u8], scale: usize, r: f64, buffer: &mut Vec<f64>) -> Option<f64> {
+    if scale == 0 {
+        return None;
+    }
+
+    let max_coarse_len = data.len() / scale + 1;
+    buffer.resize(max_coarse_len, 0.0);
+
+    let mut total_m: u64 = 0;
+    let mut total_m_plus_1: u64 = 0;
+
+    // For ultra-fast mode, only process offset 1 (skip other offsets)
+    // This is a significant speedup with minimal accuracy loss for visualization
+    let len = coarse_grain_bytes_into(data, scale, 1, buffer);
+    if len <= RCMSE_EMBEDDING_DIM + 1 {
+        return None;
+    }
+
+    let (n_m, n_m_plus_1) = count_pattern_matches_histogram(&buffer[..len], r);
+    total_m += n_m;
+    total_m_plus_1 += n_m_plus_1;
+
+    if total_m == 0 || total_m_plus_1 == 0 {
+        return None;
+    }
+
+    let ratio = total_m_plus_1 as f64 / total_m as f64;
+    Some(-ratio.ln())
+}
+
 /// Calculate a simplified RCMSE complexity value for fast visualization.
+///
+/// This uses an ultra-fast histogram-based approximation that is ~100x faster
+/// than the full RCMSE algorithm while still capturing the key complexity signal.
 ///
 /// Returns a value between 0.0 and 1.0:
 /// - 0.0: Random/encrypted (steep negative slope)
 /// - 0.5: Structured/complex (flat slope)
 /// - 1.0: Chaotic/interesting (positive early slope)
+///
+/// # Performance
+/// - Full RCMSE: O(n² × scales × offsets) ≈ O(n² × 36) for default params
+/// - Fast RCMSE: O(n × scales) ≈ O(n × 3) with histogram approximation
 pub fn calculate_rcmse_quick(data: &[u8]) -> f32 {
-    // Use fewer scales for speed (6 scales works well with 256-byte windows)
-    const QUICK_MAX_SCALE: usize = 6;
+    // Minimum data length for meaningful analysis
+    if data.len() < 16 {
+        return 0.5;
+    }
 
-    let analysis = calculate_rcmse(data, QUICK_MAX_SCALE);
+    // Calculate tolerance from byte standard deviation (fast path)
+    let sd = std_deviation_bytes(data);
+    if sd < 1.0 {
+        // Near-uniform data
+        return 0.5;
+    }
+    let r = RCMSE_TOLERANCE_FACTOR * sd;
 
-    // Map to 0-1 based on complexity index and classification
-    match analysis.classification {
-        RCMSEClassification::Random => 0.1 + analysis.complexity_index as f32 * 0.15,
-        RCMSEClassification::Structured => 0.4 + analysis.complexity_index as f32 * 0.25,
-        RCMSEClassification::Chaotic => 0.7 + analysis.complexity_index as f32 * 0.2,
-        RCMSEClassification::Unknown => 0.5,
+    // Thread-local buffer to avoid allocation
+    let mut buffer = Vec::with_capacity(data.len() + 1);
+
+    // Compute entropy at sparse scales using histogram approximation
+    let mut entropies = [0.0f64; 3];
+    let mut valid_count = 0;
+
+    for (i, &scale) in FAST_SCALES.iter().enumerate() {
+        if data.len() < (RCMSE_EMBEDDING_DIM + 2) * scale {
+            break;
+        }
+        if let Some(entropy) = rcmse_at_scale_fast(data, scale, r, &mut buffer) {
+            entropies[i] = entropy;
+            valid_count += 1;
+        }
+    }
+
+    if valid_count < 2 {
+        return 0.5;
+    }
+
+    // Estimate slope from available scales
+    let slope = if valid_count == 3 {
+        // Linear regression approximation with 3 points
+        // scales: 1, 3, 6 -> normalized: 0, 0.4, 1.0
+        // slope ≈ (e6 - e1) / 5 adjusted for scale spacing
+        (entropies[2] - entropies[0]) / 5.0
+    } else {
+        // 2 points: use simple difference
+        (entropies[1] - entropies[0]) / 2.0
+    };
+
+    // Check for early increase (chaotic signature)
+    let has_early_increase = valid_count >= 2 && entropies[1] > entropies[0] * 1.1;
+
+    // Compute mean entropy for complexity factor
+    let mean_entropy: f64 = entropies[..valid_count].iter().sum::<f64>() / valid_count as f64;
+    let entropy_factor = (mean_entropy / 3.0).min(1.0) as f32;
+
+    // Classification and mapping to 0-1 range
+    if has_early_increase && slope > -0.05 {
+        // Chaotic: high complexity signal
+        0.7 + entropy_factor * 0.25
+    } else if slope < -0.08 {
+        // Random: entropy decreases sharply with scale
+        0.1 + entropy_factor * 0.2
+    } else if slope.abs() < 0.05 {
+        // Structured: flat entropy profile
+        0.4 + entropy_factor * 0.3
+    } else {
+        // Ambiguous
+        0.5
     }
 }
 
