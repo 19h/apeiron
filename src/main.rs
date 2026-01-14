@@ -14,7 +14,6 @@ mod gpu;
 mod hilbert;
 mod util;
 mod viz;
-mod wavelet_malware;
 
 use std::fs::File;
 use std::path::PathBuf;
@@ -29,13 +28,11 @@ use eframe::egui::{self, Color32, ColorImage, Pos2, Rect, RichText, Sense, Vec2}
 
 use analysis::{
     byte_distribution_sampled, calculate_entropy, calculate_jsd, calculate_kolmogorov_complexity,
-    calculate_rcmse_quick, extract_ascii, identify_file_type, precompute_chunk_entropies,
-    wavelet_suspiciousness_8, ANALYSIS_WINDOW, WAVELET_CHUNK_SIZE,
+    calculate_rcmse_quick, extract_ascii, identify_file_type, ANALYSIS_WINDOW,
 };
 use app::{
     ApeironApp, BackgroundTask, BackgroundTasks, FileData, HexView, Selection, Tab, TextureParams,
     Viewport, VisualizationMode, COMPLEXITY_SAMPLE_INTERVAL, RCMSE_SAMPLE_INTERVAL,
-    WAVELET_SAMPLE_INTERVAL,
 };
 use hilbert::{calculate_dimension, xy2d, HilbertBuffer, HilbertRefiner, PROGRESSIVE_THRESHOLD};
 use util::color::{
@@ -43,7 +40,6 @@ use util::color::{
     PANEL_DARK, TACTICAL_CYAN, VOID_BLACK,
 };
 use util::format_bytes;
-use wavelet_malware as wm;
 
 // =============================================================================
 // Application Implementation
@@ -139,36 +135,11 @@ impl ApeironApp {
             complexity_map: None,
             reference_distribution,
             rcmse_map: None,
-            wavelet_map: None,
             hilbert_buffer,
         });
 
         // Set tab title
         tab.title = title;
-
-        // Clear previous wavelet report
-        tab.wavelet_report = None;
-
-        // LAZY COMPUTATION: Only spawn WaveletReport on load (needed for sidebar).
-        // Other mode-specific computations are started when user switches to that mode.
-        let (tx, rx) = mpsc::channel();
-        let data_for_report = Arc::clone(&data);
-        thread::spawn(move || {
-            let report = wm::analyze_file_for_wavelet(&data_for_report);
-            let _ = tx.send(BackgroundTask::WaveletReport(report));
-        });
-
-        let tab = self.active_tab_mut();
-        tab.background_tasks = Some(BackgroundTasks {
-            receiver: rx,
-            computing_complexity: false, // Lazy: not started yet
-            computing_rcmse: false,      // Lazy: not started yet
-            computing_wavelet: false,    // Lazy: not started yet
-            computing_wavelet_report: true,
-            complexity_progress: 0.0,
-            rcmse_progress: 0.0,
-            wavelet_progress: 0.0,
-        });
 
         // Reset viewport and selection
         tab.viewport = Viewport::default();
@@ -186,7 +157,7 @@ impl ApeironApp {
         if size > PROGRESSIVE_THRESHOLD {
             println!("Progressive Hilbert rendering started...");
         }
-        println!("Wavelet analysis started (other modes computed on demand)...");
+        println!("Background analysis computed on demand per visualization mode.");
     }
 
     /// Poll for completed background tasks on the active tab and update file data.
@@ -241,32 +212,6 @@ impl ApeironApp {
                             tasks.computing_rcmse = false;
                             tasks.rcmse_progress = 1.0;
                         }
-                        BackgroundTask::WaveletPartial { data, progress } => {
-                            if let Some(ref mut file) = tab.file_data {
-                                file.wavelet_map = Some(Arc::new(data));
-                            }
-                            tasks.wavelet_progress = progress;
-                        }
-                        BackgroundTask::WaveletComplete => {
-                            println!(
-                                "Wavelet map complete: {} samples",
-                                tab.file_data
-                                    .as_ref()
-                                    .and_then(|f| f.wavelet_map.as_ref())
-                                    .map(|m| m.len())
-                                    .unwrap_or(0)
-                            );
-                            tasks.computing_wavelet = false;
-                            tasks.wavelet_progress = 1.0;
-                        }
-                        BackgroundTask::WaveletReport(report) => {
-                            println!(
-                                "Wavelet analysis ready: {} levels, {} chunks",
-                                report.num_wavelet_levels, report.num_entropy_chunks
-                            );
-                            tab.wavelet_report = Some(report);
-                            tasks.computing_wavelet_report = false;
-                        }
                     }
                 }
                 Err(TryRecvError::Empty) => break,
@@ -281,11 +226,7 @@ impl ApeironApp {
         // Clear background tasks if all done
         let tab = &mut self.tabs[self.active_tab];
         if let Some(tasks) = &tab.background_tasks {
-            if !tasks.computing_complexity
-                && !tasks.computing_rcmse
-                && !tasks.computing_wavelet
-                && !tasks.computing_wavelet_report
-            {
+            if !tasks.computing_complexity && !tasks.computing_rcmse {
                 self.tabs[self.active_tab].background_tasks = None;
                 println!("All background computations complete.");
             }
@@ -312,7 +253,6 @@ impl ApeironApp {
             // These need precomputed maps
             VisualizationMode::KolmogorovComplexity => file.complexity_map.is_some(),
             VisualizationMode::MultiScaleEntropy => file.rcmse_map.is_some(),
-            VisualizationMode::WaveletEntropy => file.wavelet_map.is_some(),
         }
     }
 
@@ -381,15 +321,6 @@ impl ApeironApp {
         rcmse_map.get(index).copied().unwrap_or(0.5)
     }
 
-    /// Look up precomputed wavelet suspiciousness value for a file offset.
-    fn lookup_wavelet(wavelet_map: &[f32], offset: usize) -> f32 {
-        if wavelet_map.is_empty() {
-            return 0.5;
-        }
-        let index = offset / WAVELET_SAMPLE_INTERVAL;
-        wavelet_map.get(index).copied().unwrap_or(0.5)
-    }
-
     // =========================================================================
     // LAZY MODE COMPUTATION
     // Start computation for a mode only when the user switches to it.
@@ -421,14 +352,6 @@ impl ApeironApp {
                         .map(|t| !t.computing_rcmse)
                         .unwrap_or(true)
             }
-            VisualizationMode::WaveletEntropy => {
-                file.wavelet_map.is_none()
-                    && tab
-                        .background_tasks
-                        .as_ref()
-                        .map(|t| !t.computing_wavelet)
-                        .unwrap_or(true)
-            }
             // Other modes don't need precomputed maps
             _ => false,
         };
@@ -458,11 +381,8 @@ impl ApeironApp {
                         receiver: rx,
                         computing_complexity: true,
                         computing_rcmse: false,
-                        computing_wavelet: false,
-                        computing_wavelet_report: false,
                         complexity_progress: 0.0,
                         rcmse_progress: 0.0,
-                        wavelet_progress: 0.0,
                     });
                     return;
                 }
@@ -480,33 +400,8 @@ impl ApeironApp {
                         receiver: rx,
                         computing_complexity: false,
                         computing_rcmse: true,
-                        computing_wavelet: false,
-                        computing_wavelet_report: false,
                         complexity_progress: 0.0,
                         rcmse_progress: 0.0,
-                        wavelet_progress: 0.0,
-                    });
-                    return;
-                }
-            }
-            VisualizationMode::WaveletEntropy => {
-                println!("Starting Wavelet entropy computation on demand...");
-                thread::spawn(move || {
-                    Self::precompute_wavelet_streaming(&data, &tx);
-                });
-                let tab = &mut self.tabs[self.active_tab];
-                if let Some(ref mut tasks) = tab.background_tasks {
-                    tasks.computing_wavelet = true;
-                } else {
-                    tab.background_tasks = Some(BackgroundTasks {
-                        receiver: rx,
-                        computing_complexity: false,
-                        computing_rcmse: false,
-                        computing_wavelet: true,
-                        computing_wavelet_report: false,
-                        complexity_progress: 0.0,
-                        rcmse_progress: 0.0,
-                        wavelet_progress: 0.0,
                     });
                     return;
                 }
@@ -628,70 +523,6 @@ impl ApeironApp {
         let _ = tx.send(BackgroundTask::RcmseComplete);
     }
 
-    /// Precompute wavelet map with streaming updates using parallel batches.
-    fn precompute_wavelet_streaming(data: &[u8], tx: &mpsc::Sender<BackgroundTask>) {
-        const WINDOW_SIZE: usize = 2048;
-        const CHUNKS_PER_WINDOW: usize = WINDOW_SIZE / WAVELET_CHUNK_SIZE; // 8
-        const CHUNK_INDEX_STEP: usize = WAVELET_CHUNK_SIZE / WAVELET_SAMPLE_INTERVAL; // 4
-
-        let total_samples = (data.len() / WAVELET_SAMPLE_INTERVAL).max(1);
-
-        if data.len() < WINDOW_SIZE {
-            // File too small - send complete result immediately
-            let results = vec![0.5f32; total_samples];
-            let _ = tx.send(BackgroundTask::WaveletPartial {
-                data: results,
-                progress: 1.0,
-            });
-            let _ = tx.send(BackgroundTask::WaveletComplete);
-            return;
-        }
-
-        // Step 1: Precompute all chunk entropies first (this is fast, done in parallel)
-        let chunk_entropies =
-            precompute_chunk_entropies(data, WAVELET_CHUNK_SIZE, WAVELET_SAMPLE_INTERVAL);
-
-        let num_full_samples = (data.len() - WINDOW_SIZE) / WAVELET_SAMPLE_INTERVAL + 1;
-        let batch_size = Self::STREAMING_BATCH_SIZE;
-        let num_batches = (num_full_samples + batch_size - 1) / batch_size;
-
-        let mut all_results = Vec::with_capacity(total_samples);
-
-        // Step 2: Compute wavelet suspiciousness SEQUENTIALLY to avoid rayon contention
-        for batch_idx in 0..num_batches {
-            let batch_start = batch_idx * batch_size;
-            let batch_end = (batch_start + batch_size).min(num_full_samples);
-
-            // Compute this batch SEQUENTIALLY to avoid rayon contention with rendering
-            for sample_idx in batch_start..batch_end {
-                let mut stream = [0.0f64; CHUNKS_PER_WINDOW];
-                for c in 0..CHUNKS_PER_WINDOW {
-                    let chunk_idx = sample_idx + c * CHUNK_INDEX_STEP;
-                    stream[c] = chunk_entropies.get(chunk_idx).copied().unwrap_or(0.0);
-                }
-                all_results.push(wavelet_suspiciousness_8(&stream) as f32);
-            }
-
-            // Fill remaining samples with last value for complete visualization
-            let last_value = all_results.last().copied().unwrap_or(0.5);
-            let mut full_results = all_results.clone();
-            full_results.resize(total_samples, last_value);
-
-            // Send progress update
-            let progress = batch_end as f32 / num_full_samples as f32;
-            let _ = tx.send(BackgroundTask::WaveletPartial {
-                data: full_results,
-                progress,
-            });
-        }
-
-        // Ensure final result has all samples
-        let last_value = all_results.last().copied().unwrap_or(0.5);
-        all_results.resize(total_samples, last_value);
-
-        let _ = tx.send(BackgroundTask::WaveletComplete);
-    }
-
     /// Update the selection based on a byte offset and optionally sync hex view.
     fn update_selection(&mut self, offset: u64) {
         self.update_selection_with_scroll(offset, true);
@@ -756,8 +587,7 @@ impl ApeironApp {
             VisualizationMode::Hilbert
             | VisualizationMode::KolmogorovComplexity
             | VisualizationMode::JensenShannonDivergence
-            | VisualizationMode::MultiScaleEntropy
-            | VisualizationMode::WaveletEntropy => {
+            | VisualizationMode::MultiScaleEntropy => {
                 let x = world_pos.x as u64;
                 let y = world_pos.y as u64;
 
@@ -883,7 +713,6 @@ impl ApeironApp {
         let complexity_map = file.complexity_map.clone();
         let reference_distribution = Arc::clone(&file.reference_distribution);
         let rcmse_map = file.rcmse_map.clone();
-        let wavelet_map = file.wavelet_map.clone();
         let hilbert_buffer = file.hilbert_buffer.clone();
         let dimension = file.dimension;
         let file_size = file.size;
@@ -893,7 +722,6 @@ impl ApeironApp {
         let empty_map: Arc<Vec<f32>> = Arc::new(Vec::new());
         let complexity_ref = complexity_map.as_ref().unwrap_or(&empty_map);
         let rcmse_ref = rcmse_map.as_ref().unwrap_or(&empty_map);
-        let wavelet_ref = wavelet_map.as_ref().unwrap_or(&empty_map);
 
         // Get current time for progressive rendering animation
         let time_seconds = ctx.input(|i| i.time);
@@ -913,11 +741,10 @@ impl ApeironApp {
                     VisualizationMode::Digraph => Some(gpu::GpuVizMode::Digraph),
                     VisualizationMode::BytePhaseSpace => Some(gpu::GpuVizMode::BytePhaseSpace),
                     VisualizationMode::SimilarityMatrix => Some(gpu::GpuVizMode::SimilarityMatrix),
-                    // Kolmogorov, JSD, RCMSE, and Wavelet use precomputed/calculated values - CPU rendering
+                    // Kolmogorov, JSD, and RCMSE use precomputed/calculated values - CPU rendering
                     VisualizationMode::KolmogorovComplexity
                     | VisualizationMode::JensenShannonDivergence
-                    | VisualizationMode::MultiScaleEntropy
-                    | VisualizationMode::WaveletEntropy => None,
+                    | VisualizationMode::MultiScaleEntropy => None,
                 };
 
                 if let Some(mode) = gpu_mode {
@@ -948,7 +775,6 @@ impl ApeironApp {
                         complexity_ref,
                         &reference_distribution,
                         rcmse_ref,
-                        wavelet_ref,
                         hilbert_buffer.as_deref(),
                         dimension,
                         file_size,
@@ -967,7 +793,6 @@ impl ApeironApp {
                     complexity_ref,
                     &reference_distribution,
                     rcmse_ref,
-                    wavelet_ref,
                     hilbert_buffer.as_deref(),
                     dimension,
                     file_size,
@@ -986,7 +811,6 @@ impl ApeironApp {
                 complexity_ref,
                 &reference_distribution,
                 rcmse_ref,
-                wavelet_ref,
                 hilbert_buffer.as_deref(),
                 dimension,
                 file_size,
@@ -1010,7 +834,6 @@ impl ApeironApp {
         complexity_map: &[f32],
         reference_distribution: &[f64; 256],
         rcmse_map: &[f32],
-        wavelet_map: &[f32],
         hilbert_buffer: Option<&HilbertBuffer>,
         dimension: u64,
         file_size: u64,
@@ -1083,22 +906,6 @@ impl ApeironApp {
                 } else {
                     viz::generate_rcmse_pixels(
                         rcmse_map, dimension, file_size, tex_size, world_min, scale_x, scale_y,
-                    )
-                }
-            }
-            VisualizationMode::WaveletEntropy => {
-                // Show placeholder while computing to avoid parallel rendering competing with background
-                if wavelet_map.is_empty() {
-                    viz::generate_computing_placeholder(tex_size, time_seconds)
-                } else {
-                    viz::generate_wavelet_pixels(
-                        wavelet_map,
-                        dimension,
-                        file_size,
-                        tex_size,
-                        world_min,
-                        scale_x,
-                        scale_y,
                     )
                 }
             }
@@ -1561,20 +1368,6 @@ impl eframe::App for ApeironApp {
                                     if tasks.computing_rcmse {
                                         self.draw_task_progress(ui, "RCMSE", tasks.rcmse_progress);
                                     }
-                                    if tasks.computing_wavelet {
-                                        self.draw_task_progress(
-                                            ui,
-                                            "Wavelet",
-                                            tasks.wavelet_progress,
-                                        );
-                                    }
-                                    if tasks.computing_wavelet_report {
-                                        ui.label(
-                                            RichText::new("[ANALYZING]")
-                                                .size(9.0)
-                                                .color(TACTICAL_CYAN),
-                                        );
-                                    }
                                 }
                             });
                         });
@@ -1749,7 +1542,6 @@ impl ApeironApp {
                     | VisualizationMode::KolmogorovComplexity
                     | VisualizationMode::JensenShannonDivergence
                     | VisualizationMode::MultiScaleEntropy
-                    | VisualizationMode::WaveletEntropy
             ) {
                 self.draw_hex_region_outline(ui, available_rect);
             }
@@ -2116,7 +1908,6 @@ impl ApeironApp {
                     ("COMPLEXITY", tasks.complexity_progress)
                 }
                 VisualizationMode::MultiScaleEntropy => ("RCMSE", tasks.rcmse_progress),
-                VisualizationMode::WaveletEntropy => ("WAVELET", tasks.wavelet_progress),
                 _ => ("ANALYSIS", 0.0),
             };
 
@@ -2300,7 +2091,6 @@ impl ApeironApp {
             VisualizationMode::KolmogorovComplexity => "KOL",
             VisualizationMode::JensenShannonDivergence => "JSD",
             VisualizationMode::MultiScaleEntropy => "MSE",
-            VisualizationMode::WaveletEntropy => "WAV",
         };
 
         // MIL-SPEC coordinate format
@@ -2565,7 +2355,6 @@ impl ApeironApp {
                 let selection_entropy = selection.entropy;
                 let selection_complexity = selection.kolmogorov_complexity;
                 let selection_ascii = selection.ascii_string.clone();
-                let wavelet_report = tab.wavelet_report.clone();
 
                 // Metrics section below hex view
                 egui::ScrollArea::vertical()
@@ -2723,75 +2512,6 @@ impl ApeironApp {
                                     .small()
                                     .color(MUTED_TEXT),
                             );
-                        });
-
-                        ui.separator();
-
-                        // Wavelet Entropy Analysis
-                        Self::section(ui, "WAVELET ENTROPY", |ui| {
-                            if let Some(ref report) = wavelet_report {
-                                // Wavelet decomposition info
-                                ui.label(
-                                    RichText::new(format!(
-                                        "LEVELS: {} // CHUNKS: {}",
-                                        report.num_wavelet_levels, report.num_entropy_chunks
-                                    ))
-                                    .monospace()
-                                    .small()
-                                    .color(MUTED_TEXT),
-                                );
-
-                                // Energy distribution across scales
-                                ui.add_space(4.0);
-                                ui.label(
-                                    RichText::new("ENERGY DISTRIBUTION")
-                                        .monospace()
-                                        .small()
-                                        .color(MUTED_TEXT),
-                                );
-
-                                // Show energy at different scales
-                                let energy_spectrum = &report.energy_spectrum;
-                                if !energy_spectrum.is_empty() {
-                                    let total: f64 = energy_spectrum.iter().sum();
-                                    if total > 0.0 {
-                                        // Coarse scales (low freq) vs fine scales (high freq)
-                                        let mid = energy_spectrum.len() / 2;
-                                        let coarse: f64 = energy_spectrum[..mid].iter().sum();
-                                        let fine: f64 = energy_spectrum[mid..].iter().sum();
-                                        let coarse_ratio = coarse / total;
-                                        let fine_ratio = fine / total;
-
-                                        ui.horizontal(|ui| {
-                                            ui.label(
-                                                RichText::new(format!(
-                                                    "LOW FREQ: {:.1}%",
-                                                    coarse_ratio * 100.0
-                                                ))
-                                                .monospace()
-                                                .small()
-                                                .color(ALERT_RED.gamma_multiply(0.8)),
-                                            );
-                                            ui.add_space(8.0);
-                                            ui.label(
-                                                RichText::new(format!(
-                                                    "HIGH FREQ: {:.1}%",
-                                                    fine_ratio * 100.0
-                                                ))
-                                                .monospace()
-                                                .small()
-                                                .color(TACTICAL_CYAN.gamma_multiply(0.8)),
-                                            );
-                                        });
-                                    }
-                                }
-                            } else {
-                                ui.label(
-                                    RichText::new("[ANALYZING...]")
-                                        .monospace()
-                                        .color(TACTICAL_CYAN),
-                                );
-                            }
                         });
 
                         // String Preview (if ASCII found) - MIL-SPEC
@@ -3071,12 +2791,6 @@ impl ApeironApp {
                     "MSE",
                     "MULTI-SCALE ENTROPY",
                     "RCMSE complexity analysis",
-                );
-                Self::mode_entry(
-                    ui,
-                    "WAV",
-                    "WAVELET ENTROPY",
-                    "Frequency-scale entropy decomposition",
                 );
 
                 ui.add_space(12.0);

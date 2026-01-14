@@ -90,7 +90,6 @@ pub fn similarity_to_color(similarity: f64, is_diagonal: bool) -> Color32 {
 
 const COMPLEXITY_SAMPLE_INTERVAL: usize = 64;
 const RCMSE_SAMPLE_INTERVAL: usize = 64;
-const WAVELET_SAMPLE_INTERVAL: usize = 64;
 
 // =============================================================================
 // Lookup Functions
@@ -112,15 +111,6 @@ fn lookup_rcmse(rcmse_map: &[f32], offset: usize) -> f32 {
     }
     let index = offset / RCMSE_SAMPLE_INTERVAL;
     rcmse_map.get(index).copied().unwrap_or(0.5)
-}
-
-#[inline]
-fn lookup_wavelet(wavelet_map: &[f32], offset: usize) -> f32 {
-    if wavelet_map.is_empty() {
-        return 0.5;
-    }
-    let index = offset / WAVELET_SAMPLE_INTERVAL;
-    wavelet_map.get(index).copied().unwrap_or(0.5)
 }
 
 // =============================================================================
@@ -877,63 +867,6 @@ pub fn generate_rcmse_pixels(
             } else {
                 let s = (t - 0.85) / 0.15;
                 (0.9 + s * 0.1, 0.8 - s * 0.2, 0.1)
-            };
-
-            Color32::from_rgb((r * 255.0) as u8, (g * 255.0) as u8, (b * 255.0) as u8)
-        })
-        .collect()
-}
-
-// =============================================================================
-// Wavelet Entropy Visualization
-// =============================================================================
-
-pub fn generate_wavelet_pixels(
-    wavelet_map: &[f32],
-    dimension: u64,
-    file_size: u64,
-    tex_size: usize,
-    world_min: Vec2,
-    scale_x: f32,
-    scale_y: f32,
-) -> Vec<Color32> {
-    (0..tex_size * tex_size)
-        .into_par_iter()
-        .map(|idx| {
-            let tex_y = idx / tex_size;
-            let tex_x = idx % tex_size;
-
-            let world_x = (world_min.x + tex_x as f32 * scale_x) as u64;
-            let world_y = (world_min.y + tex_y as f32 * scale_y) as u64;
-
-            if world_x >= dimension || world_y >= dimension {
-                return Color32::from_rgb(13, 13, 13);
-            }
-
-            let d = xy2d(dimension, world_x, world_y);
-
-            if d >= file_size {
-                return Color32::from_rgb(13, 13, 13);
-            }
-
-            let suspiciousness = lookup_wavelet(wavelet_map, d as usize);
-            let t = suspiciousness.clamp(0.0, 1.0);
-
-            let (r, g, b) = if t < 0.2 {
-                let s = t / 0.2;
-                (0.1 + s * 0.1, 0.2 + s * 0.3, 0.7 + s * 0.2)
-            } else if t < 0.4 {
-                let s = (t - 0.2) / 0.2;
-                (0.2 - s * 0.1, 0.5 + s * 0.3, 0.9 - s * 0.2)
-            } else if t < 0.6 {
-                let s = (t - 0.4) / 0.2;
-                (0.1 + s * 0.6, 0.8 - s * 0.1, 0.7 - s * 0.5)
-            } else if t < 0.8 {
-                let s = (t - 0.6) / 0.2;
-                (0.7 + s * 0.3, 0.7 - s * 0.3, 0.2 - s * 0.1)
-            } else {
-                let s = (t - 0.8) / 0.2;
-                (1.0, 0.4 - s * 0.2, 0.1 + s * 0.3)
             };
 
             Color32::from_rgb((r * 255.0) as u8, (g * 255.0) as u8, (b * 255.0) as u8)

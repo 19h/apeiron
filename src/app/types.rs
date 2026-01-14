@@ -7,7 +7,6 @@ use eframe::egui::{TextureHandle, Vec2};
 use memmap2::Mmap;
 
 use crate::hilbert::{d2xy, HilbertBuffer};
-use crate::wavelet_malware as wm;
 
 // =============================================================================
 // Constants
@@ -18,9 +17,6 @@ pub const COMPLEXITY_SAMPLE_INTERVAL: usize = 64;
 
 /// Interval for sampling RCMSE (every N bytes).
 pub const RCMSE_SAMPLE_INTERVAL: usize = 64;
-
-/// Interval for sampling wavelet suspiciousness (every N bytes).
-pub const WAVELET_SAMPLE_INTERVAL: usize = 64;
 
 // =============================================================================
 // Visualization Mode
@@ -44,8 +40,6 @@ pub enum VisualizationMode {
     JensenShannonDivergence,
     /// Refined Composite Multi-Scale Entropy - reveals complexity across time scales.
     MultiScaleEntropy,
-    /// Wavelet Entropy Decomposition - reveals entropy patterns across frequency scales.
-    WaveletEntropy,
 }
 
 impl VisualizationMode {
@@ -59,7 +53,6 @@ impl VisualizationMode {
             Self::KolmogorovComplexity => "Kolmogorov Complexity",
             Self::JensenShannonDivergence => "JS Divergence",
             Self::MultiScaleEntropy => "Multi-Scale Entropy (RCMSE)",
-            Self::WaveletEntropy => "Wavelet Entropy",
         }
     }
 
@@ -73,7 +66,6 @@ impl VisualizationMode {
             Self::KolmogorovComplexity,
             Self::JensenShannonDivergence,
             Self::MultiScaleEntropy,
-            Self::WaveletEntropy,
         ]
     }
 
@@ -87,8 +79,7 @@ impl VisualizationMode {
             | Self::SimilarityMatrix
             | Self::KolmogorovComplexity
             | Self::JensenShannonDivergence
-            | Self::MultiScaleEntropy
-            | Self::WaveletEntropy => file_dimension as f32,
+            | Self::MultiScaleEntropy => file_dimension as f32,
         }
     }
 
@@ -100,8 +91,7 @@ impl VisualizationMode {
             Self::Hilbert
             | Self::KolmogorovComplexity
             | Self::JensenShannonDivergence
-            | Self::MultiScaleEntropy
-            | Self::WaveletEntropy => 512,
+            | Self::MultiScaleEntropy => 512,
         }
     }
 
@@ -112,8 +102,7 @@ impl VisualizationMode {
             Self::Hilbert
             | Self::KolmogorovComplexity
             | Self::JensenShannonDivergence
-            | Self::MultiScaleEntropy
-            | Self::WaveletEntropy => false,
+            | Self::MultiScaleEntropy => false,
         }
     }
 }
@@ -141,8 +130,6 @@ pub struct FileData {
     pub reference_distribution: Arc<[f64; 256]>,
     /// Precomputed RCMSE values.
     pub rcmse_map: Option<Arc<Vec<f32>>>,
-    /// Precomputed wavelet suspiciousness values.
-    pub wavelet_map: Option<Arc<Vec<f32>>>,
     /// Progressive Hilbert computation buffer (for large files).
     pub hilbert_buffer: Option<Arc<HilbertBuffer>>,
 }
@@ -337,12 +324,6 @@ pub enum BackgroundTask {
     RcmsePartial { data: Vec<f32>, progress: f32 },
     /// Final RCMSE map (computation complete).
     RcmseComplete,
-    /// Partial wavelet map update (streaming).
-    WaveletPartial { data: Vec<f32>, progress: f32 },
-    /// Final wavelet map (computation complete).
-    WaveletComplete,
-    /// Wavelet report (not streamed, computed once).
-    WaveletReport(wm::WaveletMalwareReport),
 }
 
 /// Pending background computations.
@@ -353,14 +334,8 @@ pub struct BackgroundTasks {
     pub computing_complexity: bool,
     /// Whether RCMSE map is being computed.
     pub computing_rcmse: bool,
-    /// Whether wavelet map is being computed.
-    pub computing_wavelet: bool,
-    /// Whether wavelet report is being computed.
-    pub computing_wavelet_report: bool,
     /// Progress of complexity map computation (0.0-1.0).
     pub complexity_progress: f32,
     /// Progress of RCMSE map computation (0.0-1.0).
     pub rcmse_progress: f32,
-    /// Progress of wavelet map computation (0.0-1.0).
-    pub wavelet_progress: f32,
 }

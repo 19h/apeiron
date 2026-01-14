@@ -2,18 +2,18 @@
 
 A high-performance, GPU-accelerated binary entropy and complexity visualizer using Hilbert curves and advanced signal analysis techniques.
 
-Apeiron provides interactive visual analysis of binary files through eight visualization modes, helping identify patterns, encrypted regions, compressed data, and structural anomalies in executables, firmware, and other binary formats. It includes wavelet-based malware detection inspired by academic research.
+Apeiron provides interactive visual analysis of binary files through seven visualization modes, helping identify patterns, encrypted regions, compressed data, and structural anomalies in executables, firmware, and other binary formats.
 
 https://github.com/user-attachments/assets/c2ec6dc2-0296-4fa2-9494-8e86ccd562c2
 
 ## Features
 
-- **Eight Visualization Modes**: Comprehensive binary analysis from entropy to wavelet decomposition
+- **Seven Visualization Modes**: Comprehensive binary analysis from entropy to multi-scale complexity
 - **GPU Acceleration**: Hardware-accelerated rendering via wgpu compute shaders (WGSL)
 - **Portable SIMD**: High-performance algorithms using the `wide` crate (AVX2 on x86_64, NEON on ARM64)
 - **Progressive Rendering**: Large files (100MB+) render instantly with background refinement
 - **Memory-Mapped I/O**: Efficient handling of multi-gigabyte files without loading into RAM
-- **SSECS Malware Detection**: Wavelet-based suspiciousness scoring from academic research
+- **Tiered Compression**: Adaptive Kolmogorov complexity using XZ (LZMA2) and Zstd based on file size
 - **Interactive Hex Inspector**: Synchronized hex view with Hilbert curve region highlighting
 - **Real-time Analysis**: Hover over any region to see detailed byte-level analysis
 - **Hilbert Curve Mapping**: Space-filling curve preserves locality - nearby bytes appear as nearby pixels
@@ -54,13 +54,13 @@ Plots byte[i] vs byte[i+1] for all sequential bytes, colored by file position:
 - Position coloring shows how patterns evolve through the file
 
 ### Kolmogorov Complexity (KOL)
-Approximates algorithmic complexity using DEFLATE compression ratio:
+Approximates algorithmic complexity using a tiered compression system that adapts to file size:
 - **Purple/Blue**: Low complexity - highly compressible (nulls, repetitive data)
 - **Teal/Green**: Medium complexity - structured data
 - **Yellow/Orange**: High complexity - compressed or complex data
 - **Red/Pink**: Maximum complexity - encrypted or truly random data
 
-Features fast-path detection for likely-incompressible data, skipping compression for random/encrypted regions.
+Uses XZ (LZMA2) for small/medium files (best compression ratio) and Zstd for large files (high throughput).
 
 ### Jensen-Shannon Divergence (JSD)
 Measures how much each region's byte distribution diverges from the file's overall distribution:
@@ -78,28 +78,7 @@ Refined Composite Multi-Scale Entropy (RCMSE) analysis revealing complexity acro
 
 MSE distinguishes between different types of complexity - truly random data vs. complex but structured data.
 
-### Wavelet Entropy (WAV)
-Haar wavelet decomposition analyzing entropic energy distribution across spatial scales:
-- **Blue/Green**: Fine-scale energy dominance (normal variation, clean files)
-- **Yellow/Orange**: Mixed energy distribution (suspicious patterns)
-- **Red**: Coarse-scale energy dominance (large entropy shifts, potentially malicious)
-
-Based on the SSECS methodology from Wojnowicz et al. (2016).
-
-## SSECS Malware Analysis
-
-The right panel includes **SSECS (Suspiciously Structured Entropic Change Score)** analysis based on:
-
-> Wojnowicz et al., "Wavelet Decomposition of Software Entropy Reveals Symptoms of Malicious Code"  
-> *Journal of Innovation in Digital Ecosystems* (2016)
-
-Key insight: Malware tends to concentrate entropic energy at **coarse** spatial resolution levels (large shifts between encrypted/compressed sections), while legitimate files concentrate energy at **fine** levels (small local variations).
-
-The analysis shows:
-- **Malware Probability**: Estimated likelihood of malicious content (0-100%)
-- **Classification**: Clean / Suspicious / Likely Malware
-- **Energy Distribution**: Coarse vs. fine energy ratio
-- **Wavelet Levels**: Number of decomposition levels analyzed
+Uses an optimized histogram-based fast approximation with O(n) complexity instead of O(n^2).
 
 ## Interactive Hex Inspector
 
@@ -158,7 +137,7 @@ sudo pacman -S libxcb libxkbcommon gtk3
    - Hover over regions to inspect bytes
 3. **Switch modes**: Use the Mode dropdown in the toolbar
 4. **Reset view**: Click "Reset View" to fit the visualization to the window
-5. **Analyze**: Review the SSECS malware analysis and entropy metrics in the right panel
+5. **Analyze**: Review the entropy and complexity metrics in the right panel
 
 ## Controls
 
@@ -191,12 +170,6 @@ The right panel shows detailed information about the currently hovered byte posi
 - **Complexity**: Compression ratio percentage
 - **Interpretation**: Simple / Structured / Complex / Random
 
-### SSECS (Wavelet Entropy)
-- **Malware Probability**: Percentage likelihood
-- **Classification**: Clean / Suspicious / Likely Malware
-- **Energy Distribution**: Coarse vs. fine ratio
-- **Levels/Chunks**: Wavelet decomposition statistics
-
 ### Hex View
 - Interactive hex dump with ASCII representation
 - Scrollable through entire file
@@ -219,16 +192,24 @@ where p(x) is the probability of byte value x in the window. Result ranges from 
 - Dual accumulators for instruction-level parallelism
 
 ### Kolmogorov Complexity Approximation
-Complexity is approximated using DEFLATE compression (level 6):
-```
-K(x) ≈ len(compress(x)) / len(x)
-```
-Pre-computed at file load time using parallel processing (sampled every 64 bytes with 128-byte windows).
+Complexity is approximated using a tiered compression system that adapts to file/chunk size:
+
+| Tier | Size Range | Algorithm | Throughput |
+|------|------------|-----------|------------|
+| Streaming | <4KB | Zstd -1 | ~300 MB/s |
+| 1 | 4KB-1MB | XZ -9 | ~0.9 MB/s |
+| 2 | 1-64MB | XZ -6 | ~1.1 MB/s |
+| 3 | 64MB-1GB | Zstd -19 | ~1.2 MB/s |
+| 4 | 1-16GB | Zstd -8 | ~36 MB/s |
+| 5 | 16-100GB | Zstd -1 | ~233 MB/s |
+
+Pre-computed on demand when switching to Kolmogorov mode (sampled every 64 bytes with 128-byte windows).
 
 **Optimizations:**
-- Thread-local encoder buffer reuse
-- Fast-path detection for likely-incompressible data (skips compression)
+- XZ (LZMA2) for maximum compression ratio on small/medium data
+- Zstd for high throughput on large files
 - Background streaming computation with progress updates
+- Lazy computation: only computed when user switches to KOL mode
 
 ### Jensen-Shannon Divergence
 JSD between window distribution P and file distribution Q:
@@ -243,29 +224,15 @@ where M = ½(P + Q) and D_KL is Kullback-Leibler divergence.
 - Dual accumulators for better ILP
 
 ### Multi-Scale Entropy (RCMSE)
-Refined Composite Multi-Scale Entropy using coarse-graining:
-1. Coarse-grain signal at multiple scales τ
-2. Compute sample entropy at each scale
-3. Average across coarse-grained sequences
-4. Aggregate into complexity score
+Refined Composite Multi-Scale Entropy using a fast histogram-based approximation:
+1. Compute byte histograms for pattern counting (O(n) instead of O(n²))
+2. Sample sparse scales [1, 3, 6] instead of all scales 1-6
+3. Aggregate into complexity score
 
 **Optimizations:**
-- Direct byte processing (eliminates intermediate f64 allocation)
-- SIMD coarse-graining with u32x4 accumulation
-- Parallel scale computation with per-thread buffers
-
-### Wavelet Transform (SSECS)
-Orthonormal Haar wavelet decomposition following Wojnowicz et al.:
-
-1. **Entropy Stream**: File split into 256-byte chunks, Shannon entropy computed per chunk
-2. **Haar Transform**: Wavelet coefficients d_{jk} computed with 1/√2 scaling (energy-preserving)
-3. **Energy Spectrum**: E_j = Σ(d_{jk})² for each resolution level j
-4. **SSECS Score**: Logistic model based on coarse/fine energy ratio
-
-**Optimizations:**
-- SIMD Haar transform using f64x4
-- Thread-local scratch buffers with UnsafeCell
-- 8-way energy spectrum computation with dual accumulators
+- Histogram-based pattern matching (~50-100x speedup)
+- O(n × 3) complexity instead of O(n² × 36)
+- Lazy computation: only computed when user switches to MSE mode
 
 ### Hilbert Curve
 The Hilbert curve dimension is chosen as the smallest power of 2 where n² >= file_size. This ensures all bytes can be mapped while maintaining the locality-preserving property.
@@ -282,7 +249,7 @@ When available, visualization rendering uses wgpu compute shaders (WGSL) for par
 - **Phase Space**: Trajectory accumulation with position coloring
 - **Similarity Matrix**: Chi-squared distance computation
 
-Falls back to CPU (with rayon parallelization) for modes requiring CPU-side computation (KOL, JSD, MSE, WAV) or when GPU is unavailable.
+Falls back to CPU (with rayon parallelization) for modes requiring CPU-side computation (KOL, JSD, MSE) or when GPU is unavailable.
 
 ### Progressive Rendering
 Files larger than 100MB use a two-phase rendering approach:
@@ -294,7 +261,7 @@ The main thread reads computed values lock-free while the background thread refi
 ## Performance
 
 - **Large Files**: 100MB+ files handled efficiently via viewport-aware rendering and memory-mapped I/O
-- **Pre-computation**: Kolmogorov, RCMSE, and wavelet maps computed at load time using parallel processing
+- **Lazy Computation**: Kolmogorov and RCMSE maps computed on-demand when switching to those modes
 - **GPU Acceleration**: Significant speedup for Hilbert, Digraph, Phase Space, and Similarity Matrix modes
 - **Portable SIMD**: AVX2 on x86_64, NEON on ARM64 via the `wide` crate
 - **Texture Caching**: Smart regeneration thresholds prevent excessive recomputation during navigation
@@ -316,7 +283,7 @@ Apeiron automatically detects common file types via magic bytes:
 
 ## Use Cases
 
-- **Malware Analysis**: Identify packed/encrypted sections, detect suspicious entropy patterns via SSECS
+- **Malware Analysis**: Identify packed/encrypted sections, detect suspicious entropy patterns
 - **Firmware Analysis**: Find compressed regions, locate file systems, identify anomalies
 - **Forensics**: Detect hidden data, identify file fragments, find injected content
 - **Reverse Engineering**: Understand binary structure, locate interesting regions
@@ -326,7 +293,6 @@ Apeiron automatically detects common file types via magic bytes:
 
 ## References
 
-- Wojnowicz, M., et al. (2016). "Wavelet Decomposition of Software Entropy Reveals Symptoms of Malicious Code." *Journal of Innovation in Digital Ecosystems*, 3, 130-140. [DOI](https://doi.org/10.1016/j.jides.2016.10.009)
 - Lyda, R., & Hamrock, J. (2007). "Using Entropy Analysis to Find Encrypted and Packed Malware." *IEEE Security & Privacy*, 5(2), 40-45.
 - Costa, M., et al. (2002). "Multiscale entropy analysis of complex physiologic time series." *Physical Review Letters*, 89(6).
 - Hilbert, D. (1891). "Über die stetige Abbildung einer Linie auf ein Flächenstück." *Mathematische Annalen*, 38, 459-460.
@@ -338,9 +304,9 @@ MIT License - See [LICENSE](LICENSE) for details.
 ## Acknowledgments
 
 - Inspired by binary visualization research and tools like binvis.io and Veles
-- SSECS methodology from Cylance research (Wojnowicz et al.)
 - Uses [egui](https://github.com/emilk/egui) for the immediate mode GUI
 - GPU compute via [wgpu](https://github.com/gfx-rs/wgpu)
 - Portable SIMD via [wide](https://github.com/Lokathor/wide)
+- Compression via [xz2](https://github.com/alexcrichton/xz2-rs) (LZMA2) and [zstd](https://github.com/gyscos/zstd-rs)
 - File dialogs via [rfd](https://github.com/PolyMeilex/rfd)
 - Parallel processing via [rayon](https://github.com/rayon-rs/rayon)

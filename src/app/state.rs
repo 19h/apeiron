@@ -11,7 +11,6 @@ use crate::gpu::GpuRenderer;
 use crate::util::color::{
     DATA_WHITE, INTERFACE_GRAY, MUTED_TEXT, PANEL_DARK, TACTICAL_CYAN, VOID_BLACK,
 };
-use crate::wavelet_malware::WaveletMalwareReport;
 
 // =============================================================================
 // Tab
@@ -29,8 +28,6 @@ pub struct Tab {
     pub selection: Selection,
     /// Hex view state.
     pub hex_view: HexView,
-    /// Cached wavelet malware analysis for the current file.
-    pub wavelet_report: Option<WaveletMalwareReport>,
     /// Cached texture for the entropy visualization.
     pub texture: Option<TextureHandle>,
     /// Texture generation parameters (to detect when regeneration is needed).
@@ -53,7 +50,6 @@ impl Default for Tab {
             viewport: Viewport::default(),
             selection: Selection::default(),
             hex_view: HexView::new(),
-            wavelet_report: None,
             texture: None,
             texture_params: None,
             viz_mode: VisualizationMode::default(),
