@@ -3,10 +3,10 @@
 //! This library provides tools for analyzing and visualizing binary file entropy
 //! and complexity using various algorithms including:
 //! - Shannon entropy
-//! - Kolmogorov complexity (via DEFLATE compression)
+//! - Kolmogorov complexity (via tiered XZ/Zstd compression)
 //! - Jensen-Shannon divergence
 //! - Refined Composite Multi-Scale Entropy (RCMSE)
-//! - Wavelet-based SSECS malware detection
+//! - Wavelet entropy decomposition
 //!
 //! Visualizations are rendered on Hilbert curves for spatial locality preservation.
 
@@ -17,5 +17,5 @@ pub mod hilbert;
 pub mod util;
 pub mod viz;
 
-// Legacy module - kept for backwards compatibility during refactoring
+// Wavelet-based malware detection module
 pub mod wavelet_malware;

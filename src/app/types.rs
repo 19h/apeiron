@@ -44,7 +44,7 @@ pub enum VisualizationMode {
     JensenShannonDivergence,
     /// Refined Composite Multi-Scale Entropy - reveals complexity across time scales.
     MultiScaleEntropy,
-    /// Wavelet Entropy Decomposition - reveals suspicious entropy patterns via SSECS.
+    /// Wavelet Entropy Decomposition - reveals entropy patterns across frequency scales.
     WaveletEntropy,
 }
 
@@ -59,7 +59,7 @@ impl VisualizationMode {
             Self::KolmogorovComplexity => "Kolmogorov Complexity",
             Self::JensenShannonDivergence => "JS Divergence",
             Self::MultiScaleEntropy => "Multi-Scale Entropy (RCMSE)",
-            Self::WaveletEntropy => "Wavelet Entropy (SSECS)",
+            Self::WaveletEntropy => "Wavelet Entropy",
         }
     }
 

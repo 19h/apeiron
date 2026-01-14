@@ -8,7 +8,7 @@
 //! - Kolmogorov complexity
 //! - Jensen-Shannon divergence
 //! - Multi-scale entropy (RCMSE)
-//! - Wavelet entropy (SSECS)
+//! - Wavelet entropy decomposition
 
 mod generators;
 

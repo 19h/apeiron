@@ -6,7 +6,6 @@
 //! - Jensen-Shannon divergence
 //! - Refined Composite Multi-Scale Entropy (RCMSE)
 //! - Haar wavelet transform and entropy analysis
-//! - SSECS malware detection
 //! - Byte-level forensic analysis
 
 pub mod byte;
@@ -14,7 +13,6 @@ pub mod entropy;
 pub mod jsd;
 pub mod kolmogorov;
 pub mod rcmse;
-pub mod ssecs;
 pub mod wavelet;
 
 // Re-export commonly used items
@@ -26,10 +24,6 @@ pub use entropy::{
 pub use jsd::{calculate_jsd, jensen_shannon_divergence, JSDAnalysis};
 pub use kolmogorov::{calculate_kolmogorov_complexity, KolmogorovAnalysis};
 pub use rcmse::{calculate_rcmse, calculate_rcmse_quick, RCMSEAnalysis, RCMSEClassification};
-pub use ssecs::{
-    analyze_file_for_malware, MalwareClassification, SSECSResult, WaveletEntropyAnalysis,
-    WaveletMalwareReport,
-};
 pub use wavelet::{
     calculate_wavelet_suspiciousness, compute_entropy_stream, haar_wavelet_transform,
     wavelet_energy_spectrum, wavelet_suspiciousness_8, WaveletAnalysis, WAVELET_CHUNK_SIZE,
