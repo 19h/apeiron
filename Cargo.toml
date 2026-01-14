@@ -14,7 +14,11 @@ rayon = "1.10"
 wgpu = "23"
 pollster = "0.4"
 bytemuck = { version = "1.14", features = ["derive"] }
-flate2 = "1.0"
+# Tiered compression for Kolmogorov complexity approximation
+# Tier 1-2 (≤64MB): XZ/LZMA - best compression ratio
+xz2 = "0.1"
+# Tier 3-5 (64MB+): Zstd - fast with good compression
+zstd = { version = "0.13", default-features = false, features = ["zstdmt"] }
 memmap2 = "0.9"
 # Portable SIMD for high-performance algorithms
 wide = "0.7"

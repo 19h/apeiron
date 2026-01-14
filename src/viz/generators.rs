@@ -775,9 +775,7 @@ pub fn generate_kolmogorov_pixels(
             }
 
             let complexity = lookup_complexity(complexity_map, d as usize);
-            let analysis = KolmogorovAnalysis {
-                complexity: complexity as f64,
-            };
+            let analysis = KolmogorovAnalysis::from_value(complexity as f64);
             let [r, g, b] = analysis.to_color();
             Color32::from_rgb(r, g, b)
         })
