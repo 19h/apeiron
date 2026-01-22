@@ -19,6 +19,47 @@ pub const COMPLEXITY_SAMPLE_INTERVAL: usize = 64;
 pub const RCMSE_SAMPLE_INTERVAL: usize = 64;
 
 // =============================================================================
+// Byte Layout Mode
+// =============================================================================
+
+/// How bytes are mapped to 2D space.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum ByteLayout {
+    /// Hilbert curve - preserves locality but scrambles linear order.
+    #[default]
+    Hilbert,
+    /// Linear (row-major) - top-left to bottom-right, like reading text.
+    /// Better for visualizing sections/segments which are contiguous byte ranges.
+    Linear,
+}
+
+impl ByteLayout {
+    /// Get display name for the layout.
+    pub fn name(&self) -> &'static str {
+        match self {
+            Self::Hilbert => "Hilbert",
+            Self::Linear => "Linear",
+        }
+    }
+
+    /// Get short indicator for HUD.
+    pub fn short_name(&self) -> &'static str {
+        match self {
+            Self::Hilbert => "HIL",
+            Self::Linear => "LIN",
+        }
+    }
+
+    /// Toggle to the other layout.
+    pub fn toggle(&self) -> Self {
+        match self {
+            Self::Hilbert => Self::Linear,
+            Self::Linear => Self::Hilbert,
+        }
+    }
+}
+
+// =============================================================================
 // Visualization Mode
 // =============================================================================
 
@@ -83,6 +124,19 @@ impl VisualizationMode {
         }
     }
 
+    /// Get the world dimension for this mode, accounting for byte layout.
+    /// For modes that support layout toggle, uses the appropriate dimension.
+    pub fn world_dimension_for_layout(self, file: &FileData, byte_layout: ByteLayout) -> f32 {
+        match self {
+            Self::Digraph | Self::BytePhaseSpace => 256.0,
+            Self::SimilarityMatrix => file.dimension as f32, // Always uses Hilbert dimension
+            Self::Hilbert
+            | Self::KolmogorovComplexity
+            | Self::JensenShannonDivergence
+            | Self::MultiScaleEntropy => file.dimension_for_layout(byte_layout) as f32,
+        }
+    }
+
     /// Get the minimum texture size for this mode.
     pub fn min_texture_size(self) -> usize {
         match self {
@@ -105,6 +159,19 @@ impl VisualizationMode {
             | Self::MultiScaleEntropy => false,
         }
     }
+
+    /// Whether this mode supports switching between Hilbert and Linear layout.
+    /// Modes with their own coordinate systems (Digraph, PhaseSpace, SimilarityMatrix)
+    /// don't support layout switching.
+    pub fn supports_layout_toggle(self) -> bool {
+        match self {
+            Self::Hilbert
+            | Self::KolmogorovComplexity
+            | Self::JensenShannonDivergence
+            | Self::MultiScaleEntropy => true,
+            Self::SimilarityMatrix | Self::Digraph | Self::BytePhaseSpace => false,
+        }
+    }
 }
 
 // =============================================================================
@@ -119,6 +186,8 @@ pub struct FileData {
     pub size: u64,
     /// Hilbert curve dimension (power of 2).
     pub dimension: u64,
+    /// Linear layout dimension (ceil(sqrt(size)) for square layout).
+    pub linear_dimension: u64,
     /// Detected file type.
     pub file_type: &'static str,
     /// Original file path.
@@ -132,6 +201,18 @@ pub struct FileData {
     pub rcmse_map: Option<Arc<Vec<f32>>>,
     /// Progressive Hilbert computation buffer (for large files).
     pub hilbert_buffer: Option<Arc<HilbertBuffer>>,
+}
+
+impl FileData {
+    /// Get the dimension for the specified byte layout.
+    /// - Hilbert: power of 2 dimension for Hilbert curve
+    /// - Linear: ceil(sqrt(file_size)) for square layout
+    pub fn dimension_for_layout(&self, layout: ByteLayout) -> u64 {
+        match layout {
+            ByteLayout::Hilbert => self.dimension,
+            ByteLayout::Linear => self.linear_dimension,
+        }
+    }
 }
 
 // =============================================================================
@@ -177,13 +258,15 @@ pub struct Selection {
 // Hex View
 // =============================================================================
 
-/// Cached Hilbert curve outline for the visible hex region.
+/// Cached outline for the visible hex region.
 pub struct OutlineCache {
     /// The range this cache was computed for.
     pub start_offset: u64,
     pub end_offset: u64,
     /// Dimension used to compute the cache.
     pub dimension: u64,
+    /// Layout mode used to compute the cache.
+    pub byte_layout: ByteLayout,
     /// Precomputed world coordinates (x, y) for the outline.
     pub points: Vec<(f32, f32)>,
     /// Bounding box in world coordinates.
@@ -240,16 +323,31 @@ impl HexView {
     }
 
     /// Check if the outline cache is valid for the current visible range.
-    pub fn is_cache_valid(&self, start: u64, end: u64, dimension: u64) -> bool {
+    pub fn is_cache_valid(
+        &self,
+        start: u64,
+        end: u64,
+        dimension: u64,
+        byte_layout: ByteLayout,
+    ) -> bool {
         if let Some(cache) = &self.outline_cache {
-            cache.start_offset == start && cache.end_offset == end && cache.dimension == dimension
+            cache.start_offset == start
+                && cache.end_offset == end
+                && cache.dimension == dimension
+                && cache.byte_layout == byte_layout
         } else {
             false
         }
     }
 
     /// Update the outline cache for the given range.
-    pub fn update_outline_cache(&mut self, start: u64, end: u64, dimension: u64) {
+    pub fn update_outline_cache(
+        &mut self,
+        start: u64,
+        end: u64,
+        dimension: u64,
+        byte_layout: ByteLayout,
+    ) {
         let range_size = end.saturating_sub(start);
         let sample_interval = (range_size / 200).max(1) as usize;
 
@@ -259,9 +357,17 @@ impl HexView {
         let mut max_x = f32::MIN;
         let mut max_y = f32::MIN;
 
+        // Helper to convert byte offset to (x, y) based on layout
+        let offset_to_xy = |offset: u64| -> (u64, u64) {
+            match byte_layout {
+                ByteLayout::Hilbert => d2xy(dimension, offset),
+                ByteLayout::Linear => (offset % dimension, offset / dimension),
+            }
+        };
+
         let mut offset = start;
         while offset < end {
-            let (x, y) = d2xy(dimension, offset);
+            let (x, y) = offset_to_xy(offset);
             let fx = x as f32 + 0.5;
             let fy = y as f32 + 0.5;
             points.push((fx, fy));
@@ -276,7 +382,7 @@ impl HexView {
 
         // Add final point
         if end > start {
-            let (x, y) = d2xy(dimension, end.saturating_sub(1));
+            let (x, y) = offset_to_xy(end.saturating_sub(1));
             points.push((x as f32 + 0.5, y as f32 + 0.5));
             min_x = min_x.min(x as f32);
             min_y = min_y.min(y as f32);
@@ -288,6 +394,7 @@ impl HexView {
             start_offset: start,
             end_offset: end,
             dimension,
+            byte_layout,
             points,
             bbox: (min_x, min_y, max_x, max_y),
         });
@@ -308,6 +415,8 @@ pub struct TextureParams {
     pub tex_size: usize,
     /// Visualization mode used to generate this texture.
     pub viz_mode: VisualizationMode,
+    /// Byte layout (Hilbert vs Linear).
+    pub byte_layout: ByteLayout,
 }
 
 // =============================================================================

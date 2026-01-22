@@ -31,8 +31,8 @@ use analysis::{
     calculate_rcmse_quick, extract_ascii, identify_file_type, ANALYSIS_WINDOW,
 };
 use app::{
-    ApeironApp, BackgroundTask, BackgroundTasks, FileData, HexView, Selection, Tab, TextureParams,
-    Viewport, VisualizationMode, COMPLEXITY_SAMPLE_INTERVAL, RCMSE_SAMPLE_INTERVAL,
+    ApeironApp, BackgroundTask, BackgroundTasks, ByteLayout, FileData, HexView, Selection, Tab,
+    TextureParams, Viewport, VisualizationMode, COMPLEXITY_SAMPLE_INTERVAL, RCMSE_SAMPLE_INTERVAL,
 };
 use hilbert::{calculate_dimension, xy2d, HilbertBuffer, HilbertRefiner, PROGRESSIVE_THRESHOLD};
 use util::color::{
@@ -88,6 +88,8 @@ impl ApeironApp {
         }
 
         let dimension = calculate_dimension(size);
+        // Linear dimension: ceil(sqrt(file_size)) for square layout
+        let linear_dimension = (size as f64).sqrt().ceil() as u64;
         let file_type = identify_file_type(data);
 
         // Extract filename for tab title
@@ -130,6 +132,7 @@ impl ApeironApp {
             data: Arc::clone(&data),
             size,
             dimension,
+            linear_dimension,
             file_type,
             path,
             complexity_map: None,
@@ -579,8 +582,10 @@ impl ApeironApp {
         }
 
         let viz_mode = tab.viz_mode;
-        let dimension = file.dimension;
+        let byte_layout = tab.byte_layout;
         let file_size = file.size;
+        // Use layout-specific dimension for modes that support layout toggle
+        let dimension = file.dimension_for_layout(byte_layout);
 
         // Find the offset based on interaction
         let offset = match viz_mode {
@@ -592,7 +597,11 @@ impl ApeironApp {
                 let y = world_pos.y as u64;
 
                 if x < dimension && y < dimension {
-                    let d = xy2d(dimension, x, y);
+                    // Convert world coordinates to byte offset based on layout
+                    let d = match byte_layout {
+                        ByteLayout::Hilbert => xy2d(dimension, x, y),
+                        ByteLayout::Linear => y * dimension + x,
+                    };
                     if d < file_size {
                         Some(d)
                     } else {
@@ -622,8 +631,8 @@ impl ApeironApp {
                 }
             }
             VisualizationMode::SimilarityMatrix => {
-                // Map to file positions based on X/Y
-                let pos_x = (world_pos.x as u64 * file_size / dimension).min(file_size - 1);
+                // Map to file positions based on X/Y (similarity matrix always uses Hilbert dimension)
+                let pos_x = (world_pos.x as u64 * file_size / file.dimension).min(file_size - 1);
                 Some(pos_x)
             }
         };
@@ -640,8 +649,10 @@ impl ApeironApp {
             return;
         };
 
-        // Get world dimension based on visualization mode
-        let dim = tab.viz_mode.world_dimension(file.dimension);
+        // Get world dimension based on visualization mode and layout
+        let dim = tab
+            .viz_mode
+            .world_dimension_for_layout(file, tab.byte_layout);
 
         // Calculate world region to render
         let (world_min, world_max) = if tab.viz_mode.renders_full_world() {
@@ -687,21 +698,24 @@ impl ApeironApp {
             world_max,
             tex_size,
             viz_mode: tab.viz_mode,
+            byte_layout: tab.byte_layout,
         };
 
         if let Some(old_params) = &tab.texture_params {
-            // Only regenerate if viewport changed significantly or mode changed
+            // Only regenerate if viewport changed significantly or mode/layout changed
             let min_delta = (new_params.world_min - old_params.world_min).length();
             let max_delta = (new_params.world_max - old_params.world_max).length();
             let size_changed = new_params.tex_size != old_params.tex_size;
             let mode_changed = new_params.viz_mode != old_params.viz_mode;
+            let layout_changed = new_params.byte_layout != old_params.byte_layout;
 
-            // Threshold: regenerate if moved more than 10% of visible area or size/mode changed
+            // Threshold: regenerate if moved more than 10% of visible area or size/mode/layout changed
             let threshold = world_size.length() * 0.1;
             if min_delta < threshold
                 && max_delta < threshold
                 && !size_changed
                 && !mode_changed
+                && !layout_changed
                 && tab.texture.is_some()
             {
                 return;
@@ -714,9 +728,11 @@ impl ApeironApp {
         let reference_distribution = Arc::clone(&file.reference_distribution);
         let rcmse_map = file.rcmse_map.clone();
         let hilbert_buffer = file.hilbert_buffer.clone();
-        let dimension = file.dimension;
         let file_size = file.size;
         let viz_mode = tab.viz_mode;
+        let byte_layout = tab.byte_layout;
+        // Use layout-specific dimension for modes that support layout toggle
+        let dimension = file.dimension_for_layout(byte_layout);
 
         // Use empty slice as fallback for maps not yet computed
         let empty_map: Arc<Vec<f32>> = Arc::new(Vec::new());
@@ -732,44 +748,68 @@ impl ApeironApp {
         // Try GPU rendering first, fall back to CPU
         // Note: KolmogorovComplexity, JSD, and RCMSE are CPU-only (use precomputed values)
         // Also use CPU for Hilbert when progressive rendering is active (large files)
-        let image = if let Some(ref gpu) = self.gpu_renderer {
-            if gpu.is_ready() {
-                let gpu_mode = match viz_mode {
-                    // Use CPU for Hilbert with progressive buffer (shows refinement progress)
-                    VisualizationMode::Hilbert if hilbert_buffer.is_some() => None,
-                    VisualizationMode::Hilbert => Some(gpu::GpuVizMode::Hilbert),
-                    VisualizationMode::Digraph => Some(gpu::GpuVizMode::Digraph),
-                    VisualizationMode::BytePhaseSpace => Some(gpu::GpuVizMode::BytePhaseSpace),
-                    VisualizationMode::SimilarityMatrix => Some(gpu::GpuVizMode::SimilarityMatrix),
-                    // Kolmogorov, JSD, and RCMSE use precomputed/calculated values - CPU rendering
-                    VisualizationMode::KolmogorovComplexity
-                    | VisualizationMode::JensenShannonDivergence
-                    | VisualizationMode::MultiScaleEntropy => None,
-                };
+        // GPU shaders only support Hilbert layout, so use CPU for Linear layout
+        let use_gpu = byte_layout == ByteLayout::Hilbert;
+        let image = if use_gpu {
+            if let Some(ref gpu) = self.gpu_renderer {
+                if gpu.is_ready() {
+                    let gpu_mode = match viz_mode {
+                        // Use CPU for Hilbert with progressive buffer (shows refinement progress)
+                        VisualizationMode::Hilbert if hilbert_buffer.is_some() => None,
+                        VisualizationMode::Hilbert => Some(gpu::GpuVizMode::Hilbert),
+                        VisualizationMode::Digraph => Some(gpu::GpuVizMode::Digraph),
+                        VisualizationMode::BytePhaseSpace => Some(gpu::GpuVizMode::BytePhaseSpace),
+                        VisualizationMode::SimilarityMatrix => {
+                            Some(gpu::GpuVizMode::SimilarityMatrix)
+                        }
+                        // Kolmogorov, JSD, and RCMSE use precomputed/calculated values - CPU rendering
+                        VisualizationMode::KolmogorovComplexity
+                        | VisualizationMode::JensenShannonDivergence
+                        | VisualizationMode::MultiScaleEntropy => None,
+                    };
 
-                if let Some(mode) = gpu_mode {
-                    let rgba_data = gpu.render(
-                        mode,
-                        tex_size as u32,
-                        tex_size as u32,
-                        world_min.x,
-                        world_min.y,
-                        world_max.x,
-                        world_max.y,
-                    );
+                    if let Some(mode) = gpu_mode {
+                        let rgba_data = gpu.render(
+                            mode,
+                            tex_size as u32,
+                            tex_size as u32,
+                            world_min.x,
+                            world_min.y,
+                            world_max.x,
+                            world_max.y,
+                        );
 
-                    // Convert RGBA bytes to Color32
-                    let pixels: Vec<Color32> = rgba_data
-                        .chunks_exact(4)
-                        .map(|c| Color32::from_rgba_unmultiplied(c[0], c[1], c[2], c[3]))
-                        .collect();
+                        // Convert RGBA bytes to Color32
+                        let pixels: Vec<Color32> = rgba_data
+                            .chunks_exact(4)
+                            .map(|c| Color32::from_rgba_unmultiplied(c[0], c[1], c[2], c[3]))
+                            .collect();
 
-                    ColorImage {
-                        size: [tex_size, tex_size],
-                        pixels,
+                        ColorImage {
+                            size: [tex_size, tex_size],
+                            pixels,
+                        }
+                    } else {
+                        // Mode not supported on GPU, use CPU
+                        Self::generate_cpu_image(
+                            &data,
+                            complexity_ref,
+                            &reference_distribution,
+                            rcmse_ref,
+                            hilbert_buffer.as_deref(),
+                            dimension,
+                            file_size,
+                            tex_size,
+                            world_min,
+                            scale_x,
+                            scale_y,
+                            viz_mode,
+                            byte_layout,
+                            time_seconds,
+                        )
                     }
                 } else {
-                    // Mode not supported on GPU, use CPU
+                    // GPU not ready, use CPU fallback
                     Self::generate_cpu_image(
                         &data,
                         complexity_ref,
@@ -783,11 +823,12 @@ impl ApeironApp {
                         scale_x,
                         scale_y,
                         viz_mode,
+                        byte_layout,
                         time_seconds,
                     )
                 }
             } else {
-                // GPU not ready, use CPU fallback
+                // No GPU, use CPU fallback
                 Self::generate_cpu_image(
                     &data,
                     complexity_ref,
@@ -801,11 +842,12 @@ impl ApeironApp {
                     scale_x,
                     scale_y,
                     viz_mode,
+                    byte_layout,
                     time_seconds,
                 )
             }
         } else {
-            // No GPU, use CPU fallback
+            // Linear layout - use CPU rendering
             Self::generate_cpu_image(
                 &data,
                 complexity_ref,
@@ -819,6 +861,7 @@ impl ApeironApp {
                 scale_x,
                 scale_y,
                 viz_mode,
+                byte_layout,
                 time_seconds,
             )
         };
@@ -842,12 +885,18 @@ impl ApeironApp {
         scale_x: f32,
         scale_y: f32,
         viz_mode: VisualizationMode,
+        byte_layout: ByteLayout,
         time_seconds: f64,
     ) -> ColorImage {
+        let use_linear = byte_layout == ByteLayout::Linear;
         let pixels: Vec<Color32> = match viz_mode {
             VisualizationMode::Hilbert => {
-                // Use progressive rendering for large files with hilbert_buffer
-                if let Some(buffer) = hilbert_buffer {
+                if use_linear {
+                    viz::generate_linear_entropy_pixels(
+                        data, dimension, file_size, tex_size, world_min, scale_x, scale_y,
+                    )
+                } else if let Some(buffer) = hilbert_buffer {
+                    // Use progressive rendering for large files with hilbert_buffer
                     viz::generate_hilbert_pixels_progressive(
                         buffer,
                         dimension,
@@ -886,6 +935,7 @@ impl ApeironApp {
                         world_min,
                         scale_x,
                         scale_y,
+                        use_linear,
                     )
                 }
             }
@@ -898,6 +948,7 @@ impl ApeironApp {
                 world_min,
                 scale_x,
                 scale_y,
+                use_linear,
             ),
             VisualizationMode::MultiScaleEntropy => {
                 // Show placeholder while computing to avoid parallel rendering competing with background
@@ -906,6 +957,7 @@ impl ApeironApp {
                 } else {
                     viz::generate_rcmse_pixels(
                         rcmse_map, dimension, file_size, tex_size, world_min, scale_x, scale_y,
+                        use_linear,
                     )
                 }
             }
@@ -932,7 +984,9 @@ impl ApeironApp {
     fn fit_to_view(&mut self, view_size: Vec2) {
         let tab = &mut self.tabs[self.active_tab];
         if let Some(file) = &tab.file_data {
-            let world_dim = tab.viz_mode.world_dimension(file.dimension);
+            let world_dim = tab
+                .viz_mode
+                .world_dimension_for_layout(file, tab.byte_layout);
 
             // Calculate zoom to fit world in view with some padding
             let padding = 0.95; // 95% of view
@@ -1337,6 +1391,37 @@ impl eframe::App for ApeironApp {
                         tab.last_fit_view_size = None;
                     }
 
+                    // Layout toggle button (only for modes that support it)
+                    if new_mode.supports_layout_toggle() {
+                        ui.add_space(8.0);
+                        ui.label(RichText::new("LAYOUT:").size(10.0).color(MUTED_TEXT));
+                        let current_layout = self.active_tab().byte_layout;
+                        let layout_btn = ui.add(
+                            egui::Button::new(
+                                RichText::new(current_layout.short_name())
+                                    .monospace()
+                                    .size(11.0),
+                            )
+                            .min_size(egui::vec2(40.0, 20.0)),
+                        );
+                        if layout_btn.clicked() {
+                            let tab = self.active_tab_mut();
+                            tab.byte_layout = tab.byte_layout.toggle();
+                            tab.texture = None;
+                            tab.texture_params = None;
+                            // Reset viewport to fit the new layout
+                            tab.needs_fit_to_view = true;
+                            tab.last_fit_view_size = None;
+                            // Invalidate outline cache since coordinates changed
+                            tab.hex_view.outline_cache = None;
+                        }
+                        layout_btn.on_hover_text(format!(
+                            "Toggle layout: {} → {}",
+                            current_layout.name(),
+                            current_layout.toggle().name()
+                        ));
+                    }
+
                     // Show loading indicator when background tasks are running
                     let has_background_tasks = self.active_tab().background_tasks.is_some();
                     let hilbert_progress = self.get_hilbert_refine_progress();
@@ -1446,7 +1531,9 @@ impl ApeironApp {
             let (min_zoom, max_zoom) = {
                 let tab = self.active_tab();
                 if let Some(file) = &tab.file_data {
-                    let world_dim = tab.viz_mode.world_dimension(file.dimension);
+                    let world_dim = tab
+                        .viz_mode
+                        .world_dimension_for_layout(file, tab.byte_layout);
                     let view_min = available_rect.width().min(available_rect.height());
                     // Min zoom: fit entire world in view (with margin)
                     let min_z = (view_min * 0.8) / world_dim;
@@ -1622,7 +1709,8 @@ impl ApeironApp {
             return;
         }
 
-        let dimension = file.dimension;
+        let byte_layout = tab.byte_layout;
+        let dimension = file.dimension_for_layout(byte_layout);
         let viewport_offset = tab.viewport.offset;
         let viewport_zoom = tab.viewport.zoom;
 
@@ -1630,10 +1718,10 @@ impl ApeironApp {
         let tab = &mut self.tabs[self.active_tab];
         if !tab
             .hex_view
-            .is_cache_valid(start_offset, end_offset, dimension)
+            .is_cache_valid(start_offset, end_offset, dimension, byte_layout)
         {
             tab.hex_view
-                .update_outline_cache(start_offset, end_offset, dimension);
+                .update_outline_cache(start_offset, end_offset, dimension, byte_layout);
         }
 
         // Get cached data
@@ -2093,9 +2181,16 @@ impl ApeironApp {
             VisualizationMode::MultiScaleEntropy => "MSE",
         };
 
+        // Add layout indicator for modes that support it
+        let layout_indicator = if tab.viz_mode.supports_layout_toggle() {
+            format!("/{}", tab.byte_layout.short_name())
+        } else {
+            String::new()
+        };
+
         // MIL-SPEC coordinate format
         let text = format!(
-            "◢ [{}] | ZOOM: {:.2}x | POS: {:.0},{:.0} | SIZE: {} | [ACTIVE]",
+            "◢ [{}{layout_indicator}] | ZOOM: {:.2}x | POS: {:.0},{:.0} | SIZE: {} | [ACTIVE]",
             mode_indicator,
             tab.viewport.zoom,
             tab.viewport.offset.x,

@@ -205,6 +205,53 @@ pub fn generate_hilbert_pixels_progressive(
         .collect()
 }
 
+// =============================================================================
+// Linear Layout Visualization
+// =============================================================================
+
+/// Generate entropy pixels using linear (row-major) byte mapping.
+/// Bytes are laid out left-to-right, top-to-bottom like reading text.
+/// This makes it easy to visualize file sections as horizontal bands.
+pub fn generate_linear_entropy_pixels(
+    data: &[u8],
+    dimension: u64,
+    file_size: u64,
+    tex_size: usize,
+    world_min: Vec2,
+    scale_x: f32,
+    scale_y: f32,
+) -> Vec<Color32> {
+    (0..tex_size * tex_size)
+        .into_par_iter()
+        .map(|idx| {
+            let tex_y = idx / tex_size;
+            let tex_x = idx % tex_size;
+
+            let world_x = (world_min.x + tex_x as f32 * scale_x) as u64;
+            let world_y = (world_min.y + tex_y as f32 * scale_y) as u64;
+
+            if world_x >= dimension || world_y >= dimension {
+                return Color32::from_rgb(13, 13, 13);
+            }
+
+            // Linear mapping: row-major order
+            let d = world_y * dimension + world_x;
+
+            if d >= file_size {
+                return Color32::from_rgb(13, 13, 13);
+            }
+
+            let start = d as usize;
+            let end = (start + ANALYSIS_WINDOW).min(data.len());
+            let chunk = &data[start..end];
+
+            let analysis = ByteAnalysis::analyze(chunk);
+            let [r, g, b] = analysis.to_color();
+            Color32::from_rgb(r, g, b)
+        })
+        .collect()
+}
+
 pub fn generate_computing_placeholder(tex_size: usize, time_seconds: f64) -> Vec<Color32> {
     let total = tex_size * tex_size;
     let mut pixels = Vec::with_capacity(total);
@@ -744,6 +791,7 @@ pub fn generate_kolmogorov_pixels(
     world_min: Vec2,
     scale_x: f32,
     scale_y: f32,
+    use_linear: bool,
 ) -> Vec<Color32> {
     (0..tex_size * tex_size)
         .into_par_iter()
@@ -758,7 +806,11 @@ pub fn generate_kolmogorov_pixels(
                 return Color32::from_rgb(13, 13, 13);
             }
 
-            let d = xy2d(dimension, world_x, world_y);
+            let d = if use_linear {
+                world_y * dimension + world_x
+            } else {
+                xy2d(dimension, world_x, world_y)
+            };
 
             if d >= file_size {
                 return Color32::from_rgb(13, 13, 13);
@@ -785,6 +837,7 @@ pub fn generate_jsd_pixels(
     world_min: Vec2,
     scale_x: f32,
     scale_y: f32,
+    use_linear: bool,
 ) -> Vec<Color32> {
     (0..tex_size * tex_size)
         .into_par_iter()
@@ -799,7 +852,11 @@ pub fn generate_jsd_pixels(
                 return Color32::from_rgb(13, 13, 13);
             }
 
-            let d = xy2d(dimension, world_x, world_y);
+            let d = if use_linear {
+                world_y * dimension + world_x
+            } else {
+                xy2d(dimension, world_x, world_y)
+            };
 
             if d >= file_size {
                 return Color32::from_rgb(13, 13, 13);
@@ -829,6 +886,7 @@ pub fn generate_rcmse_pixels(
     world_min: Vec2,
     scale_x: f32,
     scale_y: f32,
+    use_linear: bool,
 ) -> Vec<Color32> {
     (0..tex_size * tex_size)
         .into_par_iter()
@@ -843,7 +901,11 @@ pub fn generate_rcmse_pixels(
                 return Color32::from_rgb(13, 13, 13);
             }
 
-            let d = xy2d(dimension, world_x, world_y);
+            let d = if use_linear {
+                world_y * dimension + world_x
+            } else {
+                xy2d(dimension, world_x, world_y)
+            };
 
             if d >= file_size {
                 return Color32::from_rgb(13, 13, 13);

@@ -15,6 +15,6 @@ mod types;
 
 pub use state::{ApeironApp, Tab};
 pub use types::{
-    BackgroundTask, BackgroundTasks, FileData, HexView, OutlineCache, Selection, TextureParams,
-    Viewport, VisualizationMode, COMPLEXITY_SAMPLE_INTERVAL, RCMSE_SAMPLE_INTERVAL,
+    BackgroundTask, BackgroundTasks, ByteLayout, FileData, HexView, OutlineCache, Selection,
+    TextureParams, Viewport, VisualizationMode, COMPLEXITY_SAMPLE_INTERVAL, RCMSE_SAMPLE_INTERVAL,
 };

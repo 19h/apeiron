@@ -5,7 +5,8 @@ use std::path::PathBuf;
 use eframe::egui::{self, TextureHandle};
 
 use super::types::{
-    BackgroundTasks, FileData, HexView, Selection, TextureParams, Viewport, VisualizationMode,
+    BackgroundTasks, ByteLayout, FileData, HexView, Selection, TextureParams, Viewport,
+    VisualizationMode,
 };
 use crate::gpu::GpuRenderer;
 use crate::util::color::{
@@ -34,6 +35,8 @@ pub struct Tab {
     pub texture_params: Option<TextureParams>,
     /// Current visualization mode.
     pub viz_mode: VisualizationMode,
+    /// Current byte layout (Hilbert vs Linear).
+    pub byte_layout: ByteLayout,
     /// Whether viewport needs to be fitted to view (after load or mode change).
     pub needs_fit_to_view: bool,
     /// View size used for the last fit_to_view call.
@@ -53,6 +56,7 @@ impl Default for Tab {
             texture: None,
             texture_params: None,
             viz_mode: VisualizationMode::default(),
+            byte_layout: ByteLayout::default(),
             needs_fit_to_view: false,
             last_fit_view_size: None,
             background_tasks: None,
