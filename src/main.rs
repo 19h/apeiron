@@ -17,7 +17,7 @@ mod viz;
 
 use std::fs::File;
 use std::path::PathBuf;
-use std::sync::mpsc::{self, TryRecvError};
+use std::sync::mpsc::TryRecvError;
 use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
@@ -28,8 +28,9 @@ use eframe::egui::{self, Color32, ColorImage, Pos2, Rect, RichText, Sense, Vec2}
 
 use analysis::{
     byte_distribution_sampled, calculate_entropy, calculate_jsd, calculate_kolmogorov_complexity,
-    calculate_rcmse_quick, extract_ascii, identify_file_type, ANALYSIS_WINDOW,
+    extract_ascii, identify_file_type, ANALYSIS_WINDOW,
 };
+use app::background::{compute_samples, AnalysisTask};
 use app::{
     ApeironApp, BackgroundTask, BackgroundTasks, ByteLayout, FileData, HexView, Selection, Tab,
     TextureParams, Viewport, VisualizationMode, COMPLEXITY_SAMPLE_INTERVAL, RCMSE_SAMPLE_INTERVAL,
@@ -99,11 +100,6 @@ impl ApeironApp {
             .unwrap_or("Unknown")
             .to_string();
 
-        // Upload to GPU if available (has its own size limit)
-        if let Some(ref mut gpu) = self.gpu_renderer {
-            gpu.upload_file(data, dimension);
-        }
-
         // Calculate reference byte distribution for JSD using sampling for large files
         // This is O(1) for large files instead of O(n)
         let reference_distribution = Arc::new(byte_distribution_sampled(data));
@@ -116,16 +112,16 @@ impl ApeironApp {
         }
         let tab = self.active_tab_mut();
 
-        // Start progressive Hilbert computation for large files
-        let hilbert_buffer = if size > PROGRESSIVE_THRESHOLD {
-            println!(
-                "File > {}MB: Using progressive Hilbert rendering",
-                PROGRESSIVE_THRESHOLD / (1024 * 1024)
-            );
-            Some(HilbertRefiner::start(Arc::clone(&data), size))
-        } else {
-            None
-        };
+        if let Some(buffer) = tab
+            .file_data
+            .as_ref()
+            .and_then(|file| file.hilbert_buffer.as_ref())
+        {
+            buffer.cancel();
+        }
+        tab.background_tasks = None;
+        // Progressive entropy is allocated and started only when Hilbert mode is used.
+        let hilbert_buffer = None;
 
         // Create file data with empty precomputed maps
         tab.file_data = Some(FileData {
@@ -146,21 +142,24 @@ impl ApeironApp {
 
         // Reset viewport and selection
         tab.viewport = Viewport::default();
-        tab.texture = None;
         tab.texture_params = None;
+        tab.hilbert_texture_revision = None;
         tab.needs_fit_to_view = true;
 
         // Initialize selection at offset 0
+        tab.selection = Selection {
+            offset: u64::MAX,
+            ..Selection::default()
+        };
         Self::update_selection_on_tab(tab, 0);
 
         println!(
             "Loaded file: Size={} bytes, Dimension={}, Type={}",
             size, dimension, file_type
         );
-        if size > PROGRESSIVE_THRESHOLD {
-            println!("Progressive Hilbert rendering started...");
-        }
         println!("Background analysis computed on demand per visualization mode.");
+        let mode = self.active_tab().viz_mode;
+        self.ensure_mode_data(mode);
     }
 
     /// Poll for completed background tasks on the active tab and update file data.
@@ -181,7 +180,10 @@ impl ApeironApp {
                     match task {
                         BackgroundTask::ComplexityPartial { data, progress } => {
                             if let Some(ref mut file) = tab.file_data {
-                                file.complexity_map = Some(Arc::new(data));
+                                let map = file
+                                    .complexity_map
+                                    .get_or_insert_with(|| Arc::new(Vec::new()));
+                                Arc::make_mut(map).extend(data);
                             }
                             tasks.complexity_progress = progress;
                         }
@@ -199,7 +201,9 @@ impl ApeironApp {
                         }
                         BackgroundTask::RcmsePartial { data, progress } => {
                             if let Some(ref mut file) = tab.file_data {
-                                file.rcmse_map = Some(Arc::new(data));
+                                let map =
+                                    file.rcmse_map.get_or_insert_with(|| Arc::new(Vec::new()));
+                                Arc::make_mut(map).extend(data);
                             }
                             tasks.rcmse_progress = progress;
                         }
@@ -306,6 +310,27 @@ impl ApeironApp {
         None
     }
 
+    /// Invalidate once per published buffer change, including final completion.
+    fn refresh_hilbert_texture(&mut self) -> bool {
+        let tab = self.active_tab_mut();
+        if tab.viz_mode != VisualizationMode::Hilbert || tab.byte_layout != ByteLayout::Hilbert {
+            return false;
+        }
+        let Some(buffer) = tab
+            .file_data
+            .as_ref()
+            .and_then(|file| file.hilbert_buffer.as_ref())
+        else {
+            return false;
+        };
+        let revision = (buffer.is_coarse_complete(), buffer.fine_progress());
+        if tab.hilbert_texture_revision == Some(revision) {
+            return false;
+        }
+        tab.texture_params = None;
+        true
+    }
+
     /// Look up precomputed complexity value for a file offset.
     fn lookup_complexity(complexity_map: &[f32], offset: usize) -> f32 {
         if complexity_map.is_empty() {
@@ -332,6 +357,16 @@ impl ApeironApp {
     /// Ensure data for the given visualization mode is being computed.
     /// Called when user switches modes - starts computation if not already running.
     fn ensure_mode_data(&mut self, mode: VisualizationMode) {
+        if mode == VisualizationMode::Hilbert {
+            if let Some(file) = &mut self.tabs[self.active_tab].file_data {
+                if file.size > PROGRESSIVE_THRESHOLD && file.hilbert_buffer.is_none() {
+                    file.hilbert_buffer =
+                        Some(HilbertRefiner::start(Arc::clone(&file.data), file.size));
+                    println!("Progressive Hilbert rendering started...");
+                }
+            }
+            return;
+        }
         let tab = &self.tabs[self.active_tab];
         let Some(ref file) = tab.file_data else {
             return;
@@ -363,64 +398,25 @@ impl ApeironApp {
             return;
         }
 
-        // Get or create the background tasks channel
         let data = Arc::clone(&file.data);
-
-        // We need to create a new channel or add to existing one
-        // For simplicity, we'll create a new channel and merge receivers
-        let (tx, rx) = mpsc::channel();
-
-        match mode {
+        let tab = &mut self.tabs[self.active_tab];
+        let tasks = tab
+            .background_tasks
+            .get_or_insert_with(BackgroundTasks::new);
+        let task = match mode {
             VisualizationMode::KolmogorovComplexity => {
-                println!("Starting Kolmogorov complexity computation on demand...");
-                thread::spawn(move || {
-                    Self::precompute_complexity_streaming(&data, &tx);
-                });
-                let tab = &mut self.tabs[self.active_tab];
-                if let Some(ref mut tasks) = tab.background_tasks {
-                    tasks.computing_complexity = true;
-                } else {
-                    tab.background_tasks = Some(BackgroundTasks {
-                        receiver: rx,
-                        computing_complexity: true,
-                        computing_rcmse: false,
-                        complexity_progress: 0.0,
-                        rcmse_progress: 0.0,
-                    });
-                    return;
-                }
+                tasks.computing_complexity = true;
+                AnalysisTask::Complexity
             }
             VisualizationMode::MultiScaleEntropy => {
-                println!("Starting RCMSE computation on demand...");
-                thread::spawn(move || {
-                    Self::precompute_rcmse_streaming(&data, &tx);
-                });
-                let tab = &mut self.tabs[self.active_tab];
-                if let Some(ref mut tasks) = tab.background_tasks {
-                    tasks.computing_rcmse = true;
-                } else {
-                    tab.background_tasks = Some(BackgroundTasks {
-                        receiver: rx,
-                        computing_complexity: false,
-                        computing_rcmse: true,
-                        complexity_progress: 0.0,
-                        rcmse_progress: 0.0,
-                    });
-                    return;
-                }
+                tasks.computing_rcmse = true;
+                AnalysisTask::Rcmse
             }
-            _ => {}
-        }
-
-        // Store the new receiver - we need to poll from multiple receivers
-        // For now, replace the receiver (existing tasks will complete but won't be polled)
-        // TODO: Could merge receivers for better handling
-        let tab = &mut self.tabs[self.active_tab];
-        if let Some(ref mut tasks) = tab.background_tasks {
-            // Replace receiver - old tasks continue but we poll new one
-            // This is a simplification; a production version might merge channels
-            tasks.receiver = rx;
-        }
+            _ => return,
+        };
+        let sender = tasks.sender.clone();
+        let cancelled = Arc::clone(&tasks.cancelled);
+        thread::spawn(move || compute_samples(&data, task, &sender, &cancelled));
     }
 
     /// Pause Hilbert refinement (when switching away from Hilbert mode).
@@ -443,89 +439,6 @@ impl ApeironApp {
         }
     }
 
-    // =========================================================================
-    // STREAMING PRECOMPUTE FUNCTIONS
-    // These compute maps in chunks and send partial updates for progressive rendering.
-    // =========================================================================
-
-    /// Batch size for streaming updates (number of samples per batch).
-    /// Larger = fewer updates but chunkier progress. Smaller = smoother but more overhead.
-    const STREAMING_BATCH_SIZE: usize = 100_000;
-
-    /// Precompute complexity map with streaming updates.
-    /// Uses SEQUENTIAL iteration to avoid competing with rendering for rayon's thread pool.
-    fn precompute_complexity_streaming(data: &[u8], tx: &mpsc::Sender<BackgroundTask>) {
-        const WINDOW_SIZE: usize = 128;
-        let num_samples = (data.len() / COMPLEXITY_SAMPLE_INTERVAL).max(1);
-        let batch_size = Self::STREAMING_BATCH_SIZE;
-        let num_batches = (num_samples + batch_size - 1) / batch_size;
-
-        let mut all_results = Vec::with_capacity(num_samples);
-
-        for batch_idx in 0..num_batches {
-            let batch_start = batch_idx * batch_size;
-            let batch_end = (batch_start + batch_size).min(num_samples);
-
-            // Compute this batch SEQUENTIALLY to avoid rayon contention with rendering
-            for i in batch_start..batch_end {
-                let start = i * COMPLEXITY_SAMPLE_INTERVAL;
-                let end = (start + WINDOW_SIZE).min(data.len());
-                let value = if start < data.len() {
-                    calculate_kolmogorov_complexity(&data[start..end]) as f32
-                } else {
-                    0.0
-                };
-                all_results.push(value);
-            }
-
-            // Send progress update
-            let progress = batch_end as f32 / num_samples as f32;
-            let _ = tx.send(BackgroundTask::ComplexityPartial {
-                data: all_results.clone(),
-                progress,
-            });
-        }
-
-        let _ = tx.send(BackgroundTask::ComplexityComplete);
-    }
-
-    /// Precompute RCMSE map with streaming updates.
-    /// Uses SEQUENTIAL iteration to avoid competing with rendering for rayon's thread pool.
-    fn precompute_rcmse_streaming(data: &[u8], tx: &mpsc::Sender<BackgroundTask>) {
-        const WINDOW_SIZE: usize = 256;
-        let num_samples = (data.len() / RCMSE_SAMPLE_INTERVAL).max(1);
-        let batch_size = Self::STREAMING_BATCH_SIZE;
-        let num_batches = (num_samples + batch_size - 1) / batch_size;
-
-        let mut all_results = Vec::with_capacity(num_samples);
-
-        for batch_idx in 0..num_batches {
-            let batch_start = batch_idx * batch_size;
-            let batch_end = (batch_start + batch_size).min(num_samples);
-
-            // Compute this batch SEQUENTIALLY to avoid rayon contention with rendering
-            for i in batch_start..batch_end {
-                let start = i * RCMSE_SAMPLE_INTERVAL;
-                let end = (start + WINDOW_SIZE).min(data.len());
-                let value = if start < data.len() && end > start {
-                    calculate_rcmse_quick(&data[start..end])
-                } else {
-                    0.5
-                };
-                all_results.push(value);
-            }
-
-            // Send progress update
-            let progress = batch_end as f32 / num_samples as f32;
-            let _ = tx.send(BackgroundTask::RcmsePartial {
-                data: all_results.clone(),
-                progress,
-            });
-        }
-
-        let _ = tx.send(BackgroundTask::RcmseComplete);
-    }
-
     /// Update the selection based on a byte offset and optionally sync hex view.
     fn update_selection(&mut self, offset: u64) {
         self.update_selection_with_scroll(offset, true);
@@ -546,6 +459,12 @@ impl ApeironApp {
     fn update_selection_on_tab_with_scroll(tab: &mut Tab, offset: u64, scroll_hex_view: bool) {
         if let Some(file) = &tab.file_data {
             if offset < file.size {
+                if offset == tab.selection.offset {
+                    if scroll_hex_view {
+                        tab.hex_view.scroll_to(offset, file.size);
+                    }
+                    return;
+                }
                 let start = offset as usize;
                 let end = (start + ANALYSIS_WINDOW).min(file.data.len());
                 let chunk = &file.data[start..end];
@@ -731,6 +650,15 @@ impl ApeironApp {
         let file_size = file.size;
         let viz_mode = tab.viz_mode;
         let byte_layout = tab.byte_layout;
+        let hilbert_revision =
+            if viz_mode == VisualizationMode::Hilbert && byte_layout == ByteLayout::Hilbert {
+                hilbert_buffer
+                    .as_ref()
+                    .map(|buffer| (buffer.is_coarse_complete(), buffer.fine_progress()))
+            } else {
+                None
+            };
+
         // Use layout-specific dimension for modes that support layout toggle
         let dimension = file.dimension_for_layout(byte_layout);
 
@@ -750,8 +678,28 @@ impl ApeironApp {
         // Also use CPU for Hilbert when progressive rendering is active (large files)
         // GPU shaders only support Hilbert layout, so use CPU for Linear layout
         let use_gpu = byte_layout == ByteLayout::Hilbert;
+        let gpu_mode_needed = matches!(
+            viz_mode,
+            VisualizationMode::SimilarityMatrix
+                | VisualizationMode::Digraph
+                | VisualizationMode::BytePhaseSpace
+        ) || (viz_mode == VisualizationMode::Hilbert
+            && hilbert_buffer.is_none());
+        if use_gpu && gpu_mode_needed {
+            if let Some(gpu) = &mut self.gpu_renderer {
+                if self
+                    .gpu_file
+                    .as_ref()
+                    .map(|uploaded| !Arc::ptr_eq(uploaded, &data))
+                    .unwrap_or(true)
+                {
+                    gpu.upload_mapped_file(Arc::clone(&data), dimension);
+                    self.gpu_file = Some(Arc::clone(&data));
+                }
+            }
+        }
         let image = if use_gpu {
-            if let Some(ref gpu) = self.gpu_renderer {
+            if let Some(ref mut gpu) = self.gpu_renderer {
                 if gpu.is_ready() {
                     let gpu_mode = match viz_mode {
                         // Use CPU for Hilbert with progressive buffer (shows refinement progress)
@@ -867,7 +815,13 @@ impl ApeironApp {
         };
 
         let tab = &mut self.tabs[self.active_tab];
-        tab.texture = Some(ctx.load_texture("entropy_map", image, egui::TextureOptions::NEAREST));
+        tab.hilbert_texture_revision = hilbert_revision;
+        if let Some(texture) = &mut tab.texture {
+            texture.set(image, egui::TextureOptions::NEAREST);
+        } else {
+            tab.texture =
+                Some(ctx.load_texture("entropy_map", image, egui::TextureOptions::NEAREST));
+        }
         tab.texture_params = Some(new_params);
     }
 
@@ -976,7 +930,6 @@ impl ApeironApp {
         tab.needs_fit_to_view = true;
         tab.last_fit_view_size = None;
         // Clear texture so it regenerates for the new viewport
-        tab.texture = None;
         tab.texture_params = None;
     }
 
@@ -1007,7 +960,6 @@ impl ApeironApp {
             tab.last_fit_view_size = Some(view_size);
 
             // Clear texture to force regeneration with new viewport
-            tab.texture = None;
             tab.texture_params = None;
         }
         self.tabs[self.active_tab].needs_fit_to_view = false;
@@ -1045,19 +997,20 @@ impl eframe::App for ApeironApp {
         // If background tasks are in progress or just completed, request repaint
         let tab_viz_mode = self.active_tab().viz_mode;
         if self.is_computing() || task_completed {
-            ctx.request_repaint();
+            ctx.request_repaint_after(Duration::from_millis(50));
             // Invalidate texture if task completed (new data available)
             if task_completed && self.is_mode_data_ready(tab_viz_mode) {
-                self.active_tab_mut().texture = None;
+                self.active_tab_mut().texture_params = None;
             }
         }
 
         // Handle progressive Hilbert rendering: request periodic repaints and texture updates
+        if self.refresh_hilbert_texture() {
+            ctx.request_repaint();
+        }
         if self.is_hilbert_refining() {
             // Request repaint at ~10fps for smooth progress animation
             ctx.request_repaint_after(Duration::from_millis(100));
-            // Invalidate texture to show refinement progress
-            self.active_tab_mut().texture = None;
         }
 
         // Handle file drops
@@ -1383,7 +1336,6 @@ impl eframe::App for ApeironApp {
 
                         let tab = self.active_tab_mut();
                         tab.viz_mode = new_mode;
-                        tab.texture = None;
                         tab.texture_params = None;
                         // Reset viewport completely to ensure proper fit
                         tab.viewport = Viewport::default();
@@ -1407,7 +1359,6 @@ impl eframe::App for ApeironApp {
                         if layout_btn.clicked() {
                             let tab = self.active_tab_mut();
                             tab.byte_layout = tab.byte_layout.toggle();
-                            tab.texture = None;
                             tab.texture_params = None;
                             // Reset viewport to fit the new layout
                             tab.needs_fit_to_view = true;
@@ -1587,7 +1538,11 @@ impl ApeironApp {
         let data_ready = self.is_mode_data_ready(current_mode);
 
         // We regenerate when viewport changes or texture is missing, but only if data is ready
-        if data_ready && (self.active_tab().texture.is_none() || viewport_changed) {
+        if data_ready
+            && (self.active_tab().texture.is_none()
+                || self.active_tab().texture_params.is_none()
+                || viewport_changed)
+        {
             self.generate_texture(ui.ctx(), available_rect);
         }
 
@@ -3051,4 +3006,153 @@ fn main() -> eframe::Result<()> {
         options,
         Box::new(move |cc| Ok(Box::new(ApeironApp::new_with_file(cc, initial_file)))),
     )
+}
+
+#[cfg(test)]
+mod performance_regressions {
+    use super::*;
+    use std::time::Instant;
+
+    fn file_data(bytes: &[u8]) -> FileData {
+        let mut map = memmap2::MmapMut::map_anon(bytes.len()).unwrap();
+        map.copy_from_slice(bytes);
+        FileData {
+            data: Arc::new(map.make_read_only().unwrap()),
+            size: bytes.len() as u64,
+            dimension: calculate_dimension(bytes.len() as u64),
+            linear_dimension: (bytes.len() as f64).sqrt().ceil() as u64,
+            file_type: "test",
+            path: PathBuf::new(),
+            complexity_map: None,
+            reference_distribution: Arc::new(byte_distribution_sampled(bytes)),
+            rcmse_map: None,
+            hilbert_buffer: None,
+        }
+    }
+
+    #[test]
+    fn concurrent_modes_are_both_polled_into_complete_maps() {
+        let bytes: Vec<u8> = (0..129).map(|i| i as u8).collect();
+        let mut app = ApeironApp::default();
+        app.active_tab_mut().file_data = Some(file_data(&bytes));
+        app.ensure_mode_data(VisualizationMode::KolmogorovComplexity);
+        app.ensure_mode_data(VisualizationMode::MultiScaleEntropy);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while app.active_tab().background_tasks.is_some() {
+            app.poll_background_tasks();
+            assert!(
+                Instant::now() < deadline,
+                "background workers did not complete"
+            );
+            thread::sleep(Duration::from_millis(1));
+        }
+        let file = app.active_tab().file_data.as_ref().unwrap();
+        assert_eq!(file.complexity_map.as_ref().unwrap().len(), 3);
+        assert_eq!(file.rcmse_map.as_ref().unwrap().len(), 3);
+        for i in 0..3 {
+            let start = i * 64;
+            assert_eq!(
+                file.complexity_map.as_ref().unwrap()[i],
+                calculate_kolmogorov_complexity(&bytes[start..(start + 128).min(bytes.len())])
+                    as f32
+            );
+            assert_eq!(
+                file.rcmse_map.as_ref().unwrap()[i],
+                analysis::calculate_rcmse_quick(&bytes[start..(start + 256).min(bytes.len())])
+            );
+        }
+    }
+
+    #[test]
+    fn dropping_tab_cancels_refiner_and_analysis_workers() {
+        let mut tab = Tab::default();
+        let mut file = file_data(&[0; 129]);
+        let buffer = Arc::new(HilbertBuffer::new(129));
+        file.hilbert_buffer = Some(Arc::clone(&buffer));
+        tab.file_data = Some(file);
+        tab.background_tasks = Some(BackgroundTasks::new());
+        let cancelled = Arc::clone(&tab.background_tasks.as_ref().unwrap().cancelled);
+        let sender = tab.background_tasks.as_ref().unwrap().sender.clone();
+        drop(tab);
+        assert!(buffer.is_cancelled());
+        assert!(cancelled.load(std::sync::atomic::Ordering::Relaxed));
+        assert!(sender.send(BackgroundTask::ComplexityComplete).is_err());
+    }
+
+    #[test]
+    fn fixed_pair_views_use_native_bin_resolution() {
+        assert_eq!(VisualizationMode::Digraph.min_texture_size(), 256);
+        assert_eq!(VisualizationMode::BytePhaseSpace.min_texture_size(), 256);
+    }
+
+    #[test]
+    fn analysis_updates_reuse_the_existing_texture_handle() {
+        let mut app = ApeironApp::default();
+        let mut file = file_data(&[0; 129]);
+        file.complexity_map = Some(Arc::new(vec![0.5; 3]));
+        app.active_tab_mut().file_data = Some(file);
+        app.active_tab_mut().viz_mode = VisualizationMode::KolmogorovComplexity;
+        let context = egui::Context::default();
+        let rect = Rect::from_min_size(Pos2::ZERO, Vec2::splat(512.0));
+        app.generate_texture(&context, rect);
+        let first = app.active_tab().texture.as_ref().unwrap().id();
+        app.active_tab_mut()
+            .file_data
+            .as_mut()
+            .unwrap()
+            .complexity_map = Some(Arc::new(vec![0.9; 3]));
+        app.active_tab_mut().texture_params = None;
+        app.generate_texture(&context, rect);
+        assert_eq!(app.active_tab().texture.as_ref().unwrap().id(), first);
+        assert!(app.active_tab().texture_params.is_some());
+    }
+
+    #[test]
+    fn completed_refinement_invalidates_a_cached_partial_image() {
+        let mut app = ApeironApp::default();
+        let mut file = file_data(&[0; 129]);
+        let buffer = HilbertRefiner::start(Arc::clone(&file.data), file.size);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !buffer.is_fine_complete() {
+            assert!(Instant::now() < deadline);
+            thread::sleep(Duration::from_millis(1));
+        }
+        file.hilbert_buffer = Some(buffer);
+        app.active_tab_mut().file_data = Some(file);
+        app.active_tab_mut().viz_mode = VisualizationMode::Hilbert;
+        let context = egui::Context::default();
+        let rect = Rect::from_min_size(Pos2::ZERO, Vec2::splat(512.0));
+        app.generate_texture(&context, rect);
+        app.active_tab_mut().hilbert_texture_revision = Some((false, 0));
+        assert!(!app.is_hilbert_refining());
+        assert!(app.refresh_hilbert_texture());
+        assert!(app.active_tab().texture_params.is_none());
+        app.generate_texture(&context, rect);
+        assert!(!app.refresh_hilbert_texture());
+    }
+
+    #[test]
+    #[ignore = "requires a native GPU adapter"]
+    fn gpu_upload_follows_active_mapping_across_tabs() {
+        let mut app = ApeironApp::default();
+        app.gpu_renderer = Some(gpu::GpuRenderer::new().expect("native GPU adapter required"));
+        app.active_tab_mut().file_data = Some(file_data(&[0; 129]));
+        app.active_tab_mut().viz_mode = VisualizationMode::Hilbert;
+        let context = egui::Context::default();
+        let rect = Rect::from_min_size(Pos2::ZERO, Vec2::splat(512.0));
+        app.generate_texture(&context, rect);
+        let first = Arc::clone(&app.active_tab().file_data.as_ref().unwrap().data);
+        assert!(Arc::ptr_eq(app.gpu_file.as_ref().unwrap(), &first));
+        app.new_tab();
+        app.active_tab_mut().file_data = Some(file_data(&[255; 129]));
+        app.active_tab_mut().viz_mode = VisualizationMode::Hilbert;
+        app.generate_texture(&context, rect);
+        let second = &app.active_tab().file_data.as_ref().unwrap().data;
+        assert!(Arc::ptr_eq(app.gpu_file.as_ref().unwrap(), second));
+        assert!(!Arc::ptr_eq(app.gpu_file.as_ref().unwrap(), &first));
+        app.active_tab = 0;
+        app.active_tab_mut().texture = None;
+        app.generate_texture(&context, rect);
+        assert!(Arc::ptr_eq(app.gpu_file.as_ref().unwrap(), &first));
+    }
 }

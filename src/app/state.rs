@@ -1,6 +1,8 @@
 //! Main application and tab state structures.
 
+use memmap2::Mmap;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use eframe::egui::{self, TextureHandle};
 
@@ -33,6 +35,8 @@ pub struct Tab {
     pub texture: Option<TextureHandle>,
     /// Texture generation parameters (to detect when regeneration is needed).
     pub texture_params: Option<TextureParams>,
+    /// Progressive buffer state captured before generating the current image.
+    pub hilbert_texture_revision: Option<(bool, usize)>,
     /// Current visualization mode.
     pub viz_mode: VisualizationMode,
     /// Current byte layout (Hilbert vs Linear).
@@ -55,12 +59,26 @@ impl Default for Tab {
             hex_view: HexView::new(),
             texture: None,
             texture_params: None,
+            hilbert_texture_revision: None,
             viz_mode: VisualizationMode::default(),
             byte_layout: ByteLayout::default(),
             needs_fit_to_view: false,
             last_fit_view_size: None,
             background_tasks: None,
         }
+    }
+}
+
+impl Drop for Tab {
+    fn drop(&mut self) {
+        if let Some(buffer) = self
+            .file_data
+            .as_ref()
+            .and_then(|file| file.hilbert_buffer.as_ref())
+        {
+            buffer.cancel();
+        }
+        // Dropping BackgroundTasks cancels workers and closes their receiver.
     }
 }
 
@@ -80,6 +98,8 @@ pub struct ApeironApp {
     pub is_drop_target: bool,
     /// GPU renderer for accelerated visualization.
     pub gpu_renderer: Option<GpuRenderer>,
+    /// Identity of the mapping currently uploaded to the shared GPU renderer.
+    pub gpu_file: Option<Arc<Mmap>>,
     /// Initial file to load (from command-line argument).
     pub initial_file: Option<PathBuf>,
     /// Tab currently being dragged (index).
@@ -94,6 +114,7 @@ impl Default for ApeironApp {
             show_help: false,
             is_drop_target: false,
             gpu_renderer: None,
+            gpu_file: None,
             initial_file: None,
             dragging_tab: None,
         }

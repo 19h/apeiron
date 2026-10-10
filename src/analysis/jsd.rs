@@ -152,6 +152,73 @@ pub fn calculate_jsd(data: &[u8], reference: &[f64; 256]) -> f64 {
     jensen_shannon_divergence(&local_dist, reference)
 }
 
+/// Prepared JSD contributions for repeated windows against one reference.
+/// Construction costs O(256 * window_size) time and space; each full window
+/// costs O(window_size + distinct_bytes), with no logarithms in the hot path.
+/// Preserves the epsilon and base-2 convention of `calculate_jsd`.
+/// Prepared window sizes range from 1 to 256 bytes.
+pub struct JsdWindow {
+    window_size: usize,
+    baseline: f64,
+    contributions: Vec<f64>,
+    reference: [f64; 256],
+}
+
+impl JsdWindow {
+    pub fn new(reference: &[f64; 256], window_size: usize) -> Self {
+        assert!((1..=256).contains(&window_size));
+        let mut baseline = 0.0;
+        let mut contributions = vec![0.0; 256 * (window_size + 1)];
+        let factor = 0.5 / std::f64::consts::LN_2;
+        for (byte, &q) in reference.iter().enumerate() {
+            let zero = if q > 0.0 {
+                q * (q / (0.5 * q + EPSILON)).ln() * factor
+            } else {
+                0.0
+            };
+            baseline += zero;
+            for count in 1..=window_size {
+                let p = count as f64 / window_size as f64;
+                let m = 0.5 * (p + q) + EPSILON;
+                let q_term = if q > 0.0 { q * (q / m).ln() } else { 0.0 };
+                contributions[byte * (window_size + 1) + count] =
+                    (p * (p / m).ln() + q_term) * factor - zero;
+            }
+        }
+        Self {
+            window_size,
+            baseline,
+            contributions,
+            reference: *reference,
+        }
+    }
+
+    pub fn divergence(&self, data: &[u8]) -> f64 {
+        // EOF windows have a different normalization. Their rare calls use
+        // the general kernel, including its uniform empty-data convention.
+        if data.len() != self.window_size {
+            return calculate_jsd(data, &self.reference);
+        }
+        let mut counts = [0u16; 256];
+        let mut touched = [0u8; 256];
+        let mut distinct = 0;
+        for &byte in data {
+            let count = &mut counts[byte as usize];
+            if *count == 0 {
+                touched[distinct] = byte;
+                distinct += 1;
+            }
+            *count += 1;
+        }
+        let mut result = self.baseline;
+        for &byte in &touched[..distinct] {
+            let byte = byte as usize;
+            result += self.contributions[byte * (self.window_size + 1) + counts[byte] as usize];
+        }
+        result.clamp(0.0, 1.0)
+    }
+}
+
 /// Batch calculate JSD for multiple chunks against the same reference.
 /// More efficient than calling calculate_jsd repeatedly.
 pub fn calculate_jsd_batch(data: &[u8], chunk_size: usize, reference: &[f64; 256]) -> Vec<f64> {
@@ -230,6 +297,48 @@ impl JSDAnalysis {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn prepared_windows_match_general_jsd() {
+        let mut seed = 0x123456789abcdefu64;
+        let data: Vec<u8> = (0..4096)
+            .map(|_| {
+                seed ^= seed << 13;
+                seed ^= seed >> 7;
+                seed ^= seed << 17;
+                seed as u8
+            })
+            .collect();
+        let mut sparse = [0.0; 256];
+        sparse[0] = 0.2;
+        sparse[128] = 0.8;
+        for reference in [byte_distribution(&data), [1.0 / 256.0; 256], sparse] {
+            for size in [1, 16, 64, 128] {
+                let prepared = JsdWindow::new(&reference, size);
+                for chunk in data.chunks(size) {
+                    assert!(
+                        (prepared.divergence(chunk) - calculate_jsd(chunk, &reference)).abs()
+                            < 1e-12
+                    );
+                }
+                for byte in [0, 128, 255] {
+                    let uniform = vec![byte; size];
+                    assert!(
+                        (prepared.divergence(&uniform) - calculate_jsd(&uniform, &reference)).abs()
+                            < 1e-12
+                    );
+                }
+                for len in 0..size {
+                    assert!(
+                        (prepared.divergence(&data[..len])
+                            - calculate_jsd(&data[..len], &reference))
+                        .abs()
+                            < 1e-12
+                    );
+                }
+            }
+        }
+    }
 
     #[test]
     fn test_jsd_identical() {

@@ -10,11 +10,9 @@
 
 use eframe::egui::{Color32, Vec2};
 use rayon::prelude::*;
-use wide::f64x4;
 
-use crate::analysis::{
-    calculate_jsd, ByteAnalysis, JSDAnalysis, KolmogorovAnalysis, ANALYSIS_WINDOW,
-};
+use crate::analysis::jsd::JsdWindow;
+use crate::analysis::{ByteAnalysis, JSDAnalysis, KolmogorovAnalysis, ANALYSIS_WINDOW};
 use crate::hilbert::{xy2d, HilbertBuffer};
 
 // =============================================================================
@@ -113,6 +111,97 @@ fn lookup_rcmse(rcmse_map: &[f32], offset: usize) -> f32 {
     rcmse_map.get(index).copied().unwrap_or(0.5)
 }
 
+/// Collapse repeated integer world coordinates before running an analysis
+/// kernel. At 4x zoom, one byte is analyzed once instead of 16 times.
+fn render_byte_layout(
+    dimension: u64,
+    file_size: u64,
+    tex_size: usize,
+    world_min: Vec2,
+    scale_x: f32,
+    scale_y: f32,
+    use_linear: bool,
+    color: impl Fn(usize) -> Color32 + Sync,
+) -> Vec<Color32> {
+    if tex_size == 0 {
+        return Vec::new();
+    }
+    // Overview pixels usually address distinct bytes. Preserve the direct
+    // projection path there; coordinate deduplication pays off only at zoom.
+    if scale_x >= 1.0 && scale_y >= 1.0 {
+        return (0..tex_size * tex_size)
+            .into_par_iter()
+            .map(|i| {
+                let x = world_min.x + (i % tex_size) as f32 * scale_x;
+                let y = world_min.y + (i / tex_size) as f32 * scale_y;
+                if !x.is_finite()
+                    || !y.is_finite()
+                    || x < 0.0
+                    || y < 0.0
+                    || x >= dimension as f32
+                    || y >= dimension as f32
+                {
+                    return Color32::from_rgb(13, 13, 13);
+                }
+                let offset = if use_linear {
+                    y as u64 * dimension + x as u64
+                } else {
+                    xy2d(dimension, x as u64, y as u64)
+                };
+                if offset >= file_size {
+                    Color32::from_rgb(13, 13, 13)
+                } else {
+                    color(offset as usize)
+                }
+            })
+            .collect();
+    }
+    let axis = |min: f32, scale: f32| {
+        let mut values = Vec::new();
+        let mut indices = Vec::with_capacity(tex_size);
+        for i in 0..tex_size {
+            let world = min + i as f32 * scale;
+            let coordinate = if world.is_finite() && world >= 0.0 && world < dimension as f32 {
+                Some(world as u64)
+            } else {
+                None
+            };
+            if values.last() != Some(&coordinate) {
+                values.push(coordinate);
+            }
+            indices.push(values.len() - 1);
+        }
+        (values, indices)
+    };
+    let (xs, x_indices) = axis(world_min.x, scale_x);
+    let (ys, y_indices) = axis(world_min.y, scale_y);
+    let pixels: Vec<Color32> = (0..xs.len() * ys.len())
+        .into_par_iter()
+        .map(|i| {
+            let (Some(x), Some(y)) = (xs[i % xs.len()], ys[i / xs.len()]) else {
+                return Color32::from_rgb(13, 13, 13);
+            };
+            let offset = if use_linear {
+                y * dimension + x
+            } else {
+                xy2d(dimension, x, y)
+            };
+            if offset >= file_size {
+                Color32::from_rgb(13, 13, 13)
+            } else {
+                color(offset as usize)
+            }
+        })
+        .collect();
+    if xs.len() == tex_size && ys.len() == tex_size {
+        return pixels;
+    }
+    (0..tex_size * tex_size)
+        .into_par_iter()
+        .map(|i| pixels[y_indices[i / tex_size] * xs.len() + x_indices[i % tex_size]])
+        .collect()
+}
+
 // =============================================================================
 // Hilbert Curve Visualization
 // =============================================================================
@@ -126,34 +215,20 @@ pub fn generate_hilbert_pixels(
     scale_x: f32,
     scale_y: f32,
 ) -> Vec<Color32> {
-    (0..tex_size * tex_size)
-        .into_par_iter()
-        .map(|idx| {
-            let tex_y = idx / tex_size;
-            let tex_x = idx % tex_size;
-
-            let world_x = (world_min.x + tex_x as f32 * scale_x) as u64;
-            let world_y = (world_min.y + tex_y as f32 * scale_y) as u64;
-
-            if world_x >= dimension || world_y >= dimension {
-                return Color32::from_rgb(13, 13, 13);
-            }
-
-            let d = xy2d(dimension, world_x, world_y);
-
-            if d >= file_size {
-                return Color32::from_rgb(13, 13, 13);
-            }
-
-            let start = d as usize;
-            let end = (start + ANALYSIS_WINDOW).min(data.len());
-            let chunk = &data[start..end];
-
-            let analysis = ByteAnalysis::analyze(chunk);
-            let [r, g, b] = analysis.to_color();
+    render_byte_layout(
+        dimension,
+        file_size.min(data.len() as u64),
+        tex_size,
+        world_min,
+        scale_x,
+        scale_y,
+        false,
+        |start| {
+            let end = start.saturating_add(ANALYSIS_WINDOW).min(data.len());
+            let [r, g, b] = ByteAnalysis::analyze(&data[start..end]).to_color();
             Color32::from_rgb(r, g, b)
-        })
-        .collect()
+        },
+    )
 }
 
 pub fn generate_hilbert_pixels_progressive(
@@ -221,32 +296,44 @@ pub fn generate_linear_entropy_pixels(
     scale_x: f32,
     scale_y: f32,
 ) -> Vec<Color32> {
+    let file_size = file_size.min(data.len() as u64);
+    if scale_x < 1.0 || scale_y < 1.0 {
+        return render_byte_layout(
+            dimension,
+            file_size,
+            tex_size,
+            world_min,
+            scale_x,
+            scale_y,
+            true,
+            |start| {
+                let end = start.saturating_add(ANALYSIS_WINDOW).min(data.len());
+                let [r, g, b] = ByteAnalysis::analyze(&data[start..end]).to_color();
+                Color32::from_rgb(r, g, b)
+            },
+        );
+    }
+    // Keep the direct row-major loop for overview rendering.
     (0..tex_size * tex_size)
         .into_par_iter()
         .map(|idx| {
-            let tex_y = idx / tex_size;
-            let tex_x = idx % tex_size;
-
-            let world_x = (world_min.x + tex_x as f32 * scale_x) as u64;
-            let world_y = (world_min.y + tex_y as f32 * scale_y) as u64;
-
+            let x = world_min.x + (idx % tex_size) as f32 * scale_x;
+            let y = world_min.y + (idx / tex_size) as f32 * scale_y;
+            if x < 0.0 || y < 0.0 || !x.is_finite() || !y.is_finite() {
+                return Color32::from_rgb(13, 13, 13);
+            }
+            let world_x = x as u64;
+            let world_y = y as u64;
             if world_x >= dimension || world_y >= dimension {
                 return Color32::from_rgb(13, 13, 13);
             }
-
-            // Linear mapping: row-major order
-            let d = world_y * dimension + world_x;
-
-            if d >= file_size {
+            let offset = world_y * dimension + world_x;
+            if offset >= file_size {
                 return Color32::from_rgb(13, 13, 13);
             }
-
-            let start = d as usize;
-            let end = (start + ANALYSIS_WINDOW).min(data.len());
-            let chunk = &data[start..end];
-
-            let analysis = ByteAnalysis::analyze(chunk);
-            let [r, g, b] = analysis.to_color();
+            let start = offset as usize;
+            let end = start.saturating_add(ANALYSIS_WINDOW).min(data.len());
+            let [r, g, b] = ByteAnalysis::analyze(&data[start..end]).to_color();
             Color32::from_rgb(r, g, b)
         })
         .collect()
@@ -274,221 +361,106 @@ pub fn generate_computing_placeholder(tex_size: usize, time_seconds: f64) -> Vec
 // Similarity Matrix Visualization (Optimized)
 // =============================================================================
 
-/// Cache-aligned histogram to avoid false sharing and improve cache utilization.
-#[repr(C, align(64))]
-struct AlignedHist {
-    counts: [u32; 256],
+const SIMILARITY_WINDOW: usize = 32;
+
+/// A cached axis window: dense counts for O(1) lookup and sparse support
+/// for comparisons that visit at most 64 occupied bins, rather than 256.
+struct WindowHistogram {
+    counts: [u8; 256],
+    support: [u8; SIMILARITY_WINDOW],
+    distinct: usize,
+    total: usize,
+    position: usize,
 }
 
-impl AlignedHist {
-    #[inline(always)]
-    const fn new() -> Self {
-        Self {
-            counts: [0u32; 256],
+impl WindowHistogram {
+    fn new(data: &[u8], position: usize) -> Self {
+        let mut result = Self {
+            counts: [0; 256],
+            support: [0; SIMILARITY_WINDOW],
+            distinct: 0,
+            total: 0,
+            position,
+        };
+        if position >= data.len() {
+            return result;
         }
-    }
-}
-
-/// Compute histogram for a window at given position.
-/// Uses 8-way unrolled counting with 2 interleaved histograms to avoid cache conflicts.
-#[inline]
-fn compute_histogram(data: &[u8], pos: usize, window_size: usize) -> [u32; 256] {
-    let end = (pos + window_size).min(data.len());
-
-    if pos >= data.len() {
-        return [0u32; 256];
-    }
-
-    let window = &data[pos..end];
-
-    // Use 2 interleaved histograms to reduce cache line conflicts
-    let mut h0 = AlignedHist::new();
-    let mut h1 = AlignedHist::new();
-
-    // 8-way unrolled counting with interleaved histograms
-    let chunks = window.chunks_exact(8);
-    let remainder = chunks.remainder();
-
-    for chunk in chunks {
-        unsafe {
-            // Interleave between h0 and h1 to reduce conflicts
-            *h0.counts.get_unchecked_mut(chunk[0] as usize) += 1;
-            *h1.counts.get_unchecked_mut(chunk[1] as usize) += 1;
-            *h0.counts.get_unchecked_mut(chunk[2] as usize) += 1;
-            *h1.counts.get_unchecked_mut(chunk[3] as usize) += 1;
-            *h0.counts.get_unchecked_mut(chunk[4] as usize) += 1;
-            *h1.counts.get_unchecked_mut(chunk[5] as usize) += 1;
-            *h0.counts.get_unchecked_mut(chunk[6] as usize) += 1;
-            *h1.counts.get_unchecked_mut(chunk[7] as usize) += 1;
+        let end = position.saturating_add(SIMILARITY_WINDOW).min(data.len());
+        result.total = end - position;
+        for &byte in &data[position..end] {
+            let count = &mut result.counts[byte as usize];
+            if *count == 0 {
+                result.support[result.distinct] = byte;
+                result.distinct += 1;
+            }
+            *count += 1;
         }
+        result
     }
 
-    for (i, &byte) in remainder.iter().enumerate() {
-        unsafe {
-            if i & 1 == 0 {
-                *h0.counts.get_unchecked_mut(byte as usize) += 1;
+    fn distance(&self, other: &Self, terms: &[[f64; 33]; 33]) -> f64 {
+        if self.total == 0 || other.total == 0 {
+            return 2.0;
+        }
+        let mut sum = 0.0;
+        let full = self.total == SIMILARITY_WINDOW && other.total == SIMILARITY_WINDOW;
+        if full {
+            // For normalized histograms, chi^2 = 2 - sum(4*p*q/(p+q)).
+            // Only shared bins contribute to this sum. No second support pass
+            // is needed, and disjoint support gives exactly distance 2.
+            let (small, large) = if self.distinct <= other.distinct {
+                (self, other)
             } else {
-                *h1.counts.get_unchecked_mut(byte as usize) += 1;
+                (other, self)
+            };
+            for &byte in &small.support[..small.distinct] {
+                let y = large.counts[byte as usize] as usize;
+                if y != 0 {
+                    sum += terms[small.counts[byte as usize] as usize][y];
+                }
+            }
+            return (2.0 - sum).clamp(0.0, 2.0);
+        }
+        let inv_x = 1.0 / self.total as f64;
+        let inv_y = 1.0 / other.total as f64;
+        for &byte in &self.support[..self.distinct] {
+            let x = self.counts[byte as usize] as usize;
+            let y = other.counts[byte as usize] as usize;
+            sum += if full {
+                terms[x][y]
+            } else {
+                let p = x as f64 * inv_x;
+                let q = y as f64 * inv_y;
+                (p - q).powi(2) / (p + q + 1e-30)
+            };
+        }
+        for &byte in &other.support[..other.distinct] {
+            if self.counts[byte as usize] == 0 {
+                sum += if full {
+                    terms[0][other.counts[byte as usize] as usize]
+                } else {
+                    other.counts[byte as usize] as f64 * inv_y
+                };
             }
         }
+        sum
     }
-
-    // Merge histograms using SIMD
-    use wide::u32x4;
-    let mut result = [0u32; 256];
-
-    for i in (0..256).step_by(4) {
-        let v0 = u32x4::new([
-            h0.counts[i],
-            h0.counts[i + 1],
-            h0.counts[i + 2],
-            h0.counts[i + 3],
-        ]);
-        let v1 = u32x4::new([
-            h1.counts[i],
-            h1.counts[i + 1],
-            h1.counts[i + 2],
-            h1.counts[i + 3],
-        ]);
-        let sum = v0 + v1;
-        let arr = sum.to_array();
-        result[i] = arr[0];
-        result[i + 1] = arr[1];
-        result[i + 2] = arr[2];
-        result[i + 3] = arr[3];
-    }
-
-    result
 }
 
-/// Compute chi-squared distance between two histograms using SIMD.
-/// Optimized with 16-way processing and quad accumulators for maximum ILP.
-#[inline]
-fn chi_squared_distance_simd(hist_x: &[u32; 256], hist_y: &[u32; 256]) -> f64 {
-    // SIMD total computation using u32x4 with 8-way accumulation
-    use wide::u32x4;
-
-    let mut sum_x0 = u32x4::ZERO;
-    let mut sum_x1 = u32x4::ZERO;
-    let mut sum_y0 = u32x4::ZERO;
-    let mut sum_y1 = u32x4::ZERO;
-
-    for i in (0..256).step_by(8) {
-        let hx0 = u32x4::new([hist_x[i], hist_x[i + 1], hist_x[i + 2], hist_x[i + 3]]);
-        let hx1 = u32x4::new([hist_x[i + 4], hist_x[i + 5], hist_x[i + 6], hist_x[i + 7]]);
-        let hy0 = u32x4::new([hist_y[i], hist_y[i + 1], hist_y[i + 2], hist_y[i + 3]]);
-        let hy1 = u32x4::new([hist_y[i + 4], hist_y[i + 5], hist_y[i + 6], hist_y[i + 7]]);
-        sum_x0 += hx0;
-        sum_x1 += hx1;
-        sum_y0 += hy0;
-        sum_y1 += hy1;
-    }
-
-    let combined_x = sum_x0 + sum_x1;
-    let combined_y = sum_y0 + sum_y1;
-    let arr_x = combined_x.to_array();
-    let arr_y = combined_y.to_array();
-    let total_x = arr_x[0] + arr_x[1] + arr_x[2] + arr_x[3];
-    let total_y = arr_y[0] + arr_y[1] + arr_y[2] + arr_y[3];
-
-    if total_x == 0 || total_y == 0 {
-        return 2.0; // Maximum distance
-    }
-
-    let inv_total_x = f64x4::splat(1.0 / total_x as f64);
-    let inv_total_y = f64x4::splat(1.0 / total_y as f64);
-
-    // 16-way SIMD chi-squared with quad accumulators for maximum ILP
-    let mut chi_sq0 = f64x4::ZERO;
-    let mut chi_sq1 = f64x4::ZERO;
-    let mut chi_sq2 = f64x4::ZERO;
-    let mut chi_sq3 = f64x4::ZERO;
-
-    // Small epsilon for branchless division
-    let eps = f64x4::splat(1e-30);
-
-    for i in (0..256).step_by(16) {
-        // Load 16 histogram values
-        let hx0 = f64x4::new([
-            hist_x[i] as f64,
-            hist_x[i + 1] as f64,
-            hist_x[i + 2] as f64,
-            hist_x[i + 3] as f64,
-        ]);
-        let hx1 = f64x4::new([
-            hist_x[i + 4] as f64,
-            hist_x[i + 5] as f64,
-            hist_x[i + 6] as f64,
-            hist_x[i + 7] as f64,
-        ]);
-        let hx2 = f64x4::new([
-            hist_x[i + 8] as f64,
-            hist_x[i + 9] as f64,
-            hist_x[i + 10] as f64,
-            hist_x[i + 11] as f64,
-        ]);
-        let hx3 = f64x4::new([
-            hist_x[i + 12] as f64,
-            hist_x[i + 13] as f64,
-            hist_x[i + 14] as f64,
-            hist_x[i + 15] as f64,
-        ]);
-
-        let hy0 = f64x4::new([
-            hist_y[i] as f64,
-            hist_y[i + 1] as f64,
-            hist_y[i + 2] as f64,
-            hist_y[i + 3] as f64,
-        ]);
-        let hy1 = f64x4::new([
-            hist_y[i + 4] as f64,
-            hist_y[i + 5] as f64,
-            hist_y[i + 6] as f64,
-            hist_y[i + 7] as f64,
-        ]);
-        let hy2 = f64x4::new([
-            hist_y[i + 8] as f64,
-            hist_y[i + 9] as f64,
-            hist_y[i + 10] as f64,
-            hist_y[i + 11] as f64,
-        ]);
-        let hy3 = f64x4::new([
-            hist_y[i + 12] as f64,
-            hist_y[i + 13] as f64,
-            hist_y[i + 14] as f64,
-            hist_y[i + 15] as f64,
-        ]);
-
-        // Convert to probabilities
-        let px0 = hx0 * inv_total_x;
-        let px1 = hx1 * inv_total_x;
-        let px2 = hx2 * inv_total_x;
-        let px3 = hx3 * inv_total_x;
-        let py0 = hy0 * inv_total_y;
-        let py1 = hy1 * inv_total_y;
-        let py2 = hy2 * inv_total_y;
-        let py3 = hy3 * inv_total_y;
-
-        // Compute (px - py)² / (px + py + eps) - branchless
-        let diff0 = px0 - py0;
-        let diff1 = px1 - py1;
-        let diff2 = px2 - py2;
-        let diff3 = px3 - py3;
-
-        let sum0 = px0 + py0 + eps;
-        let sum1 = px1 + py1 + eps;
-        let sum2 = px2 + py2 + eps;
-        let sum3 = px3 + py3 + eps;
-
-        chi_sq0 += (diff0 * diff0) / sum0;
-        chi_sq1 += (diff1 * diff1) / sum1;
-        chi_sq2 += (diff2 * diff2) / sum2;
-        chi_sq3 += (diff3 * diff3) / sum3;
-    }
-
-    // Combine all accumulators
-    let combined = (chi_sq0 + chi_sq1) + (chi_sq2 + chi_sq3);
-    combined.reduce_add()
+fn similarity_terms() -> &'static [[f64; 33]; 33] {
+    use std::sync::OnceLock;
+    static TERMS: OnceLock<[[f64; 33]; 33]> = OnceLock::new();
+    TERMS.get_or_init(|| {
+        let mut terms = [[0.0; 33]; 33];
+        for (x, row) in terms.iter_mut().enumerate() {
+            for (y, term) in row.iter_mut().enumerate() {
+                let p = x as f64 / SIMILARITY_WINDOW as f64;
+                let q = y as f64 / SIMILARITY_WINDOW as f64;
+                *term = 4.0 * p * q / (p + q + 1e-30);
+            }
+        }
+        terms
+    })
 }
 
 pub fn generate_similarity_matrix_pixels(
@@ -500,33 +472,33 @@ pub fn generate_similarity_matrix_pixels(
     scale_y: f32,
     dimension: u64,
 ) -> Vec<Color32> {
-    let window_size: usize = 32;
     let dim = dimension as f64;
-
+    let axis = |min: f32, scale: f32| -> Vec<Option<WindowHistogram>> {
+        (0..tex_size)
+            .map(|i| {
+                let world = min + i as f32 * scale;
+                if world < 0.0 || world >= dim as f32 {
+                    None
+                } else {
+                    let pos = ((world as f64 / dim) * file_size as f64) as usize;
+                    Some(WindowHistogram::new(data, pos))
+                }
+            })
+            .collect()
+    };
+    // Each histogram is constructed once per axis, rather than twice per pixel.
+    let xs = axis(world_min.x, scale_x);
+    let ys = axis(world_min.y, scale_y);
+    let terms = similarity_terms();
     (0..tex_size * tex_size)
         .into_par_iter()
         .map(|idx| {
-            let tex_y = idx / tex_size;
-            let tex_x = idx % tex_size;
-
-            let world_x = world_min.x + tex_x as f32 * scale_x;
-            let world_y = world_min.y + tex_y as f32 * scale_y;
-
-            if world_x < 0.0 || world_y < 0.0 || world_x >= dim as f32 || world_y >= dim as f32 {
+            let (Some(x), Some(y)) = (&xs[idx % tex_size], &ys[idx / tex_size]) else {
                 return Color32::from_rgb(10, 10, 15);
-            }
-
-            let pos_x = ((world_x as f64 / dim) * file_size as f64) as usize;
-            let pos_y = ((world_y as f64 / dim) * file_size as f64) as usize;
-
-            let hist_x = compute_histogram(data, pos_x, window_size);
-            let hist_y = compute_histogram(data, pos_y, window_size);
-
-            let chi_sq = chi_squared_distance_simd(&hist_x, &hist_y);
-            let similarity = 1.0 - (chi_sq / 2.0).sqrt();
-
-            let is_diagonal = (pos_x as i64 - pos_y as i64).abs() < window_size as i64;
-            similarity_to_color(similarity, is_diagonal)
+            };
+            let similarity = 1.0 - (x.distance(y, terms) / 2.0).sqrt();
+            let diagonal = x.position.abs_diff(y.position) < SIMILARITY_WINDOW;
+            similarity_to_color(similarity, diagonal)
         })
         .collect()
 }
@@ -615,9 +587,32 @@ fn build_digraph_parallel(data: &[u8]) -> (Vec<u64>, u64) {
     (digraph, max_count)
 }
 
+/// Color the fixed 256x256 byte-pair space once, then resample its palette.
+fn render_pair_palette(
+    palette: &[Color32],
+    tex_size: usize,
+    world_min: Vec2,
+    scale_x: f32,
+    scale_y: f32,
+    background: Color32,
+) -> Vec<Color32> {
+    (0..tex_size * tex_size)
+        .into_par_iter()
+        .map(|idx| {
+            let x = world_min.x + (idx % tex_size) as f32 * scale_x;
+            let y = world_min.y + (idx / tex_size) as f32 * scale_y;
+            if !(0.0..256.0).contains(&x) || !(0.0..256.0).contains(&y) {
+                background
+            } else {
+                palette[y as usize * 256 + x as usize]
+            }
+        })
+        .collect()
+}
+
 pub fn generate_digraph_pixels(
     data: &[u8],
-    file_size: u64,
+    _file_size: u64,
     tex_size: usize,
     world_min: Vec2,
     scale_x: f32,
@@ -625,36 +620,20 @@ pub fn generate_digraph_pixels(
 ) -> Vec<Color32> {
     let (digraph, max_count) = build_digraph_parallel(data);
     let sqrt_max = (max_count as f64).sqrt();
-
-    (0..tex_size * tex_size)
-        .into_par_iter()
-        .map(|idx| {
-            let tex_y = idx / tex_size;
-            let tex_x = idx % tex_size;
-
-            let world_x = world_min.x + tex_x as f32 * scale_x;
-            let world_y = world_min.y + tex_y as f32 * scale_y;
-
-            let dg_x = world_x as i32;
-            let dg_y = world_y as i32;
-
-            if dg_x < 0 || dg_x >= 256 || dg_y < 0 || dg_y >= 256 {
-                return Color32::from_rgb(8, 8, 12);
-            }
-
-            let count = digraph[dg_y as usize * 256 + dg_x as usize];
-
+    let background = Color32::from_rgb(8, 8, 12);
+    let palette: Vec<Color32> = digraph
+        .par_iter()
+        .enumerate()
+        .map(|(idx, &count)| {
             if count == 0 {
-                Color32::from_rgb(8, 8, 12)
-            } else {
-                let intensity = ((count as f64).sqrt() / sqrt_max).powf(0.6);
-                let hue = ((dg_x + dg_y) as f64 / 512.0) * 300.0;
-                let sat = 0.85 - intensity * 0.2;
-                let val = 0.15 + intensity * 0.85;
-                hsv_to_rgb(hue, sat, val)
+                return background;
             }
+            let intensity = ((count as f64).sqrt() / sqrt_max).powf(0.6);
+            let hue = ((idx % 256 + idx / 256) as f64 / 512.0) * 300.0;
+            hsv_to_rgb(hue, 0.85 - intensity * 0.2, 0.15 + intensity * 0.85)
         })
-        .collect()
+        .collect();
+    render_pair_palette(&palette, tex_size, world_min, scale_x, scale_y, background)
 }
 
 // =============================================================================
@@ -693,6 +672,12 @@ fn build_phase_space_parallel(data: &[u8]) -> (Vec<(u64, u64)>, u64) {
                 }
             }
 
+            let boundary = base_offset + chunk.len() - 1;
+            if boundary + 1 < data.len() {
+                let idx = data[boundary + 1] as usize * 256 + data[boundary] as usize;
+                local_space[idx].0 = boundary as u64;
+                local_space[idx].1 += 1;
+            }
             (chunk_idx, local_space)
         })
         .collect();
@@ -700,11 +685,8 @@ fn build_phase_space_parallel(data: &[u8]) -> (Vec<(u64, u64)>, u64) {
     // Merge results - process in chunk index order for correct position tracking
     let mut phase_space = vec![(0u64, 0u64); DIGRAPH_SIZE];
 
-    // Sort by chunk index to process in order
-    let mut sorted_results: Vec<_> = results.into_iter().collect();
-    sorted_results.sort_by_key(|(idx, _)| *idx);
-
-    for (_chunk_idx, local) in &sorted_results {
+    // par_chunks is indexed; collect already preserves chunk order.
+    for (_chunk_idx, local) in &results {
         // Process 4 elements at a time for better cache usage
         for i in (0..DIGRAPH_SIZE).step_by(4) {
             unsafe {
@@ -740,43 +722,30 @@ pub fn generate_byte_phase_space_pixels(
     if file_size < 2 {
         return vec![Color32::from_rgb(10, 10, 15); tex_size * tex_size];
     }
-
     let (phase_space, max_count) = build_phase_space_parallel(data);
-    let file_size_f = file_size as f64;
     let sqrt_max = (max_count as f64).sqrt();
-
-    (0..tex_size * tex_size)
-        .into_par_iter()
-        .map(|idx| {
-            let tex_y = idx / tex_size;
-            let tex_x = idx % tex_size;
-
-            let world_x = world_min.x + tex_x as f32 * scale_x;
-            let world_y = world_min.y + tex_y as f32 * scale_y;
-
-            let ps_x = world_x as i32;
-            let ps_y = world_y as i32;
-
-            if ps_x < 0 || ps_x >= 256 || ps_y < 0 || ps_y >= 256 {
-                return Color32::from_rgb(10, 10, 15);
-            }
-
-            let (last_pos, count) = phase_space[ps_y as usize * 256 + ps_x as usize];
-
+    let palette: Vec<Color32> = phase_space
+        .par_iter()
+        .enumerate()
+        .map(|(idx, &(last_pos, count))| {
             if count == 0 {
-                Color32::from_rgb(8, 8, 12)
-            } else {
-                let intensity = ((count as f64).sqrt() / sqrt_max).powf(0.5);
-                let coord_hue = ((ps_x + ps_y) as f64 / 512.0) * 360.0;
-                let position_ratio = last_pos as f64 / file_size_f;
-                let pos_hue = position_ratio * 120.0;
-                let hue = (coord_hue * 0.7 + pos_hue * 0.3) % 360.0;
-                let sat = 0.75 + intensity * 0.2;
-                let val = 0.1 + intensity * 0.9;
-                hsv_to_rgb(hue, sat, val)
+                return Color32::from_rgb(8, 8, 12);
             }
+            let intensity = ((count as f64).sqrt() / sqrt_max).powf(0.5);
+            let coord_hue = ((idx % 256 + idx / 256) as f64 / 512.0) * 360.0;
+            let pos_hue = last_pos as f64 / file_size as f64 * 120.0;
+            let hue = (coord_hue * 0.7 + pos_hue * 0.3) % 360.0;
+            hsv_to_rgb(hue, 0.75 + intensity * 0.2, 0.1 + intensity * 0.9)
         })
-        .collect()
+        .collect();
+    render_pair_palette(
+        &palette,
+        tex_size,
+        world_min,
+        scale_x,
+        scale_y,
+        Color32::from_rgb(10, 10, 15),
+    )
 }
 
 // =============================================================================
@@ -839,39 +808,24 @@ pub fn generate_jsd_pixels(
     scale_y: f32,
     use_linear: bool,
 ) -> Vec<Color32> {
-    (0..tex_size * tex_size)
-        .into_par_iter()
-        .map(|idx| {
-            let tex_y = idx / tex_size;
-            let tex_x = idx % tex_size;
-
-            let world_x = (world_min.x + tex_x as f32 * scale_x) as u64;
-            let world_y = (world_min.y + tex_y as f32 * scale_y) as u64;
-
-            if world_x >= dimension || world_y >= dimension {
-                return Color32::from_rgb(13, 13, 13);
-            }
-
-            let d = if use_linear {
-                world_y * dimension + world_x
-            } else {
-                xy2d(dimension, world_x, world_y)
+    let prepared = JsdWindow::new(reference_distribution, ANALYSIS_WINDOW);
+    render_byte_layout(
+        dimension,
+        file_size.min(data.len() as u64),
+        tex_size,
+        world_min,
+        scale_x,
+        scale_y,
+        use_linear,
+        |start| {
+            let end = start.saturating_add(ANALYSIS_WINDOW).min(data.len());
+            let analysis = JSDAnalysis {
+                divergence: prepared.divergence(&data[start..end]),
             };
-
-            if d >= file_size {
-                return Color32::from_rgb(13, 13, 13);
-            }
-
-            let start = d as usize;
-            let end = (start + ANALYSIS_WINDOW).min(data.len());
-            let chunk = &data[start..end];
-
-            let jsd = calculate_jsd(chunk, reference_distribution);
-            let analysis = JSDAnalysis { divergence: jsd };
             let [r, g, b] = analysis.to_color();
             Color32::from_rgb(r, g, b)
-        })
-        .collect()
+        },
+    )
 }
 
 // =============================================================================
@@ -934,4 +888,132 @@ pub fn generate_rcmse_pixels(
             Color32::from_rgb((r * 255.0) as u8, (g * 255.0) as u8, (b * 255.0) as u8)
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::analysis::{byte_distribution, calculate_jsd};
+
+    #[test]
+    fn cached_similarity_distance_matches_scalar_full_and_tail_windows() {
+        let data: Vec<u8> = (0..513).map(|i| ((i * 137 + i / 3) % 256) as u8).collect();
+        for x in [0, 17, 255, 480, 490, 512, 513] {
+            for y in [0, 11, 256, 482, 500, 512, 513] {
+                let hx = WindowHistogram::new(&data, x);
+                let hy = WindowHistogram::new(&data, y);
+                let expected = if hx.total == 0 || hy.total == 0 {
+                    2.0
+                } else {
+                    (0..256)
+                        .map(|b| {
+                            let p = hx.counts[b] as f64 / hx.total as f64;
+                            let q = hy.counts[b] as f64 / hy.total as f64;
+                            (p - q).powi(2) / (p + q + 1e-30)
+                        })
+                        .sum::<f64>()
+                };
+                assert!((hx.distance(&hy, similarity_terms()) - expected).abs() < 1e-12);
+            }
+        }
+    }
+
+    #[test]
+    fn repeated_coordinates_preserve_byte_and_jsd_colors() {
+        let data: Vec<u8> = (0..4093).map(|i| ((i * 137 + i / 3) % 256) as u8).collect();
+        let reference = byte_distribution(&data);
+        for linear in [false, true] {
+            for scale in [0.25, 1.0, 2.0] {
+                let size = 32;
+                let minimum = Vec2::new(-1.0, 59.0);
+                let actual = generate_jsd_pixels(
+                    &data,
+                    &reference,
+                    64,
+                    data.len() as u64,
+                    size,
+                    minimum,
+                    scale,
+                    scale,
+                    linear,
+                );
+                let bytes = if linear {
+                    generate_linear_entropy_pixels(
+                        &data,
+                        64,
+                        data.len() as u64,
+                        size,
+                        minimum,
+                        scale,
+                        scale,
+                    )
+                } else {
+                    generate_hilbert_pixels(
+                        &data,
+                        64,
+                        data.len() as u64,
+                        size,
+                        minimum,
+                        scale,
+                        scale,
+                    )
+                };
+                for i in 0..size * size {
+                    let x = minimum.x + (i % size) as f32 * scale;
+                    let y = minimum.y + (i / size) as f32 * scale;
+                    let background = Color32::from_rgb(13, 13, 13);
+                    if !(0.0..64.0).contains(&x) || !(0.0..64.0).contains(&y) {
+                        assert_eq!(actual[i], background);
+                        assert_eq!(bytes[i], background);
+                        continue;
+                    }
+                    let offset = if linear {
+                        y as u64 * 64 + x as u64
+                    } else {
+                        xy2d(64, x as u64, y as u64)
+                    } as usize;
+                    if offset >= data.len() {
+                        assert_eq!(actual[i], background);
+                        assert_eq!(bytes[i], background);
+                        continue;
+                    }
+                    let chunk = &data[offset..(offset + ANALYSIS_WINDOW).min(data.len())];
+                    let [r, g, b] = JSDAnalysis {
+                        divergence: calculate_jsd(chunk, &reference),
+                    }
+                    .to_color();
+                    let expected = Color32::from_rgb(r, g, b);
+                    for (a, e) in actual[i].to_array().iter().zip(expected.to_array()) {
+                        assert!(a.abs_diff(e) <= 1);
+                    }
+                    let [r, g, b] = ByteAnalysis::analyze(chunk).to_color();
+                    assert_eq!(bytes[i], Color32::from_rgb(r, g, b));
+                }
+            }
+        }
+        assert!(
+            generate_jsd_pixels(&data, &reference, 64, 4093, 0, Vec2::ZERO, 1.0, 1.0, false)
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn parallel_pair_counts_include_every_boundary_and_last_position() {
+        for len in [0usize, 1, 2, 65537, 2 * 65536 + 17] {
+            let data: Vec<u8> = (0..len).map(|i| (i * 31 + i / 256) as u8).collect();
+            let (digraph, _) = build_digraph_parallel(&data);
+            let (space, _) = build_phase_space_parallel(&data);
+            let mut expected_counts = vec![0u64; DIGRAPH_SIZE];
+            let mut expected_space = vec![(0u64, 0u64); DIGRAPH_SIZE];
+            for (pos, pair) in data.windows(2).enumerate() {
+                expected_counts[pair[0] as usize * 256 + pair[1] as usize] += 1;
+                let entry = &mut expected_space[pair[1] as usize * 256 + pair[0] as usize];
+                entry.0 = pos as u64;
+                entry.1 += 1;
+            }
+            assert_eq!(digraph, expected_counts);
+            assert_eq!(space, expected_space);
+            assert_eq!(digraph.iter().sum::<u64>(), len.saturating_sub(1) as u64);
+        }
+    }
 }

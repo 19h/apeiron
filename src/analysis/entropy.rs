@@ -5,11 +5,11 @@
 //! - 4-way parallel histogram counting to avoid cache contention
 //! - Cache-aligned buffers for optimal memory access
 //! - Precomputed log2 lookup table for common count values
-//! - True branchless SIMD f64x4 log2 using IEEE 754 bit manipulation
-//! - SIMD histogram merging with u32x4/u64x4
+//! - Sparse count updates for short windows, with exact count logarithms
+//! - SIMD histogram merging with u32x4
 
 use rayon::prelude::*;
-use wide::{f64x4, u64x4};
+use wide::f64x4;
 
 /// Window size for byte analysis (matches original implementation).
 pub const ANALYSIS_WINDOW: usize = 64;
@@ -28,132 +28,95 @@ impl AlignedHistogram {
             counts: [0u32; 256],
         }
     }
-
-    #[inline(always)]
-    fn clear(&mut self) {
-        // SAFETY: u32 is zeroable, and we're writing the full array
-        // This compiles to a single memset intrinsic
-        unsafe {
-            std::ptr::write_bytes(self.counts.as_mut_ptr(), 0, 256);
-        }
-    }
 }
 
-/// Precomputed log2 values for counts 1..=LOG2_LUT_SIZE.
-/// Avoids expensive log2 calls for common small counts.
+/// Exact count-weighted logarithms shared by all entropy kernels.
 const LOG2_LUT_SIZE: usize = 4096;
 
-/// Runtime-initialized log2 lookup table.
-/// Uses std::sync::OnceLock for thread-safe lazy initialization.
-fn get_log2_lut() -> &'static [f64; LOG2_LUT_SIZE + 1] {
+fn get_entropy_lut() -> &'static [f64; LOG2_LUT_SIZE + 1] {
     use std::sync::OnceLock;
-    static LOG2_LUT: OnceLock<[f64; LOG2_LUT_SIZE + 1]> = OnceLock::new();
-    LOG2_LUT.get_or_init(|| {
-        let mut lut = [0.0f64; LOG2_LUT_SIZE + 1];
-        for i in 1..=LOG2_LUT_SIZE {
-            lut[i] = (i as f64).log2();
+    static LUT: OnceLock<[f64; LOG2_LUT_SIZE + 1]> = OnceLock::new();
+    LUT.get_or_init(|| {
+        let mut lut = [0.0; LOG2_LUT_SIZE + 1];
+        for (count, value) in lut.iter_mut().enumerate().skip(1) {
+            *value = count as f64 * (count as f64).log2();
         }
         lut
     })
 }
 
-/// Fast log2 using lookup table for small values, computed for large values.
-#[inline(always)]
-fn fast_log2(x: u32) -> f64 {
-    if x == 0 {
-        return 0.0; // Avoid special case in caller
+fn count_bytes_wide(data: &[u8]) -> [u64; 256] {
+    // Each local histogram remains below u32::MAX; only the reduction is wide.
+    data.par_chunks(64 * 1024 * 1024)
+        .map(|chunk| {
+            let mut counts = [0u32; 256];
+            count_bytes_4way(chunk, &mut counts);
+            counts.map(u64::from)
+        })
+        .reduce(
+            || [0u64; 256],
+            |mut sum, counts| {
+                for (total, count) in sum.iter_mut().zip(counts) {
+                    *total += count;
+                }
+                sum
+            },
+        )
+}
+
+fn entropy_from_wide_counts(counts: &[u64; 256], total: usize) -> f64 {
+    if total == 0 {
+        return 0.0;
     }
-    if x as usize <= LOG2_LUT_SIZE {
-        get_log2_lut()[x as usize]
+    let weighted: f64 = counts
+        .iter()
+        .filter(|&&c| c > 0)
+        .map(|&c| c as f64 * (c as f64).log2())
+        .sum();
+    ((total as f64).log2() - weighted / total as f64).clamp(0.0, 8.0)
+}
+
+/// Count and accumulate c*log2(c) exactly. Small windows update only the
+/// affected bin, rather than evaluating a SIMD logarithm for all 256 bins.
+#[inline]
+fn entropy_with_counts(data: &[u8], counts: &mut [u32; 256]) -> f64 {
+    counts.fill(0);
+    if data.is_empty() {
+        return 0.0;
+    }
+    if data.len() > u32::MAX as usize {
+        let wide = count_bytes_wide(data);
+        for (count, &value) in counts.iter_mut().zip(&wide) {
+            *count = value.min(u32::MAX as u64) as u32;
+        }
+        return entropy_from_wide_counts(&wide, data.len());
+    }
+    let lut = get_entropy_lut();
+    let mut weighted_sum = 0.0;
+    if data.len() < FOURWAY_THRESHOLD {
+        for &byte in data {
+            let count = &mut counts[byte as usize];
+            weighted_sum += lut[*count as usize + 1] - lut[*count as usize];
+            *count += 1;
+        }
     } else {
-        (x as f64).log2()
+        count_bytes_4way(data, counts);
+        for &count in counts.iter() {
+            weighted_sum += if count as usize <= LOG2_LUT_SIZE {
+                lut[count as usize]
+            } else {
+                count as f64 * (count as f64).log2()
+            };
+        }
     }
+    let total = data.len() as f64;
+    let log_total = if data.len() <= LOG2_LUT_SIZE {
+        lut[data.len()] / total
+    } else {
+        total.log2()
+    };
+    (log_total - weighted_sum / total).clamp(0.0, 8.0)
 }
-
-/// IEEE 754 constants for SIMD log2
-const MANTISSA_MASK_U64: u64 = (1u64 << 52) - 1;
-const EXPONENT_BIAS: u64 = 1023;
-const ONE_BITS: u64 = 0x3FF0_0000_0000_0000u64;
-
-/// Polynomial coefficients for log2(m) where m in [1, 2)
-/// Higher-order polynomial for better accuracy (~0.01% relative error)
-const LOG2_C0: f64 = 1.4426950408889634; // 1/ln(2)
-const LOG2_C1: f64 = -0.7213475204444817;
-const LOG2_C2: f64 = 0.4808983469629878;
-const LOG2_C3: f64 = -0.3606737602222408;
-
-/// True branchless SIMD log2 approximation using IEEE 754 bit manipulation.
-/// Accuracy: ~0.01% relative error for values > 0.
-/// For values <= 0, returns 0.0 (branchless via bit masking).
-///
-/// Algorithm: log2(x) = exponent + log2(mantissa)
-/// where mantissa is normalized to [1, 2) and approximated with polynomial.
-#[inline(always)]
-fn fast_log2_f64x4(x: f64x4) -> f64x4 {
-    // Reinterpret f64x4 as u64x4 for bit manipulation
-    let x_arr = x.to_array();
-    let bits = u64x4::new([
-        x_arr[0].to_bits(),
-        x_arr[1].to_bits(),
-        x_arr[2].to_bits(),
-        x_arr[3].to_bits(),
-    ]);
-
-    // Extract exponent: (bits >> 52) & 0x7FF - 1023
-    let bits_arr = bits.to_array();
-    let exp = f64x4::new([
-        ((bits_arr[0] >> 52) & 0x7FF) as f64 - EXPONENT_BIAS as f64,
-        ((bits_arr[1] >> 52) & 0x7FF) as f64 - EXPONENT_BIAS as f64,
-        ((bits_arr[2] >> 52) & 0x7FF) as f64 - EXPONENT_BIAS as f64,
-        ((bits_arr[3] >> 52) & 0x7FF) as f64 - EXPONENT_BIAS as f64,
-    ]);
-
-    // Normalize mantissa to [1, 2): clear exponent bits, set to 1023 (1.0 bias)
-    let mantissa_bits = u64x4::new([
-        (bits_arr[0] & MANTISSA_MASK_U64) | ONE_BITS,
-        (bits_arr[1] & MANTISSA_MASK_U64) | ONE_BITS,
-        (bits_arr[2] & MANTISSA_MASK_U64) | ONE_BITS,
-        (bits_arr[3] & MANTISSA_MASK_U64) | ONE_BITS,
-    ]);
-
-    let m_arr = mantissa_bits.to_array();
-    let m_vec = f64x4::new([
-        f64::from_bits(m_arr[0]),
-        f64::from_bits(m_arr[1]),
-        f64::from_bits(m_arr[2]),
-        f64::from_bits(m_arr[3]),
-    ]);
-
-    // Polynomial approximation for log2(m) where m in [1, 2)
-    // Using 4th-order Horner's method: t * (c0 + t * (c1 + t * (c2 + t * c3)))
-    let one = f64x4::splat(1.0);
-    let c0 = f64x4::splat(LOG2_C0);
-    let c1 = f64x4::splat(LOG2_C1);
-    let c2 = f64x4::splat(LOG2_C2);
-    let c3 = f64x4::splat(LOG2_C3);
-
-    let t = m_vec - one; // t = m - 1, in [0, 1)
-
-    // Horner's method (4th order)
-    let poly = t * (c0 + t * (c1 + t * (c2 + t * c3)));
-
-    // log2(x) = exponent + log2(mantissa)
-    let result = exp + poly;
-
-    // Branchless zero-masking for non-positive inputs
-    // If x <= 0, the exponent will be very negative or special (NaN/Inf bits)
-    // We create a mask where positive values keep their result, others get 0
-    let result_arr = result.to_array();
-    f64x4::new([
-        if x_arr[0] > 0.0 { result_arr[0] } else { 0.0 },
-        if x_arr[1] > 0.0 { result_arr[1] } else { 0.0 },
-        if x_arr[2] > 0.0 { result_arr[2] } else { 0.0 },
-        if x_arr[3] > 0.0 { result_arr[3] } else { 0.0 },
-    ])
-}
-
-/// SIMD zeros constant
-const ZERO_X4: f64x4 = f64x4::new([0.0, 0.0, 0.0, 0.0]);
 
 /// Count bytes using 4-way parallel histograms.
 /// This avoids cache line contention when processing sequential bytes
@@ -254,109 +217,13 @@ const FOURWAY_THRESHOLD: usize = 256;
 /// Shannon entropy measures the average information content per byte.
 /// Values range from 0 (completely uniform) to 8 (maximum randomness).
 pub fn calculate_entropy(data: &[u8]) -> f64 {
-    if data.is_empty() {
-        return 0.0;
-    }
-
-    let mut counts = [0u32; 256];
-
-    if data.len() >= FOURWAY_THRESHOLD {
-        count_bytes_4way(data, &mut counts);
-    } else {
-        count_bytes_simple(data, &mut counts);
-    }
-
-    let total = data.len() as f64;
-    let inv_total = 1.0 / total;
-
-    // Compute entropy using SIMD-accelerated log2
-    // H = log2(n) - (1/n) * sum(c * log2(c))
-    let log2_total = total.log2();
-
-    // SIMD entropy accumulation with dual accumulators for better ILP
-    let mut sum_vec0 = ZERO_X4;
-    let mut sum_vec1 = ZERO_X4;
-
-    for i in (0..256).step_by(8) {
-        let c_vec0 = f64x4::new([
-            counts[i] as f64,
-            counts[i + 1] as f64,
-            counts[i + 2] as f64,
-            counts[i + 3] as f64,
-        ]);
-        let c_vec1 = f64x4::new([
-            counts[i + 4] as f64,
-            counts[i + 5] as f64,
-            counts[i + 6] as f64,
-            counts[i + 7] as f64,
-        ]);
-
-        // Use fast SIMD log2 for all 8 values
-        let log2_c0 = fast_log2_f64x4(c_vec0);
-        let log2_c1 = fast_log2_f64x4(c_vec1);
-
-        // c * log2(c), zeros naturally become 0 * log2(0) = 0
-        sum_vec0 += c_vec0 * log2_c0;
-        sum_vec1 += c_vec1 * log2_c1;
-    }
-
-    // Combine and horizontal sum
-    let combined = sum_vec0 + sum_vec1;
-    let arr = combined.to_array();
-    let sum_c_log_c = arr[0] + arr[1] + arr[2] + arr[3];
-
-    log2_total - inv_total * sum_c_log_c
+    entropy_with_counts(data, &mut [0u32; 256])
 }
 
-/// Optimized entropy calculation for a chunk (typically 256 bytes).
-/// Uses SIMD accumulation with dual accumulators for better ILP.
-#[inline(always)]
+/// Exact Shannon entropy for a chunk, including empty chunks.
+#[inline]
 pub fn chunk_entropy_fast(chunk: &[u8]) -> f64 {
-    debug_assert!(!chunk.is_empty());
-
-    let mut counts = [0u32; 256];
-
-    // For typical chunk sizes (64-256 bytes), simple counting is faster
-    if chunk.len() >= FOURWAY_THRESHOLD {
-        count_bytes_4way(chunk, &mut counts);
-    } else {
-        count_bytes_simple(chunk, &mut counts);
-    }
-
-    let total = chunk.len() as f64;
-    let inv_total = 1.0 / total;
-    let log2_total = total.log2();
-
-    // SIMD entropy accumulation with dual accumulators
-    let mut sum_vec0 = ZERO_X4;
-    let mut sum_vec1 = ZERO_X4;
-
-    for i in (0..256).step_by(8) {
-        let c_vec0 = f64x4::new([
-            counts[i] as f64,
-            counts[i + 1] as f64,
-            counts[i + 2] as f64,
-            counts[i + 3] as f64,
-        ]);
-        let c_vec1 = f64x4::new([
-            counts[i + 4] as f64,
-            counts[i + 5] as f64,
-            counts[i + 6] as f64,
-            counts[i + 7] as f64,
-        ]);
-
-        let log2_c0 = fast_log2_f64x4(c_vec0);
-        let log2_c1 = fast_log2_f64x4(c_vec1);
-
-        sum_vec0 += c_vec0 * log2_c0;
-        sum_vec1 += c_vec1 * log2_c1;
-    }
-
-    let combined = sum_vec0 + sum_vec1;
-    let arr = combined.to_array();
-    let sum_c_log_c = arr[0] + arr[1] + arr[2] + arr[3];
-
-    log2_total - inv_total * sum_c_log_c
+    calculate_entropy(chunk)
 }
 
 /// Calculate byte frequency distribution (probability distribution) for a byte slice.
@@ -367,6 +234,10 @@ pub fn byte_distribution(data: &[u8]) -> [f64; 256] {
     if data.is_empty() {
         // Return uniform distribution for empty data
         return [1.0 / 256.0; 256];
+    }
+    if data.len() > u32::MAX as usize {
+        let counts = count_bytes_wide(data);
+        return counts.map(|c| c as f64 / data.len() as f64);
     }
 
     let mut counts = [0u32; 256];
@@ -400,68 +271,55 @@ pub fn byte_distribution(data: &[u8]) -> [f64; 256] {
     dist
 }
 
-/// Calculate byte frequency distribution using sampling for large files.
-///
-/// For files smaller than 10MB, this uses the full distribution.
-/// For larger files, it samples strategically to avoid O(n) iteration:
-/// - First 1MB is fully counted (headers often have distinct patterns)
-/// - Remaining file is sampled at regular intervals
-///
-/// This provides an accurate distribution estimate while being O(1) for large files.
+/// Estimate the byte distribution using bounded, contiguous block reads.
+/// Files up to 10 MiB are counted exactly. Larger files count the first MiB
+/// and at most 10 million body bytes in stratified 16 KiB blocks. Header and
+/// body estimates are weighted by their actual file sizes.
+/// Time is O(min(n, sampling_budget)); sampled I/O is bounded by the same
+/// budget rather than touching millions of pages through strided reads.
 pub fn byte_distribution_sampled(data: &[u8]) -> [f64; 256] {
-    const SMALL_FILE_THRESHOLD: usize = 10 * 1024 * 1024; // 10MB
-    const HEADER_SIZE: usize = 1024 * 1024; // 1MB of header to fully count
-    const TARGET_SAMPLES: usize = 10_000_000; // ~10 million samples from body
-
-    if data.is_empty() {
-        return [1.0 / 256.0; 256];
-    }
-
-    // For small files, use full distribution
+    const SMALL_FILE_THRESHOLD: usize = 10 * 1024 * 1024;
+    const HEADER_SIZE: usize = 1024 * 1024;
+    const TARGET_SAMPLES: usize = 10_000_000;
+    const BLOCK_SIZE: usize = 16 * 1024;
+    const BLOCK_COUNT: usize = TARGET_SAMPLES / BLOCK_SIZE;
     if data.len() <= SMALL_FILE_THRESHOLD {
         return byte_distribution(data);
     }
-
-    let mut counts = [0u32; 256];
-    let mut sample_count = 0u64;
-
-    // Count all bytes in the header (first 1MB) using optimized counting
-    let header_end = HEADER_SIZE.min(data.len());
-    if header_end >= FOURWAY_THRESHOLD {
-        count_bytes_4way(&data[..header_end], &mut counts);
-    } else {
-        count_bytes_simple(&data[..header_end], &mut counts);
+    let header = byte_distribution(&data[..HEADER_SIZE]);
+    let body = &data[HEADER_SIZE..];
+    if body.len() <= TARGET_SAMPLES {
+        let body_distribution = byte_distribution(body);
+        let weight = HEADER_SIZE as f64 / data.len() as f64;
+        return std::array::from_fn(|i| header[i] * weight + body_distribution[i] * (1.0 - weight));
     }
-    sample_count += header_end as u64;
-
-    // Sample the rest of the file
-    if data.len() > HEADER_SIZE {
-        let body = &data[HEADER_SIZE..];
-        let body_len = body.len();
-
-        // Calculate step size to get ~TARGET_SAMPLES from the body
-        let step = (body_len / TARGET_SAMPLES).max(1);
-
-        // Use strided access for sampling
-        let mut offset = 0;
-        while offset < body_len {
-            // Safety: offset is always < body_len
-            unsafe {
-                let byte = *body.get_unchecked(offset);
-                *counts.get_unchecked_mut(byte as usize) += 1;
-            }
-            sample_count += 1;
-            offset += step;
+    let mut counts = [0u64; 256];
+    let mut samples = 0usize;
+    for block in 0..BLOCK_COUNT {
+        // Partition with quotient/remainder arithmetic, avoiding usize products
+        // that could overflow for multi-terabyte mappings.
+        let quotient = body.len() / BLOCK_COUNT;
+        let remainder = body.len() % BLOCK_COUNT;
+        let low = block * quotient + block.min(remainder);
+        let high = low + quotient + usize::from(block < remainder);
+        let length = BLOCK_SIZE.min(high - low);
+        // Deterministic SplitMix64 jitter within each stratum reduces alignment
+        // with periodic file structure while preserving reproducibility.
+        let mut random = (block as u64).wrapping_add(0x9e3779b97f4a7c15);
+        random = (random ^ (random >> 30)).wrapping_mul(0xbf58476d1ce4e5b9);
+        random = (random ^ (random >> 27)).wrapping_mul(0x94d049bb133111eb);
+        random ^= random >> 31;
+        let start = low + random as usize % (high - low - length + 1);
+        let mut local = [0u32; 256];
+        count_bytes_4way(&body[start..start + length], &mut local);
+        for (sum, count) in counts.iter_mut().zip(local) {
+            *sum += count as u64;
         }
+        samples += length;
     }
-
-    // Convert counts to probabilities
-    let inv_total = 1.0 / sample_count as f64;
-    let mut dist = [0.0f64; 256];
-    for i in 0..256 {
-        dist[i] = counts[i] as f64 * inv_total;
-    }
-    dist
+    let header_weight = HEADER_SIZE as f64 / data.len() as f64;
+    let body_weight = (1.0 - header_weight) / samples as f64;
+    std::array::from_fn(|i| header[i] * header_weight + counts[i] as f64 * body_weight)
 }
 
 /// Precompute entropy values for all chunks at a given interval.
@@ -510,57 +368,11 @@ pub fn extract_ascii(data: &[u8]) -> Option<String> {
 }
 
 /// Compute entropy into a preallocated counts buffer (avoids allocation).
-/// Returns entropy value. Uses SIMD for vectorized computation.
+/// Returns entropy value. For inputs above u32::MAX bytes, the scratch counts
+/// saturate while a wide histogram supplies the exact entropy calculation.
 #[inline]
 pub fn calculate_entropy_with_buffer(data: &[u8], counts: &mut [u32; 256]) -> f64 {
-    if data.is_empty() {
-        return 0.0;
-    }
-
-    // Clear buffer - compiles to single memset call
-    counts.fill(0);
-
-    if data.len() >= FOURWAY_THRESHOLD {
-        count_bytes_4way(data, counts);
-    } else {
-        count_bytes_simple(data, counts);
-    }
-
-    let total = data.len() as f64;
-    let inv_total = 1.0 / total;
-    let log2_total = total.log2();
-
-    // SIMD entropy accumulation with dual accumulators for better ILP
-    let mut sum_vec0 = ZERO_X4;
-    let mut sum_vec1 = ZERO_X4;
-
-    for i in (0..256).step_by(8) {
-        let c_vec0 = f64x4::new([
-            counts[i] as f64,
-            counts[i + 1] as f64,
-            counts[i + 2] as f64,
-            counts[i + 3] as f64,
-        ]);
-        let c_vec1 = f64x4::new([
-            counts[i + 4] as f64,
-            counts[i + 5] as f64,
-            counts[i + 6] as f64,
-            counts[i + 7] as f64,
-        ]);
-
-        let log2_c0 = fast_log2_f64x4(c_vec0);
-        let log2_c1 = fast_log2_f64x4(c_vec1);
-
-        sum_vec0 += c_vec0 * log2_c0;
-        sum_vec1 += c_vec1 * log2_c1;
-    }
-
-    // Combine accumulators
-    let combined = sum_vec0 + sum_vec1;
-    let arr = combined.to_array();
-    let sum_c_log_c = arr[0] + arr[1] + arr[2] + arr[3];
-
-    log2_total - inv_total * sum_c_log_c
+    entropy_with_counts(data, counts)
 }
 
 /// Calculate entropy for multiple windows in a batch.
@@ -582,7 +394,7 @@ pub fn calculate_entropy_batch(data: &[u8], offsets: &[usize], window_size: usiz
         return offsets
             .iter()
             .map(|&offset| {
-                let end = (offset + window_size).min(data.len());
+                let end = offset.saturating_add(window_size).min(data.len());
                 if offset < data.len() && end > offset {
                     calculate_entropy(&data[offset..end])
                 } else {
@@ -596,7 +408,7 @@ pub fn calculate_entropy_batch(data: &[u8], offsets: &[usize], window_size: usiz
     offsets
         .par_iter()
         .map(|&offset| {
-            let end = (offset + window_size).min(data.len());
+            let end = offset.saturating_add(window_size).min(data.len());
             if offset < data.len() && end > offset {
                 // Thread-local would be ideal but for simplicity use inline buffer
                 let mut counts = [0u32; 256];
@@ -617,13 +429,13 @@ pub fn calculate_entropy_batch_into(
     window_size: usize,
     results: &mut [f64],
 ) {
-    debug_assert!(results.len() >= offsets.len());
+    assert!(results.len() >= offsets.len());
 
     // Sequential processing with reused histogram buffer for small batches
     if offsets.len() < 64 {
         let mut counts = [0u32; 256];
         for (i, &offset) in offsets.iter().enumerate() {
-            let end = (offset + window_size).min(data.len());
+            let end = offset.saturating_add(window_size).min(data.len());
             results[i] = if offset < data.len() && end > offset {
                 calculate_entropy_with_buffer(&data[offset..end], &mut counts)
             } else {
@@ -634,13 +446,115 @@ pub fn calculate_entropy_batch_into(
     }
 
     // Parallel processing for large batches
-    let entropies = calculate_entropy_batch(data, offsets, window_size);
-    results[..entropies.len()].copy_from_slice(&entropies);
+    results[..offsets.len()]
+        .par_iter_mut()
+        .zip(offsets.par_iter())
+        .for_each(|(result, &offset)| {
+            let end = offset.saturating_add(window_size).min(data.len());
+            *result = if offset < end {
+                calculate_entropy(&data[offset..end])
+            } else {
+                0.0
+            };
+        });
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sampled_distribution_weights_header_and_avoids_byte_stride_aliasing() {
+        let mut data = vec![255; 32 * 1024 * 1024];
+        data[..1024 * 1024].fill(0);
+        let distribution = byte_distribution_sampled(&data);
+        assert!((distribution[0] - 1.0 / 32.0).abs() < 1e-12);
+        assert!((distribution[255] - 31.0 / 32.0).abs() < 1e-12);
+        for (index, byte) in data.iter_mut().enumerate() {
+            *byte = index as u8;
+        }
+        let distribution = byte_distribution_sampled(&data);
+        for probability in distribution {
+            assert!((probability - 1.0 / 256.0).abs() < 1e-12);
+        }
+        assert_eq!(byte_distribution_sampled(&[]), byte_distribution(&[]));
+    }
+
+    #[test]
+    #[cfg(target_pointer_width = "64")]
+    fn wide_histogram_and_entropy_support_counts_above_u32_max() {
+        let data: Vec<u8> = (0..65539).map(|i| i as u8).collect();
+        let mut expected = [0u64; 256];
+        for &byte in &data {
+            expected[byte as usize] += 1;
+        }
+        assert_eq!(count_bytes_wide(&data), expected);
+        let count = u32::MAX as u64 + 1;
+        let mut counts = [0u64; 256];
+        counts[0] = count;
+        counts[255] = count;
+        assert_eq!(entropy_from_wide_counts(&counts, (2 * count) as usize), 1.0);
+    }
+
+    fn scalar_entropy(data: &[u8]) -> f64 {
+        if data.is_empty() {
+            return 0.0;
+        }
+        let mut counts = [0usize; 256];
+        for &byte in data {
+            counts[byte as usize] += 1;
+        }
+        counts
+            .iter()
+            .filter(|&&c| c > 0)
+            .map(|&c| {
+                let p = c as f64 / data.len() as f64;
+                -p * p.log2()
+            })
+            .sum()
+    }
+
+    #[test]
+    fn entropy_matches_scalar_for_skewed_and_short_windows() {
+        let mut seed = 0xfeedbeefu64;
+        let data: Vec<u8> = (0..10000)
+            .map(|i| {
+                seed ^= seed << 13;
+                seed ^= seed >> 7;
+                seed ^= seed << 17;
+                if i % 3 == 0 {
+                    0
+                } else {
+                    seed as u8
+                }
+            })
+            .collect();
+        let mut counts = [99; 256];
+        for len in [
+            0, 1, 3, 7, 15, 63, 64, 65, 127, 255, 256, 257, 4096, 8193, 10000,
+        ] {
+            for input in [&data[..len], &vec![42; len][..]] {
+                let expected = scalar_entropy(input);
+                assert!((calculate_entropy(input) - expected).abs() < 1e-12);
+                assert!((chunk_entropy_fast(input) - expected).abs() < 1e-12);
+                assert!(
+                    (calculate_entropy_with_buffer(input, &mut counts) - expected).abs() < 1e-12
+                );
+                assert_eq!(counts.iter().map(|&c| c as usize).sum::<usize>(), len);
+            }
+        }
+    }
+
+    #[test]
+    fn batch_into_handles_eof_and_overflow_without_touching_extra_slots() {
+        let data = vec![1; 100];
+        let offsets: Vec<usize> = (0..80).chain([99, 100, usize::MAX]).collect();
+        let expected = calculate_entropy_batch(&data, &offsets, 64);
+        let mut results = vec![-1.0; offsets.len() + 1];
+        calculate_entropy_batch_into(&data, &offsets, 64, &mut results);
+        assert_eq!(&results[..offsets.len()], expected);
+        assert_eq!(results[offsets.len()], -1.0);
+    }
 
     #[test]
     fn test_entropy_uniform() {

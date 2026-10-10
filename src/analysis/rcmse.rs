@@ -796,6 +796,122 @@ fn count_pattern_matches_histogram(series: &[f64], r: f64) -> (u64, u64) {
 
     // Calculate bin width and tolerance in bins
     let bin_width = range / FAST_HIST_BINS as f64;
+    let r_bins = ((r / bin_width).ceil() as usize).min(FAST_HIST_BINS - 1);
+
+    // Quantize values to bins: O(n)
+    let quantize = |v: f64| -> usize {
+        let bin = ((v - min_val) / bin_width) as usize;
+        bin.min(FAST_HIST_BINS - 1)
+    };
+
+    // Build 2D histogram of (series[i], series[i+1]) pairs: O(n)
+    // This represents the embedding vectors for m=2
+    let mut hist_m = [[0u32; FAST_HIST_BINS]; FAST_HIST_BINS];
+    let num_templates = n - M;
+
+    for i in 0..num_templates {
+        let b0 = quantize(series[i]);
+        let b1 = quantize(series[i + 1]);
+        hist_m[b0][b1] += 1;
+    }
+
+    // Build 3D histogram for m+1 (we can flatten to 2D by combining dimensions)
+    // For simplicity, we use a separate 2D histogram for (series[i+1], series[i+2])
+    // and estimate m+1 matches from the overlap
+    let mut hist_m1_suffix = [[0u32; FAST_HIST_BINS]; FAST_HIST_BINS];
+    let num_templates_ext = n - M - 1;
+
+    for i in 0..num_templates_ext {
+        let b1 = quantize(series[i + 1]);
+        let b2 = quantize(series[i + 2]);
+        hist_m1_suffix[b1][b2] += 1;
+    }
+
+    // Summed-area table gives each tolerance neighborhood in O(1).
+    let mut prefix = [[0u64; FAST_HIST_BINS + 1]; FAST_HIST_BINS + 1];
+    for row in 0..FAST_HIST_BINS {
+        let mut row_sum = 0;
+        for col in 0..FAST_HIST_BINS {
+            row_sum += hist_m[row][col] as u64;
+            prefix[row + 1][col + 1] = prefix[row][col + 1] + row_sum;
+        }
+    }
+    // Cache rounded suffix contributions by multiplicity. Rounding remains
+    // per suffix bin, exactly as in the existing visualization approximation.
+    let max_count = hist_m.iter().flatten().copied().max().unwrap_or(0) as usize;
+    let mut suffix_cache = vec![None; max_count + 1];
+    let mut count_m = 0u64;
+    let mut count_m_plus_1 = 0u64;
+    for b0 in 0..FAST_HIST_BINS {
+        for b1 in 0..FAST_HIST_BINS {
+            let c1 = hist_m[b0][b1] as u64;
+            if c1 == 0 {
+                continue;
+            }
+            let low0 = b0.saturating_sub(r_bins);
+            let high0 = (b0 + r_bins + 1).min(FAST_HIST_BINS);
+            let low1 = b1.saturating_sub(r_bins);
+            let high1 = (b1 + r_bins + 1).min(FAST_HIST_BINS);
+            let neighbors = prefix[high0][high1] + prefix[low0][low1]
+                - prefix[low0][high1]
+                - prefix[high0][low1];
+            count_m += c1 * (neighbors - 1); // Exclude each template's self-match.
+            let suffix = suffix_cache[c1 as usize].get_or_insert_with(|| {
+                let mut rows = [0u64; FAST_HIST_BINS + 1];
+                for (row, bins) in hist_m1_suffix.iter().enumerate() {
+                    let sum: u64 = bins
+                        .iter()
+                        .filter(|&&c| c > 0)
+                        .map(|&c| {
+                            let scale = (c as f64 / num_templates_ext as f64).min(1.0);
+                            (c1 as f64 * scale * c1 as f64) as u64
+                        })
+                        .sum();
+                    rows[row + 1] = rows[row] + sum;
+                }
+                rows
+            });
+            count_m_plus_1 += suffix[high1] - suffix[low1];
+        }
+    }
+
+    // Ensure count_m_plus_1 doesn't exceed count_m (physical constraint)
+    count_m_plus_1 = count_m_plus_1.min(count_m);
+
+    (count_m.max(1), count_m_plus_1.max(1))
+}
+
+#[cfg(test)]
+fn count_pattern_matches_histogram_reference(series: &[f64], r: f64) -> (u64, u64) {
+    let n = series.len();
+    const M: usize = 2; // Embedding dimension
+
+    if n <= M + 1 {
+        return (0, 0);
+    }
+
+    // Find min/max for quantization
+    let mut min_val = series[0];
+    let mut max_val = series[0];
+    for &v in &series[1..] {
+        if v < min_val {
+            min_val = v;
+        }
+        if v > max_val {
+            max_val = v;
+        }
+    }
+
+    let range = max_val - min_val;
+    if range < 1e-10 {
+        // All values are the same - everything matches
+        let num_templates = n - M;
+        let pairs = (num_templates * (num_templates - 1)) as u64;
+        return (pairs, pairs);
+    }
+
+    // Calculate bin width and tolerance in bins
+    let bin_width = range / FAST_HIST_BINS as f64;
     let r_bins = (r / bin_width).ceil() as usize;
 
     // Quantize values to bins: O(n)
@@ -938,7 +1054,21 @@ fn rcmse_at_scale_fast(data: &[u8], scale: usize, r: f64, buffer: &mut Vec<f64>)
 /// # Performance
 /// - Full RCMSE: O(n² × scales × offsets) ≈ O(n² × 36) for default params
 /// - Fast RCMSE: O(n × scales) ≈ O(n × 3) with histogram approximation
+thread_local! {
+    static QUICK_BUFFER: std::cell::RefCell<Vec<f64>> =
+        std::cell::RefCell::new(Vec::with_capacity(257));
+}
+
 pub fn calculate_rcmse_quick(data: &[u8]) -> f32 {
+    if data.len() <= 4096 {
+        QUICK_BUFFER
+            .with(|buffer| calculate_rcmse_quick_with_buffer(data, &mut buffer.borrow_mut()))
+    } else {
+        calculate_rcmse_quick_with_buffer(data, &mut Vec::new())
+    }
+}
+
+fn calculate_rcmse_quick_with_buffer(data: &[u8], buffer: &mut Vec<f64>) -> f32 {
     // Minimum data length for meaningful analysis
     if data.len() < 16 {
         return 0.5;
@@ -952,9 +1082,6 @@ pub fn calculate_rcmse_quick(data: &[u8]) -> f32 {
     }
     let r = RCMSE_TOLERANCE_FACTOR * sd;
 
-    // Thread-local buffer to avoid allocation
-    let mut buffer = Vec::with_capacity(data.len() + 1);
-
     // Compute entropy at sparse scales using histogram approximation
     let mut entropies = [0.0f64; 3];
     let mut valid_count = 0;
@@ -963,7 +1090,7 @@ pub fn calculate_rcmse_quick(data: &[u8]) -> f32 {
         if data.len() < (RCMSE_EMBEDDING_DIM + 2) * scale {
             break;
         }
-        if let Some(entropy) = rcmse_at_scale_fast(data, scale, r, &mut buffer) {
+        if let Some(entropy) = rcmse_at_scale_fast(data, scale, r, buffer) {
             entropies[i] = entropy;
             valid_count += 1;
         }
@@ -1010,6 +1137,33 @@ pub fn calculate_rcmse_quick(data: &[u8]) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn histogram_prefix_matches_existing_approximation() {
+        let mut seed = 0xc0ffeeu64;
+        for len in [0, 1, 3, 4, 16, 32, 64, 128, 256, 513] {
+            let series: Vec<f64> = (0..len)
+                .map(|_| {
+                    seed ^= seed << 13;
+                    seed ^= seed >> 7;
+                    seed ^= seed << 17;
+                    (seed % 256) as f64
+                })
+                .collect();
+            for r in [0.0, 0.01, 5.0, 11.0, 50.0, 255.0, 512.0] {
+                assert_eq!(
+                    count_pattern_matches_histogram(&series, r),
+                    count_pattern_matches_histogram_reference(&series, r),
+                    "len={len}, r={r}"
+                );
+            }
+            let uniform = vec![42.0; len];
+            assert_eq!(
+                count_pattern_matches_histogram(&uniform, 1.0),
+                count_pattern_matches_histogram_reference(&uniform, 1.0)
+            );
+        }
+    }
 
     #[test]
     fn test_rcmse_uniform() {

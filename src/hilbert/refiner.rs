@@ -46,7 +46,7 @@ pub struct HilbertBuffer {
     // === Coarse pass data ===
     /// Coarse entropy values (hierarchical pass).
     /// One value per "block" of the file.
-    coarse_entropy: Vec<f32>,
+    coarse_entropy: Vec<AtomicU32>,
 
     /// Block size for coarse pass (bytes per coarse sample).
     coarse_block_size: usize,
@@ -85,7 +85,7 @@ impl HilbertBuffer {
         let coarse_count = (file_size as usize / coarse_block_size).max(1);
 
         // Calculate fine sample count
-        let fine_total = (file_size as usize / FINE_SAMPLE_INTERVAL).max(1);
+        let fine_total = (file_size as usize).div_ceil(FINE_SAMPLE_INTERVAL).max(1);
 
         // Pre-allocate fine entropy with sentinel values
         let fine_entropy: Vec<AtomicU32> = (0..fine_total)
@@ -93,7 +93,7 @@ impl HilbertBuffer {
             .collect();
 
         Self {
-            coarse_entropy: vec![0.0; coarse_count],
+            coarse_entropy: (0..coarse_count).map(|_| AtomicU32::new(0)).collect(),
             coarse_block_size,
             coarse_complete: AtomicBool::new(false),
             fine_entropy,
@@ -162,7 +162,10 @@ impl HilbertBuffer {
         if self.is_coarse_complete() {
             let coarse_idx =
                 (file_offset as usize / self.coarse_block_size).min(self.coarse_entropy.len() - 1);
-            return Some((self.coarse_entropy[coarse_idx], false));
+            return Some((
+                f32::from_bits(self.coarse_entropy[coarse_idx].load(Ordering::Relaxed)),
+                false,
+            ));
         }
 
         None
@@ -263,11 +266,7 @@ impl HilbertRefiner {
             let end = (sample_offset + ENTROPY_WINDOW).min(data.len());
             if sample_offset < end {
                 let entropy = calculate_entropy(&data[sample_offset..end]);
-                // Safety: We're the only writer during coarse phase
-                unsafe {
-                    let ptr = buffer.coarse_entropy.as_ptr() as *mut f32;
-                    *ptr.add(i) = entropy as f32;
-                }
+                buffer.coarse_entropy[i].store((entropy as f32).to_bits(), Ordering::Relaxed);
             }
         }
 
@@ -301,7 +300,6 @@ impl HilbertRefiner {
 
             // Process a batch using optimized batch entropy
             let batch_end = (i + BATCH_SIZE).min(total);
-            let batch_len = batch_end - i;
 
             // Collect offsets for batch processing
             let offsets: Vec<usize> = (i..batch_end)
@@ -406,6 +404,20 @@ fn hsv_to_rgb(h: f32, s: f32, v: f32) -> (u8, u8, u8) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fine_pass_covers_partial_tail_and_publishes_coarse_values() {
+        let data: Vec<u8> = (0..129).map(|i| i as u8).collect();
+        let buffer = HilbertBuffer::new(data.len() as u64);
+        HilbertRefiner::compute_coarse(&buffer, &data);
+        assert!(buffer.lookup(128).is_some());
+        assert!(!buffer.lookup(128).unwrap().1);
+        HilbertRefiner::compute_fine(&buffer, &data);
+        assert!(buffer.is_fine_complete());
+        assert_eq!(buffer.fine_total(), 3);
+        assert_eq!(buffer.lookup(128), Some((0.0, true)));
+        assert_eq!(buffer.lookup(129), None);
+    }
 
     #[test]
     fn test_buffer_creation() {

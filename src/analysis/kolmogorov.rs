@@ -175,10 +175,12 @@ impl std::fmt::Display for CompressionTier {
     }
 }
 
-/// Thread-local encoder buffers to avoid repeated allocations.
+// Thread-local encoder buffers and small-window contexts avoid repeated allocations.
 thread_local! {
     static XZ_BUFFER: RefCell<Vec<u8>> = RefCell::new(Vec::with_capacity(4096));
     static ZSTD_BUFFER: RefCell<Vec<u8>> = RefCell::new(Vec::with_capacity(4096));
+    static ZSTD_CONTEXT: RefCell<zstd::zstd_safe::CCtx<'static>> =
+        RefCell::new(zstd::zstd_safe::CCtx::create());
 }
 
 /// Fast check if data is likely incompressible (high entropy).
@@ -314,17 +316,55 @@ fn compress_xz(data: &[u8], preset: u32, buffer: &mut Vec<u8>) -> f64 {
 #[inline]
 fn compress_zstd(data: &[u8], level: i32, buffer: &mut Vec<u8>) -> f64 {
     buffer.clear();
-    buffer.reserve(data.len());
-
-    // Use the simple compression API which handles buffer management internally
-    match zstd::stream::encode_all(data, level) {
-        Ok(compressed) => {
-            let ratio = compressed.len() as f64 / data.len() as f64;
-            *buffer = compressed; // Store result in buffer for potential reuse
-            ratio
-        }
-        Err(_) => 1.0, // Assume incompressible on error
+    if data.is_empty() {
+        return 0.0;
     }
+    if data.len() < 4096 {
+        // Continue + end reproduces the existing streaming frame convention,
+        // including its unspecified content size. A bulk API changes the ratio.
+        buffer.reserve(zstd::zstd_safe::compress_bound(data.len()) + 128);
+        let capacity = buffer.capacity();
+        return ZSTD_CONTEXT.with(|context| {
+            let mut context = context.borrow_mut();
+            if context
+                .reset(zstd::zstd_safe::ResetDirective::SessionAndParameters)
+                .is_err()
+                || context
+                    .set_parameter(zstd::zstd_safe::CParameter::CompressionLevel(level))
+                    .is_err()
+            {
+                return 1.0;
+            }
+            let mut input = zstd::zstd_safe::InBuffer::around(data);
+            let mut output = zstd::zstd_safe::OutBuffer::around(buffer);
+            while input.pos() < data.len() {
+                if context.compress_stream(&mut output, &mut input).is_err() {
+                    return 1.0;
+                }
+            }
+            loop {
+                match context.end_stream(&mut output) {
+                    Ok(0) => break,
+                    Ok(_) if output.pos() < capacity => {}
+                    Ok(_) => return 1.0,
+                    Err(_) => return 1.0,
+                }
+            }
+            output.pos() as f64 / data.len() as f64
+        });
+    }
+    // Larger tiers keep their contexts scoped to the call, avoiding retention
+    // of a large high-compression workspace on each Rayon worker.
+    buffer.reserve(data.len());
+    match zstd::stream::Encoder::new(&mut *buffer, level) {
+        Ok(mut encoder) => {
+            if encoder.write_all(data).is_err() || encoder.finish().is_err() {
+                return 1.0;
+            }
+        }
+        Err(_) => return 1.0,
+    }
+    buffer.len() as f64 / data.len() as f64
 }
 
 /// Compress data using the tiered compression system.
@@ -676,6 +716,29 @@ impl KolmogorovAnalysis {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reused_zstd_preserves_streaming_sizes_and_independent_frames() {
+        let mut buffer = Vec::new();
+        for level in [1, 8, 19, 1] {
+            for len in [0, 1, 63, 64, 128, 256, 1024, 4095, 4096, 8193] {
+                for data in [
+                    vec![0; len],
+                    (0..len).map(|i| (i * 17 + i / 7) as u8).collect(),
+                ] {
+                    let ratio = compress_zstd(&data, level, &mut buffer);
+                    if data.is_empty() {
+                        assert_eq!(ratio, 0.0);
+                        continue;
+                    }
+                    let expected = zstd::stream::encode_all(&data[..], level).unwrap();
+                    assert_eq!(buffer.len(), expected.len(), "level={level}, len={len}");
+                    assert_eq!(zstd::stream::decode_all(&buffer[..]).unwrap(), data);
+                    assert_eq!(ratio, expected.len() as f64 / len as f64);
+                }
+            }
+        }
+    }
 
     #[test]
     fn test_tier_selection() {

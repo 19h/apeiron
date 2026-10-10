@@ -10,6 +10,7 @@
 //! - `VisualizationMode` - Available visualization modes
 //! - Background task management
 
+pub mod background;
 mod state;
 mod types;
 

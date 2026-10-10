@@ -1,9 +1,10 @@
 //! Core types and data structures for Apeiron application state.
 
-use std::sync::mpsc::Receiver;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{self, Receiver, SyncSender};
 use std::sync::Arc;
 
-use eframe::egui::{TextureHandle, Vec2};
+use eframe::egui::Vec2;
 use memmap2::Mmap;
 
 use crate::hilbert::{d2xy, HilbertBuffer};
@@ -140,7 +141,9 @@ impl VisualizationMode {
     /// Get the minimum texture size for this mode.
     pub fn min_texture_size(self) -> usize {
         match self {
-            Self::Digraph | Self::BytePhaseSpace => 2048,
+            // These modes contain exactly 256 bins per axis. Nearest sampling
+            // preserves all bins when the native texture is enlarged on screen.
+            Self::Digraph | Self::BytePhaseSpace => 256,
             Self::SimilarityMatrix => 2048,
             Self::Hilbert
             | Self::KolmogorovComplexity
@@ -425,11 +428,11 @@ pub struct TextureParams {
 
 /// Background computation tasks for lazy loading.
 pub enum BackgroundTask {
-    /// Partial complexity map update (streaming).
+    /// Next complexity sample batch; append to the existing map.
     ComplexityPartial { data: Vec<f32>, progress: f32 },
     /// Final complexity map (computation complete).
     ComplexityComplete,
-    /// Partial RCMSE map update (streaming).
+    /// Next RCMSE sample batch; append to the existing map.
     RcmsePartial { data: Vec<f32>, progress: f32 },
     /// Final RCMSE map (computation complete).
     RcmseComplete,
@@ -437,6 +440,10 @@ pub enum BackgroundTask {
 
 /// Pending background computations.
 pub struct BackgroundTasks {
+    /// All workers share one bounded channel for this file.
+    pub sender: SyncSender<BackgroundTask>,
+    /// Cancellation flag shared with workers.
+    pub cancelled: Arc<AtomicBool>,
     /// Receiver for completed tasks.
     pub receiver: Receiver<BackgroundTask>,
     /// Whether complexity map is being computed.
@@ -447,4 +454,31 @@ pub struct BackgroundTasks {
     pub complexity_progress: f32,
     /// Progress of RCMSE map computation (0.0-1.0).
     pub rcmse_progress: f32,
+}
+
+impl BackgroundTasks {
+    pub fn new() -> Self {
+        let (sender, receiver) = mpsc::sync_channel(8);
+        Self {
+            sender,
+            receiver,
+            cancelled: Arc::new(AtomicBool::new(false)),
+            computing_complexity: false,
+            computing_rcmse: false,
+            complexity_progress: 0.0,
+            rcmse_progress: 0.0,
+        }
+    }
+}
+
+impl Default for BackgroundTasks {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Drop for BackgroundTasks {
+    fn drop(&mut self) {
+        self.cancelled.store(true, Ordering::Relaxed);
+    }
 }

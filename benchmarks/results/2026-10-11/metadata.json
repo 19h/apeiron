@@ -1,0 +1,90 @@
+{
+  "date_local": "2026-10-11",
+  "baseline_commit": "0b0715d2712c4288c8be14fa26e82f09cc8ff477",
+  "cpu": "Apple M4 Max",
+  "host_model": "Mac16,5",
+  "logical_cpus": 16,
+  "memory_bytes": 137438953472,
+  "rustc": "rustc 1.100.0-nightly (f248f4038 2026-09-05)",
+  "profile": {
+    "opt_level": 3,
+    "lto": true
+  },
+  "data_bytes": 8388608,
+  "generator_seed_hex": "4d595df4d0f33173",
+  "warmups_per_case": 1,
+  "repetitions_per_case": 15,
+  "unit": "ms; 1 ms = 0.001 s",
+  "statistic": "median; min/max are observed bounds, not confidence intervals",
+  "gpu_scope": "native GPU upload submission or dispatch plus synchronous readback; GUI texture upload excluded",
+  "gpu_backend": "unknown; automatic wgpu adapter selection",
+  "gpu_upload_after": "transition statistics deferred to first DIG/PHS use; warm rendering cases exclude first-use scans",
+  "host_load": "uncontrolled; default 16-worker timings include substantial scheduling contention",
+  "results_scope": "synthetic workloads; application FPS, cold-disk latency, Windows and Linux native performance unknown",
+  "validated_correctness": "scalar numerical comparisons; independent compression frames; incremental batches; EOF/boundaries; native GPU readback and active-file changes",
+  "primary_cpu_comparison": {
+    "workers": 1,
+    "sequence": "each workload filter: original 15 repetitions, then optimized 15 repetitions",
+    "files": [
+      "cpu-1-before.csv",
+      "cpu-1-after.csv"
+    ]
+  },
+  "additional_cpu_comparison": {
+    "workers": 16,
+    "files": [
+      "cpu-16-before.csv",
+      "cpu-16-after.csv"
+    ],
+    "host_load": "substantial uncontrolled contention; not used for headline ratios"
+  },
+  "validation": {
+    "general_binary_tests_passed": 70,
+    "native_gpu_binary_tests_passed": 3,
+    "general_library_tests_passed": 65,
+    "native_gpu_library_tests_passed": 2,
+    "library_tests_are_also_in_binary_suite": true,
+    "release_build": "passed",
+    "format": "passed",
+    "clippy": "passed with warnings"
+  },
+  "final_source_sha256": {
+    "Cargo.lock": "00c2a5901c75e24440512ebfbc87bdf9dd511f08c97326c5e2a015baea340860",
+    "Cargo.toml": "0043f6dec3e2b4cb3f193ce3ba40294c3f257cebf6ceaf8d36c0ee07534a07b1",
+    "examples/gpu_performance.rs": "78ef17266d5d100607eb6448638a7d1ea753a4dc5ff8ff4b4c06c4481c771a46",
+    "examples/performance.rs": "5a2c4297a1e5f99a06660cb7ff8860151c36cf49349d78478818bc1981907352",
+    "src/analysis/byte.rs": "ac961c94f20df65a46fc090e7a890e296d21c96972bb5c82fbcaed4b6f7d8dfd",
+    "src/analysis/entropy.rs": "0992cc38a070717ef24eaf85b8e7d9d50dde5cfd4046f87a985a064dd5389551",
+    "src/analysis/jsd.rs": "7c4916ba42db0ffc21b2b6dda608602416063330fc862f1e3ec2735cd3ae8527",
+    "src/analysis/kolmogorov.rs": "fda71c3852ba537c0865805e686a523986ae46166cdf8ac053d331c25dc37e82",
+    "src/analysis/mod.rs": "c8916ddc9a07c5dbdf2746857343d4855996116f672d00518f2aa97e32fe142f",
+    "src/analysis/rcmse.rs": "364fc1e6a7d7e4cb94e09129f2f2b6c7cf23e31184222ca84e6624d4a141370d",
+    "src/analysis/wavelet.rs": "8be0b6db01f60cb073f3c44a20a12b9df83c81f08ac16212ac195c0c2ec6791e",
+    "src/app/background.rs": "06042873d7b2bd4216e13c8c5de9d8ffa70800a6604e9335a23111c2f0f5565e",
+    "src/app/mod.rs": "ca89f0b154bdc667c714b89b5fdb62aab345f3a6bfc00c7926c7ed0e150d8a28",
+    "src/app/state.rs": "fdf15519a80beeef4aeedd3825f7e9aa0e75f0e1a4f9745fc75e2abc73004f3c",
+    "src/app/types.rs": "5d766e3082fb2ad07b52b449067408e62fbc25a06cc3621bca189cd60f9610ad",
+    "src/gpu/mod.rs": "a5807a95f1cf92ba319fa2522ab508b3065426ecfd8c42f1b43c478ae5f01483",
+    "src/gpu/renderer.rs": "cef7fe9a0d576d335735147407bf9b44404993c73f2e008a3ea221e8be2e295b",
+    "src/gpu/shaders/digraph.wgsl": "1f93cd3df1ea9b84147d89171f46aa36ae23a76c87875646aa0e50846a76155d",
+    "src/gpu/shaders/hilbert.wgsl": "b3d5dd531ec0fb72b0a41d5873437f8ac4c6295b6aabb4e6bbd695867d66c115",
+    "src/gpu/shaders/phase_space.wgsl": "2c93141129b01d7291b64503c05db7d45e11641e8f6d1d15e010266f2853880d",
+    "src/gpu/shaders/similarity.wgsl": "5b3ae21e0021ce89a581122ee19aaf61dcb477972b53a491ca941df0c457b742",
+    "src/hilbert/curve.rs": "444343de5448081a0d90cb0021c7ff910ac686e62fdadc9fb290ddb0c8220e57",
+    "src/hilbert/mod.rs": "01e1218c51d8694cb7850bc973df39e6d62651090bbd7ef1c3a200b5277ccad5",
+    "src/hilbert/refiner.rs": "6febda4deda8b65cb7f840649c7213d728cd95c5fd99ebf31e6dc8aa8acc8fe7",
+    "src/lib.rs": "7131b8b5b7739b9e552eafe39a1ed9c21d0d1dac1d6fa0481de3abeb4bc67976",
+    "src/main.rs": "5251d499a309a947bb92ea7a5908d64879e363dcaf96c281714007d4fe764312",
+    "src/util/color.rs": "141f23606bb84d6d651b1e30413daa3658d5f0957e6d87642acb503e68d5df99",
+    "src/util/format.rs": "eb2fec7c7f4fb0fcd452a7f1cde439f5bcf94f8ad95f004c9a7457bffbc3f910",
+    "src/util/mod.rs": "64e4516edadf7ea7111a6bf05534c9819b2052f791951c639f1bc45c2b25fdb5",
+    "src/viz/generators.rs": "4ebbcc0cb5db8b3d511c798b499995058ea3535e065311911ec8b87ad29b946a",
+    "src/viz/mod.rs": "cff9fa2c22f0a27300a42fffc93bcd47c86cbb6543232b524d5c2c534229ee68"
+  },
+  "benchmark_executable_sha256": {
+    "/tmp/apeiron-performance-baseline": "994fd725c1e11ef7a67d589266e58bba88405e003384b6449224ccd875c482df",
+    "/tmp/apeiron-gpu-baseline": "d0b6ae5342d5a066fcf77b7277521ecaf4a5d782f9c8c9f4093243a8c7057f2d",
+    "target/release/examples/performance": "d5f7a7e0cdf085544ac4e41628a726ba8409e7256ef19c813124c1be3af482e9",
+    "target/release/examples/gpu_performance": "e81ddaf3c1e2886590a0f44cb0a8c3895002688519fc741ef69b33aea96d2ab6"
+  }
+}
